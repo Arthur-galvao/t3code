@@ -110,6 +110,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as RsiService from "../orchestration-v2/RsiService.ts";
 import {
   clientModeCeiling,
   type McpInvocationScope,
@@ -219,6 +220,21 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadInterruptInput,
   ) => Effect.Effect<OrchestratorMcpThreadInterruptResult, OrchestratorMcpFailure>;
+  readonly rsiQueryLessons: (
+    scope: McpInvocationScope,
+    input: RsiService.RsiQueryLessonsInput,
+  ) => Effect.Effect<
+    { readonly lessons: ReadonlyArray<RsiService.RsiLesson>; readonly count: number },
+    OrchestratorMcpFailure
+  >;
+  readonly rsiRecordLesson: (
+    scope: McpInvocationScope,
+    input: RsiService.RsiRecordLessonInput,
+  ) => Effect.Effect<{ readonly lesson: RsiService.RsiLesson }, OrchestratorMcpFailure>;
+  readonly rsiTelemetrySummary: (
+    scope: McpInvocationScope,
+    input: RsiService.RsiTelemetrySummaryInput,
+  ) => Effect.Effect<RsiService.RsiTelemetrySummary, OrchestratorMcpFailure>;
 }
 
 export class OrchestratorMcpService extends Context.Service<
@@ -1084,6 +1100,16 @@ const make = Effect.gen(function* () {
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const remoteDelegation = yield* RemoteDelegation.RemoteDelegation;
+  const layerRsiOpt = yield* Effect.serviceOption(RsiService.RsiService);
+  const fallbackRsi = Option.isSome(layerRsiOpt) ? undefined : yield* RsiService.makeRsiService();
+  const resolveRsiService = Effect.fn("OrchestratorMcpService.resolveRsiService")(function* () {
+    const runtimeRsiOpt = yield* Effect.serviceOption(RsiService.RsiService);
+    return Option.isSome(runtimeRsiOpt)
+      ? runtimeRsiOpt.value
+      : Option.isSome(layerRsiOpt)
+        ? layerRsiOpt.value
+        : fallbackRsi!;
+  });
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -3336,6 +3362,28 @@ const make = Effect.gen(function* () {
         status: result.type === "already_terminal" ? result.run.status : "interrupt_requested",
       } satisfies OrchestratorMcpThreadInterruptResult;
     }),
+    rsiQueryLessons: Effect.fn("OrchestratorMcpService.rsiQueryLessons")(function* (_scope, input) {
+      const rsi = yield* resolveRsiService();
+      const lessons = yield* rsi.queryLessons(input);
+      return { lessons, count: lessons.length };
+    }),
+    rsiRecordLesson: Effect.fn("OrchestratorMcpService.rsiRecordLesson")(function* (_scope, input) {
+      if (input.title.trim() === "" || input.guidance.trim() === "") {
+        return yield* failure(
+          "invalid_request",
+          "RSI lesson title and guidance must be non-empty.",
+        );
+      }
+      const rsi = yield* resolveRsiService();
+      const lesson = yield* rsi.recordLesson(input);
+      return { lesson };
+    }),
+    rsiTelemetrySummary: Effect.fn("OrchestratorMcpService.rsiTelemetrySummary")(
+      function* (_scope, input) {
+        const rsi = yield* resolveRsiService();
+        return yield* rsi.getTelemetrySummary(input);
+      },
+    ),
   });
 });
 

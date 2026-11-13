@@ -7,6 +7,7 @@ import {
   t3AcpPromptWithInstructions,
   t3OrchestrationPrompt,
   t3OrchestrationSystemPrompt,
+  withSessionRsiLessonsPrefix,
 } from "./orchestrationInstructions.ts";
 
 describe("T3 device instructions", () => {
@@ -81,5 +82,73 @@ describe("T3 device instructions", () => {
       "Again.",
     );
     assert.notInclude(t3AcpPromptWithInstructions({ prompt: "Hi.", state }), "## T3 Code devices");
+  });
+
+  it("injects RSI lessons only at session start to keep mid-thread KV prefixes stable", () => {
+    const rsiPrefix = "[RSI Lessons]\n- Run targeted unit tests before full build.";
+
+    assert.include(
+      withSessionRsiLessonsPrefix({
+        prompt: "Fix the failing parser.",
+        rsiPrefix,
+        isNewSession: true,
+      }),
+      "<t3_code_rsi_lessons>\n[RSI Lessons]",
+    );
+    assert.equal(
+      withSessionRsiLessonsPrefix({
+        prompt: "Continue with the tests.",
+        rsiPrefix,
+        isNewSession: false,
+      }),
+      "Continue with the tests.",
+    );
+    assert.equal(
+      withSessionRsiLessonsPrefix({
+        prompt: "/compact",
+        rsiPrefix,
+        isNewSession: true,
+      }),
+      "/compact",
+    );
+
+    const state = { interactionMode: "default", hasT3Mcp: true, hasDeviceTools: false } as const;
+    assert.include(
+      t3AcpPromptWithInstructions({ prompt: "Start", state, rsiPrefix }),
+      "<t3_code_rsi_lessons>",
+    );
+    // Even if device tools turn on mid-thread, RSI prefix must not be injected on existing ACP sessions.
+    assert.notInclude(
+      t3AcpPromptWithInstructions({
+        prompt: "Next",
+        state: { ...state, hasDeviceTools: true },
+        previousState: state,
+        rsiPrefix,
+      }),
+      "<t3_code_rsi_lessons>",
+    );
+
+    assert.include(
+      t3OrchestrationPrompt({
+        prompt: "Start",
+        hasT3Mcp: false,
+        hasDeviceTools: false,
+        orchestrationDelivered: false,
+        deviceInstructionsDelivered: false,
+        rsiPrefix,
+      }),
+      "<t3_code_rsi_lessons>",
+    );
+    assert.notInclude(
+      t3OrchestrationPrompt({
+        prompt: "Turn 2",
+        hasT3Mcp: true,
+        hasDeviceTools: true,
+        orchestrationDelivered: true,
+        deviceInstructionsDelivered: false,
+        rsiPrefix,
+      }),
+      "<t3_code_rsi_lessons>",
+    );
   });
 });

@@ -5087,6 +5087,213 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     );
   });
 
+  describe("Tool safety guard", () => {
+    const openGuardedTurn = Effect.fn("openGuardedTurn")(function* (
+      runtimeMode: "auto" | "full-access" | "auto-accept-edits",
+      approvalPolicy?: "never",
+    ) {
+      const harness = yield* makeWakeHarness;
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode,
+        interactionMode: "default",
+        cwd: "/workspace",
+        ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+      });
+      const input = makeClaudeTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make(`attempt-claude-guard-${runtimeMode}`),
+        text: "Run guarded checks.",
+        attachments: [],
+        runtimePolicy,
+      });
+      yield* harness.runtime.startTurn({
+        ...input,
+        appThread: { ...input.appThread, runtimeMode, interactionMode: "default" },
+      });
+      const openedOptions = harness.getOpenedOptions();
+      assert.isDefined(openedOptions?.canUseTool);
+      assert.isDefined(openedOptions?.hooks?.PreToolUse);
+      return {
+        ...harness,
+        canUseTool: openedOptions!.canUseTool!,
+        preToolUseHooks: openedOptions!.hooks!.PreToolUse!.flatMap((matcher) => matcher.hooks),
+      };
+    });
+
+    it.effect(
+      "enforces PreToolUse hook and canUseTool denies in auto-accept-edits and full-access",
+      () =>
+        Effect.gen(function* () {
+          const turn = yield* openGuardedTurn("auto-accept-edits", "never");
+
+          const evalPreToolUse = async (toolName: string, toolInput: unknown) => {
+            const outputs = await Promise.all(
+              turn.preToolUseHooks.map((hook) =>
+                hook(
+                  {
+                    hook_event_name: "PreToolUse",
+                    tool_name: toolName,
+                    tool_input: toolInput,
+                    tool_use_id: "tool-pre-1",
+                    session_id: "native-thread-guard",
+                    transcript_path: "/transcript.jsonl",
+                    cwd: "/workspace",
+                  },
+                  "tool-pre-1",
+                  { signal: new AbortController().signal },
+                ),
+              ),
+            );
+            return outputs[0];
+          };
+
+          const hookRm = yield* Effect.promise(() =>
+            evalPreToolUse("Bash", { command: "rm -rf /" }),
+          );
+          assert.equal(
+            hookRm && "hookSpecificOutput" in hookRm
+              ? hookRm.hookSpecificOutput?.hookEventName === "PreToolUse"
+                ? hookRm.hookSpecificOutput.permissionDecision
+                : undefined
+              : undefined,
+            "deny",
+          );
+
+          const hookSecretEdit = yield* Effect.promise(() =>
+            evalPreToolUse("Edit", { file_path: "/workspace/.env.local" }),
+          );
+          assert.equal(
+            hookSecretEdit && "hookSpecificOutput" in hookSecretEdit
+              ? hookSecretEdit.hookSpecificOutput?.hookEventName === "PreToolUse"
+                ? hookSecretEdit.hookSpecificOutput.permissionDecision
+                : undefined
+              : undefined,
+            "deny",
+          );
+
+          const hookForcePush = yield* Effect.promise(() =>
+            evalPreToolUse("Bash", { command: "git push --force origin main" }),
+          );
+          assert.equal(
+            hookForcePush && "hookSpecificOutput" in hookForcePush
+              ? hookForcePush.hookSpecificOutput?.hookEventName === "PreToolUse"
+                ? hookForcePush.hookSpecificOutput.permissionDecision
+                : undefined
+              : undefined,
+            "ask",
+          );
+
+          const hookSafeForceLease = yield* Effect.promise(() =>
+            evalPreToolUse("Bash", { command: "git push --force-with-lease" }),
+          );
+          assert.deepEqual(hookSafeForceLease, {});
+
+          const deniedByCallback = yield* Effect.promise(() =>
+            turn.canUseTool(
+              "Read",
+              { file_path: "/workspace/.env" },
+              {
+                signal: new AbortController().signal,
+                toolUseID: "tool-canuse-secret",
+                requestId: "req-canuse-secret",
+              },
+            ),
+          );
+          assert.equal(deniedByCallback?.behavior, "deny");
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
+          ),
+        ),
+    );
+
+    it.effect(
+      "prompts via runtime_request for git push --force even when requiresClaudeApproval is false or in full-access",
+      () =>
+        Effect.gen(function* () {
+          const acceptEditsTurn = yield* openGuardedTurn("auto-accept-edits", "never");
+
+          const allowedLease = yield* Effect.promise(() =>
+            acceptEditsTurn.canUseTool(
+              "Bash",
+              { command: "git push --force-with-lease" },
+              {
+                signal: new AbortController().signal,
+                toolUseID: "tool-lease-allow",
+                requestId: "req-lease-allow",
+              },
+            ),
+          );
+          assert.equal(allowedLease?.behavior, "allow");
+
+          const pendingAcceptEditsAsk = yield* Effect.promise(() =>
+            acceptEditsTurn.canUseTool(
+              "Bash",
+              { command: "git push --force origin main" },
+              {
+                signal: new AbortController().signal,
+                toolUseID: "tool-force-ask-edits",
+                requestId: "req-force-ask-edits",
+              },
+            ),
+          ).pipe(Effect.forkScoped);
+
+          const acceptEditsRequest = yield* Queue.take(acceptEditsTurn.runtimeRequestReceipts);
+          assert.equal(acceptEditsRequest.runtimeRequest.status, "pending");
+          assert.equal(acceptEditsRequest.runtimeRequest.kind, "command");
+
+          yield* acceptEditsTurn.runtime.respondToRuntimeRequest({
+            requestId: acceptEditsRequest.runtimeRequest.id,
+            decision: "accept",
+          });
+          const acceptedOutcome = yield* Fiber.join(pendingAcceptEditsAsk);
+          assert.equal(acceptedOutcome?.behavior, "allow");
+
+          const fullAccessTurn = yield* openGuardedTurn("full-access", "never");
+          const pendingForcePush = yield* Effect.promise(() =>
+            fullAccessTurn.canUseTool(
+              "Bash",
+              { command: "git push --force origin main" },
+              {
+                signal: new AbortController().signal,
+                toolUseID: "tool-force-ask",
+                requestId: "req-force-ask",
+              },
+            ),
+          ).pipe(Effect.forkScoped);
+
+          const requestEvent = yield* Queue.take(fullAccessTurn.runtimeRequestReceipts);
+          assert.equal(requestEvent.runtimeRequest.status, "pending");
+          assert.equal(requestEvent.runtimeRequest.kind, "command");
+
+          yield* fullAccessTurn.runtime.respondToRuntimeRequest({
+            requestId: requestEvent.runtimeRequest.id,
+            decision: "decline",
+          });
+          const outcome = yield* Fiber.join(pendingForcePush);
+          assert.equal(outcome?.behavior, "deny");
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
+          ),
+        ),
+    );
+  });
+
   it.effect(
     "carries earlier user-only skill instructions on sends and steering with attachments",
     () =>

@@ -51,6 +51,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
+import * as RsiService from "./RsiService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
@@ -1945,3 +1946,128 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect(
+  "injects RSI lessons only when starting a new provider session (KV-cache safe)",
+  () =>
+    Effect.gen(function* () {
+      const rsi = yield* RsiService.RsiService;
+      yield* rsi.recordLesson({
+        title: "Use Effect.fn for service methods",
+        guidance: "Wrap service effects in Effect.fn for telemetry parity.",
+        scope: "global",
+        confidence: 0.9,
+      });
+
+      const recordedPrompts: Array<string> = [];
+      const startTurnSpy = vi.fn((turn: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+        Effect.sync(() => {
+          recordedPrompts.push(turn.message.text);
+        }),
+      );
+
+      // Turn 1: brand-new session (nativeThreadRef: null, no prior providerTurns).
+      const turn1 = makeLocalCommandHarness({ text: "Turn one prompt" });
+      const turn1Thread = turn1.projection().providerThreads[0]!;
+      turn1.open.mockReturnValue(
+        Effect.succeed({
+          driver: turn1Thread.driver,
+          providerSession: {
+            id: turn1Thread.providerSessionId,
+            driver: turn1Thread.driver,
+            providerInstanceId: turn1Thread.providerInstanceId,
+            status: "ready",
+            cwd: "/tmp/native-account-command",
+            model: null,
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt: turn1Thread.createdAt,
+            updatedAt: turn1Thread.updatedAt,
+            lastError: null,
+          },
+          ensureThread: () =>
+            Effect.succeed({
+              ...turn1Thread,
+              nativeThreadRef: {
+                driver: turn1Thread.driver,
+                nativeId: "native-session-1",
+                strength: "strong" as const,
+              },
+            }),
+          resumeThread: () => Effect.succeed(turn1Thread),
+          startTurn: startTurnSpy,
+        } as never),
+      );
+      turn1.startRootRun.mockImplementation((runInput) =>
+        runInput.session.startTurn({ message: runInput.message } as never).pipe(Effect.orDie),
+      );
+
+      yield* turn1.start;
+
+      expect(recordedPrompts).toHaveLength(1);
+      expect(recordedPrompts[0]).toContain("<t3_code_rsi_lessons>");
+      expect(recordedPrompts[0]).toContain("[RSI Lessons]");
+      expect(recordedPrompts[0]).toContain("Use Effect.fn for service methods");
+      expect(recordedPrompts[0]).toContain("Turn one prompt");
+
+      // Turn 2: continuing existing native session (nativeThreadRef present + prior providerTurn).
+      const turn2 = makeLocalCommandHarness({ text: "Follow up turn" });
+      const turn2Base = turn2.projection();
+      const turn2Thread = {
+        ...turn2Base.providerThreads[0]!,
+        nativeThreadRef: {
+          driver: turn2Base.providerThreads[0]!.driver,
+          nativeId: "native-session-1",
+          strength: "strong" as const,
+        },
+      };
+      turn2.setProjection({
+        ...turn2Base,
+        providerThreads: [turn2Thread],
+        providerTurns: [
+          {
+            id: ProviderTurnId.make("prior-provider-turn-1"),
+            providerThreadId: turn2Thread.id,
+            nodeId: turn2Base.nodes[0]!.id,
+            runAttemptId: RunAttemptId.make("prior-attempt-1"),
+            nativeTurnRef: {
+              driver: turn2Thread.driver,
+              nativeId: "native-turn-1",
+              strength: "strong" as const,
+            },
+            ordinal: 1,
+            status: "completed",
+            startedAt: turn2Thread.createdAt,
+            completedAt: turn2Thread.updatedAt,
+          },
+        ],
+      });
+      turn2.open.mockReturnValue(
+        Effect.succeed({
+          driver: turn2Thread.driver,
+          providerSession: {
+            id: turn2Thread.providerSessionId,
+            driver: turn2Thread.driver,
+            providerInstanceId: turn2Thread.providerInstanceId,
+            status: "ready",
+            cwd: "/tmp/native-account-command",
+            model: null,
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt: turn2Thread.createdAt,
+            updatedAt: turn2Thread.updatedAt,
+            lastError: null,
+          },
+          ensureThread: () => Effect.succeed(turn2Thread),
+          resumeThread: () => Effect.succeed(turn2Thread),
+          startTurn: startTurnSpy,
+        } as never),
+      );
+      turn2.startRootRun.mockImplementation((runInput) =>
+        runInput.session.startTurn({ message: runInput.message } as never).pipe(Effect.orDie),
+      );
+
+      yield* turn2.start;
+
+      expect(recordedPrompts).toHaveLength(2);
+      expect(recordedPrompts[1]).toBe("Follow up turn");
+    }).pipe(Effect.provide(RsiService.layer)),
+);

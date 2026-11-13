@@ -1,5 +1,13 @@
 import { assert, describe, it } from "@effect/vitest";
-import { RunId, ThreadId, type OrchestrationV2DomainEvent } from "@t3tools/contracts";
+import {
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  RunId,
+  ThreadId,
+  type OrchestrationV2Command,
+  type OrchestrationV2DomainEvent,
+} from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -14,7 +22,11 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
-import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
+import {
+  limitRecoveryCommand,
+  USAGE_LIMIT_FALLBACK_PROMPT,
+  usageLimitFallbackCommands,
+} from "./UsageLimitRecoveryWorker.ts";
 
 it.effect("idle sweeps skip SQL until the next wake time or a relevant event", () =>
   Effect.gen(function* () {
@@ -115,4 +127,143 @@ describe("limitRecoveryCommand arming", () => {
     const thread = failedThread(30 * HOUR_MS, 24 * HOUR_MS + 1);
     assert.isNull(limitRecoveryCommand(thread, true, nowMs));
   });
+});
+
+describe("cross-provider usage-limit fallback", () => {
+  const claudeSelection = {
+    instanceId: ProviderInstanceId.make("claudeAgent"),
+    model: "claude-opus-4-6",
+  };
+  const agySelection = {
+    instanceId: ProviderInstanceId.make("antigravity"),
+    model: "gemini-3.1-pro",
+  };
+
+  it("emits provider.switch + continuation dispatch immediately before resetAt for Claude <-> Antigravity", () => {
+    // Future reset (5 hours ahead): fallback should NOT stall waiting for resetAt.
+    const thread = failedThread(1_000, -5 * HOUR_MS);
+    const commands = usageLimitFallbackCommands({
+      thread,
+      currentModelSelection: claudeSelection,
+      fallbackModelSelection: agySelection,
+      autoFallback: true,
+      nowMs,
+    });
+    assert.lengthOf(commands, 2);
+    assert.deepEqual(commands[0], {
+      type: "provider.switch",
+      commandId: commands[0]!.commandId,
+      threadId: thread.id,
+      modelSelection: agySelection,
+    });
+    assert.equal(commands[1]?.type, "message.dispatch");
+    if (commands[1]?.type === "message.dispatch") {
+      assert.equal(commands[1].modelSelection?.instanceId, agySelection.instanceId);
+      assert.equal(commands[1].modelSelection?.model, agySelection.model);
+      assert.equal(commands[1].manualContinuationOfRunId, thread.latestRunId);
+      assert.equal(commands[1].text, USAGE_LIMIT_FALLBACK_PROMPT);
+      assert.deepEqual(commands[1].dispatchMode, { type: "start_immediately" });
+    }
+
+    const reverse = usageLimitFallbackCommands({
+      thread,
+      currentModelSelection: agySelection,
+      fallbackModelSelection: claudeSelection,
+      autoFallback: true,
+      nowMs,
+    });
+    assert.lengthOf(reverse, 2);
+    assert.equal(reverse[0]?.type, "provider.switch");
+  });
+
+  it("returns no fallback commands when disabled, unset, or already on fallback model", () => {
+    const thread = failedThread(1_000, -HOUR_MS);
+    assert.isEmpty(
+      usageLimitFallbackCommands({
+        thread,
+        currentModelSelection: claudeSelection,
+        fallbackModelSelection: agySelection,
+        autoFallback: false,
+        nowMs,
+      }),
+    );
+    assert.isEmpty(
+      usageLimitFallbackCommands({
+        thread,
+        currentModelSelection: claudeSelection,
+        fallbackModelSelection: null,
+        autoFallback: true,
+        nowMs,
+      }),
+    );
+    assert.isEmpty(
+      usageLimitFallbackCommands({
+        thread,
+        currentModelSelection: agySelection,
+        fallbackModelSelection: agySelection,
+        autoFallback: true,
+        nowMs,
+      }),
+    );
+  });
+
+  it.effect("sweep dispatches fallback switch + continuation when usage_limit occurs", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(nowMs);
+      const thread = failedThread(1_000, -4 * HOUR_MS);
+      const dispatched = yield* Queue.unbounded<OrchestrationV2Command>();
+      const layer = UsageLimitRecoveryWorker.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Scheduler.layer,
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getLimitRecoveryCandidates: () => Effect.succeed([thread]),
+              getLimitRecoveryWakeAt: () => Effect.succeed(null),
+              getThread: () =>
+                Effect.succeed({
+                  id: thread.id,
+                  projectId: ProjectId.make("project:fallback"),
+                  modelSelection: claudeSelection,
+                } as never),
+            }),
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              dispatch: (command) =>
+                Queue.offer(dispatched, command as OrchestrationV2Command).pipe(
+                  Effect.as({} as never),
+                ),
+            }),
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              streamDomainEvents: Stream.never,
+            }),
+            Layer.mock(ServerSettings.ServerSettingsService)({
+              getSettings: Effect.succeed({
+                autoResumeLimitedThreads: false,
+                snoozeLimitedThreads: false,
+                autoFallbackOnUsageLimit: true,
+                fallbackModelSelection: agySelection,
+                providerInstances: {
+                  [agySelection.instanceId]: {
+                    driver: ProviderDriverKind.make("antigravity"),
+                    enabled: true,
+                  },
+                },
+                projectSettingsOverrides: {},
+              } as never),
+              streamChanges: Stream.never,
+            }),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const first = yield* Queue.take(dispatched);
+        const second = yield* Queue.take(dispatched);
+        assert.equal(first.type, "provider.switch");
+        assert.equal(second.type, "message.dispatch");
+        if (second.type === "message.dispatch") {
+          assert.equal(second.text, USAGE_LIMIT_FALLBACK_PROMPT);
+          assert.equal(second.modelSelection?.instanceId, agySelection.instanceId);
+        }
+      }).pipe(Effect.provide(layer));
+    }),
+  );
 });

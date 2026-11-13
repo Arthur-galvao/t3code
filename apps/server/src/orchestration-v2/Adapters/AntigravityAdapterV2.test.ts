@@ -135,6 +135,84 @@ describe("AntigravityAdapterV2 flavor", () => {
       outcome: { outcome: "selected", optionId: "opt-dev" },
     });
   });
+
+  it("enforces tool safety guard in permissionDisposition before ACP defaults", () => {
+    const fullAccessPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      cwd: "/workspace",
+    });
+
+    assert.equal(
+      flavor.permissionDisposition?.(fullAccessPolicy, {
+        sessionId: "session-1",
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        toolCall: {
+          toolCallId: "call-rm",
+          kind: "execute",
+          title: "Run command",
+          rawInput: { CommandLine: "rm -rf /" },
+        },
+      }),
+      "deny",
+    );
+
+    assert.equal(
+      flavor.permissionDisposition?.(fullAccessPolicy, {
+        sessionId: "session-1",
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        toolCall: {
+          toolCallId: "call-env",
+          kind: "read",
+          title: "Read .env",
+          locations: [{ path: "/workspace/.env" }],
+        },
+      }),
+      "deny",
+    );
+
+    assert.equal(
+      flavor.permissionDisposition?.(fullAccessPolicy, {
+        sessionId: "session-1",
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        toolCall: {
+          toolCallId: "call-force-push",
+          kind: "execute",
+          title: "Run git push",
+          rawInput: { command: "git push --force origin main" },
+        },
+      }),
+      "ask",
+    );
+
+    assert.equal(
+      flavor.permissionDisposition?.(fullAccessPolicy, {
+        sessionId: "session-1",
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        toolCall: {
+          toolCallId: "call-safe-push",
+          kind: "execute",
+          title: "Run git push",
+          rawInput: { command: "git push --force-with-lease" },
+        },
+      }),
+      "allow",
+    );
+
+    assert.equal(
+      flavor.permissionDisposition?.(fullAccessPolicy, {
+        sessionId: "session-1",
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        toolCall: {
+          toolCallId: "call-env-example",
+          kind: "read",
+          title: "Read .env.example",
+          locations: [{ path: "/workspace/.env.example" }],
+        },
+      }),
+      "allow",
+    );
+  });
 });
 
 const layerSession = Layer.mergeAll(
@@ -416,6 +494,85 @@ describe("AntigravityAdapterV2 client file system", () => {
         context("fs/read_text_file"),
       );
       assert.equal(viaInsideLink.content, "inside");
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect("blocks secret file reads while allowing .env.example via client file system", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let readTextFile: Parameters<RuntimeService["handleReadTextFile"]>[0] | undefined;
+      const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-log-" });
+      const requestLog = path.join(logs, "requests.ndjson");
+      const crypto = yield* SecureRandom.SecureRandom;
+      const instanceId = ProviderInstanceId.make("antigravity-secret-read-test");
+      const adapter = yield* makeAntigravityAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        makeRuntime: (input) =>
+          makeAntigravityAcpRuntime({
+            ...input,
+            childProcessSpawner,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: input.cwd,
+              env: { T3_ACP_ANTIGRAVITY: "1", T3_ACP_REQUEST_LOG_PATH: requestLog },
+            },
+          }).pipe(
+            Effect.provideService(SecureRandom.SecureRandom, crypto),
+            Effect.map((runtime): RuntimeService => ({
+              ...runtime,
+              handleReadTextFile: (handler) =>
+                Effect.sync(() => {
+                  readTextFile = handler;
+                }).pipe(Effect.andThen(runtime.handleReadTextFile(handler))),
+            })),
+          ),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.undefined,
+      });
+      const workspace = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-antigravity-secret-",
+      });
+      const envPath = path.join(workspace, ".env");
+      const envExamplePath = path.join(workspace, ".env.example");
+      yield* fileSystem.writeFileString(envPath, "API_KEY=secret\n");
+      yield* fileSystem.writeFileString(envExamplePath, "API_KEY=\n");
+
+      const threadId = ThreadId.make("thread-antigravity-secret-read");
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: workspace,
+      });
+      const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-antigravity-secret-read"),
+        modelSelection,
+        runtimePolicy,
+      });
+      yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
+      if (readTextFile === undefined) {
+        return yield* Effect.die("Antigravity sessions must serve client file reads");
+      }
+      const context = (method: string) => ({ requestId: `test-${method}`, method });
+      const envDenied = yield* readTextFile(
+        { sessionId: "mock-session-1", path: envPath },
+        context("fs/read_text_file"),
+      ).pipe(Effect.flip);
+      assert.propertyVal(envDenied, "code", -32602);
+      const envExampleAllowed = yield* readTextFile(
+        { sessionId: "mock-session-1", path: envExamplePath },
+        context("fs/read_text_file"),
+      );
+      assert.equal(envExampleAllowed.content, "API_KEY=\n");
     }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });

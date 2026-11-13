@@ -9,14 +9,20 @@ import type { SelfInvocation } from "@t3tools/shared/nodeRuntime";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Predicate from "effect/Predicate";
 import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
+import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { PULL_REQUEST_LINKING_INSTRUCTIONS } from "@t3tools/provider-core/server/runtimeInstructions";
+import { evaluateToolSafety } from "@t3tools/provider-core/server/toolSafetyGuard";
+import { acpPermissionDisposition } from "@t3tools/provider-acp/server/clientPolicy";
+import * as ServerSettings from "../../serverSettings.ts";
 import type { AntigravityAuth } from "../../provider/AntigravityAuth.ts";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import {
@@ -83,6 +89,7 @@ export interface AntigravityAdapterV2Options {
   readonly withProcess: AntigravityAuth["withProcess"];
   readonly defaultModel: Effect.Effect<string | undefined>;
   readonly supportsNativeGoals?: Effect.Effect<boolean>;
+  readonly toolSafetyGuardEnabled?: Effect.Effect<boolean>;
   readonly onSessionStarted?: (
     started: AcpSessionRuntime.AcpSessionRuntimeStartResult,
     cwd: string,
@@ -131,14 +138,50 @@ interface AntigravityFlavorServices {
   readonly host: ProviderHost.ProviderHost["Service"];
 }
 
+function antigravitySafetyInput(request: EffectAcpSchema.RequestPermissionRequest): {
+  readonly toolName: string;
+  readonly rawInput: unknown;
+} {
+  const { toolCall } = request;
+  const toolName =
+    toolCall.kind && toolCall.kind !== "other" ? toolCall.kind : (toolCall.title ?? "unknown");
+  const baseInput = Predicate.isObject(toolCall.rawInput)
+    ? toolCall.rawInput
+    : typeof toolCall.rawInput === "string"
+      ? { command: toolCall.rawInput }
+      : {};
+  return {
+    toolName,
+    rawInput: {
+      ...baseInput,
+      ...(toolCall.kind == null ? {} : { kind: toolCall.kind }),
+      ...(toolCall.title == null ? {} : { title: toolCall.title }),
+      ...(toolCall.locations == null ? {} : { locations: toolCall.locations }),
+    },
+  };
+}
+
 export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
+  let safetyGuardEnabled = true;
+  const refreshSafetyGuardEnabled = options.toolSafetyGuardEnabled
+    ? options.toolSafetyGuardEnabled.pipe(
+        Effect.tap((enabled) =>
+          Effect.sync(() => {
+            safetyGuardEnabled = enabled;
+          }),
+        ),
+        Effect.asVoid,
+        Effect.ignore,
+      )
+    : Effect.void;
   const antigravityClientFileRoots = (cwd: string | null) =>
     cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
+      yield* refreshSafetyGuardEnabled;
       const scope = yield* Scope.fork(yield* Effect.scope);
       const runtime = yield* options
         .withProcess(
@@ -180,7 +223,10 @@ export function makeAntigravityAcpAdapterFlavor(
             ),
           ),
         prompt: (payload, promptOptions) =>
-          Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
+          refreshSafetyGuardEnabled.pipe(
+            Effect.andThen(Effect.sync(reads.reset)),
+            Effect.andThen(runtime.prompt(payload, promptOptions)),
+          ),
         handleSessionUpdate: (handler) => {
           projectUpdate = handler;
           return runtime.handleSessionUpdate((notification) =>
@@ -251,14 +297,34 @@ export function makeAntigravityAcpAdapterFlavor(
     }),
     sessionModeForPolicy: (policy) => antigravityPermissionMode(policy.runtimeMode),
     runtimeModeForSessionMode: antigravityRuntimeModeForSessionMode,
+    permissionDisposition: (policy, request) => {
+      const { toolName, rawInput } = antigravitySafetyInput(request);
+      const safety = evaluateToolSafety({ toolName, rawInput, enabled: safetyGuardEnabled });
+      if (safety.decision === "deny") return "deny";
+      if (safety.decision === "ask") return "ask";
+      return acpPermissionDisposition(policy, request);
+    },
     clientFileSystem: {
-      readTextFile: (request, cwd) =>
-        readAntigravityClientTextFile({
+      readTextFile: (request, cwd) => {
+        const safety = evaluateToolSafety({
+          toolName: "Read",
+          rawInput: { file_path: request.path },
+          enabled: safetyGuardEnabled,
+        });
+        if (safety.decision === "deny") {
+          return Effect.fail(
+            EffectAcpErrors.AcpRequestError.invalidParams(
+              safety.reason ?? `Access to '${request.path}' blocked by T3 tool safety guard.`,
+            ),
+          );
+        }
+        return readAntigravityClientTextFile({
           fileSystem: options.fileSystem,
           path: options.path,
           allowedRoots: antigravityClientFileRoots(cwd),
           request,
-        }),
+        });
+      },
     },
     approvalOptions: antigravityApprovalOptions,
     extractPermissionQuestion: (request) => {
@@ -298,9 +364,22 @@ export const makeAntigravityAdapterV2 = Effect.fn("makeAntigravityAdapterV2")(fu
     path: yield* Path.Path,
     host: yield* ProviderHost.ProviderHost,
   };
+  const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
+  const toolSafetyGuardEnabled =
+    options.toolSafetyGuardEnabled ??
+    (Option.isSome(serverSettings)
+      ? serverSettings.value.getSettings.pipe(
+          Effect.map((settings) => settings.toolSafetyGuardEnabled),
+          Effect.orElseSucceed(() => true),
+        )
+      : Effect.succeed(true));
   return yield* makeAcpAdapterV2({
     instanceId: options.instanceId,
-    flavor: makeAntigravityAcpAdapterFlavor({ ...options, ...services }),
+    flavor: makeAntigravityAcpAdapterFlavor({
+      ...options,
+      toolSafetyGuardEnabled,
+      ...services,
+    }),
     selfInvocation: options.selfInvocation,
     ...(options.nativeLogging === undefined ? {} : { nativeLogging: options.nativeLogging }),
     ...(options.continuationRequests === undefined

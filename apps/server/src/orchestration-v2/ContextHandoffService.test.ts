@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import {
   ContextTransferId,
   MessageId,
+  PlanId,
   ProjectId,
   ProviderInstanceId,
   ProviderThreadId,
@@ -11,6 +12,7 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
+import { historyCost } from "@t3tools/provider-core/server/handoffBudget";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -301,3 +303,221 @@ it.effect("inherited history stops at a missing fork ancestor", () =>
     assert.deepEqual(items, []);
   }),
 );
+
+it.layer(layerTest)("ContextHandoffService structured cross-provider synthesis", (it) => {
+  it.effect(
+    "preserves files touched, decisions, verification state, and open steps across Claude <-> Antigravity switch",
+    () =>
+      Effect.gen(function* () {
+        const now = DateTime.makeUnsafe("2026-11-12T18:00:00.000Z");
+        const threadId = ThreadId.make("thread:claude-to-agy");
+        const base = {
+          threadId,
+          runId: RunId.make("run:1"),
+          nodeId: null,
+          providerThreadId: ProviderThreadId.make("provider-thread:claude"),
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          status: "completed" as const,
+          title: null,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+        };
+        const items: ReadonlyArray<OrchestrationV2TurnItem> = [
+          {
+            ...base,
+            id: TurnItemId.make("item:1"),
+            ordinal: 1,
+            type: "user_message",
+            messageId: MessageId.make("msg:1"),
+            createdBy: "user",
+            creationSource: "web",
+            inputIntent: "turn_start",
+            attachments: [],
+            text: "Implement automatic Claude <-> Antigravity quota fallback and structured context handoff synthesis.",
+          },
+          {
+            ...base,
+            id: TurnItemId.make("item:2"),
+            ordinal: 2,
+            type: "assistant_message",
+            messageId: MessageId.make("msg:2"),
+            streaming: false,
+            text: "Approach:\n- Decided to synthesize structured sections inside ContextHandoffService.\n- Implemented UsageLimitRecoveryWorker fallback routing.",
+          },
+          {
+            ...base,
+            id: TurnItemId.make("item:3"),
+            ordinal: 3,
+            type: "file_change",
+            fileName: "packages/contracts/src/settings.ts",
+            changes: [
+              { operation: "update", path: "packages/contracts/src/settings.ts" },
+              {
+                operation: "update",
+                path: "apps/server/src/orchestration-v2/ContextHandoffService.ts",
+              },
+            ],
+          },
+          {
+            ...base,
+            id: TurnItemId.make("item:4"),
+            ordinal: 4,
+            type: "command_execution",
+            status: "failed",
+            input: "vp.cmd test run src/orchestration-v2/ContextHandoffService.test.ts",
+            exitCode: 1,
+            output: "FAIL AssertionError: expected section header",
+          },
+          {
+            ...base,
+            id: TurnItemId.make("item:5"),
+            ordinal: 5,
+            type: "command_execution",
+            status: "completed",
+            input: "vp.cmd test run src/orchestration-v2/ContextHandoffService.test.ts",
+            exitCode: 0,
+            output: "Test Files 1 passed (1)",
+          },
+          {
+            ...base,
+            id: TurnItemId.make("item:6"),
+            ordinal: 6,
+            type: "command_execution",
+            status: "failed",
+            input: "vp.cmd lint apps/server/src/orchestration-v2/ContextHandoffService.ts",
+            exitCode: 1,
+            output: "error: prefer-effect-fn violation at line 42",
+          },
+          {
+            ...base,
+            id: TurnItemId.make("item:7"),
+            ordinal: 7,
+            type: "todo_list",
+            planId: PlanId.make("plan:1"),
+            steps: [
+              { id: "step-1", text: "Update settings schema", status: "completed" },
+              {
+                id: "step-2",
+                text: "Fix oxlint warning and run full typecheck",
+                status: "pending",
+              },
+            ],
+          },
+          {
+            ...base,
+            id: TurnItemId.make("item:8"),
+            ordinal: 8,
+            type: "error",
+            status: "failed",
+            failure: {
+              class: "usage_limit",
+              code: null,
+              message: "Claude rate limit reached; switching to Antigravity.",
+              retryable: true,
+            },
+          },
+        ];
+
+        const service = yield* ContextHandoffService.ContextHandoffServiceV2;
+        const handoff = yield* service.prepareProviderHandoff({
+          threadId,
+          targetRunId: RunId.make("run:2"),
+          transferId: ContextTransferId.make("transfer:claude-to-agy"),
+          fromProviderThreadIds: [ProviderThreadId.make("provider-thread:claude")],
+          toProviderThreadId: ProviderThreadId.make("provider-thread:antigravity"),
+          fromProviderInstanceId: ProviderInstanceId.make("claudeAgent"),
+          toProviderInstanceId: ProviderInstanceId.make("antigravity"),
+          coveredRunOrdinals: { from: 1, to: 1 },
+          strategy: "full_thread_summary",
+          items,
+          createdAt: now,
+        });
+
+        const coverage = handoff.history?.coverage ?? "";
+        assert.isAtMost(historyCost([], coverage), 3_800);
+        for (const section of [
+          "## Objective",
+          "## Key Decisions",
+          "## Files Modified",
+          "## Verification State",
+          "## Open Next Steps",
+        ]) {
+          assert.include(coverage, section);
+          assert.include(handoff.summaryText, section);
+        }
+        assert.include(coverage, "packages/contracts/src/settings.ts");
+        assert.include(coverage, "apps/server/src/orchestration-v2/ContextHandoffService.ts");
+        assert.include(
+          coverage,
+          "`vp.cmd test run src/orchestration-v2/ContextHandoffService.test.ts` -> passed (exit 0)",
+        );
+        assert.notInclude(
+          coverage,
+          "`vp.cmd test run src/orchestration-v2/ContextHandoffService.test.ts` -> failed (exit 1)",
+        );
+        assert.include(
+          coverage,
+          "`vp.cmd lint apps/server/src/orchestration-v2/ContextHandoffService.ts` -> failed (exit 1)",
+        );
+        assert.include(coverage, "[pending] Fix oxlint warning and run full typecheck");
+        assert.include(coverage, "usage_limit");
+      }),
+  );
+
+  it("bounds structured synthesis within a tight byte budget without breaking UTF-16", () => {
+    const now = DateTime.makeUnsafe("2026-11-12T18:00:00.000Z");
+    const threadId = ThreadId.make("thread:bounded");
+    const items: Array<OrchestrationV2TurnItem> = [
+      {
+        id: TurnItemId.make("item:u1"),
+        threadId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "user_message",
+        messageId: MessageId.make("msg:u1"),
+        createdBy: "user",
+        creationSource: "web",
+        inputIntent: "turn_start",
+        attachments: [],
+        text: `${"Objective 🧪 ".repeat(40)}done`,
+      },
+      ...Array.from({ length: 30 }, (_, index) => ({
+        id: TurnItemId.make(`item:f${index}`),
+        threadId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: index + 2,
+        status: "completed" as const,
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "file_change" as const,
+        fileName: `src/module-${index}/file-${index}.ts`,
+      })),
+    ];
+
+    const summary = ContextHandoffService.buildStructuredHandoffSummary(items, 900);
+    assert.isAtMost(Buffer.byteLength(summary, "utf8"), 900);
+    assert.isTrue(summary.isWellFormed());
+    assert.include(summary, "## Objective");
+    assert.include(summary, "## Files Modified");
+  });
+});

@@ -51,10 +51,12 @@ import {
   latestNativeContextUsage,
 } from "@t3tools/provider-core/server/handoffBudget";
 import { deliverContextHandoffs, withInlineContext } from "./ContextHandoffDelivery.ts";
+import { withSessionRsiLessonsPrefix } from "@t3tools/provider-core/server/orchestrationInstructions";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import * as RsiService from "./RsiService.ts";
 import {
   ContextHandoffBackgroundWorkError,
   knownProviderFailureMessage,
@@ -186,6 +188,7 @@ export const layer: Layer.Layer<
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
+    const layerRsiService = yield* Effect.serviceOption(RsiService.RsiService);
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
 
     const resolveRecreateBase = Effect.fn("ProviderTurnStartService.resolveRecreateBase")(
@@ -1726,6 +1729,35 @@ export const layer: Layer.Layer<
           ],
         });
       });
+      const hasPriorProviderTurns = projection.providerTurns.some(
+        (turn) => turn.providerThreadId === providerThread.id,
+      );
+      const isNewProviderSession =
+        !goalCommand &&
+        !isCompactionCommandMessage(message) &&
+        (resumeFellBack ||
+          portableForkFallback !== undefined ||
+          (providerThread.nativeThreadRef === null &&
+            nativeForkTransfer === undefined &&
+            !hasPriorProviderTurns));
+      const runtimeRsiService = yield* Effect.serviceOption(RsiService.RsiService);
+      const rsiService = Option.orElse(runtimeRsiService, () => layerRsiService);
+      const activePaths = (message.context?.records ?? []).flatMap((record) => {
+        if ("path" in record && typeof record.path === "string") return [record.path];
+        if ("filePath" in record && typeof record.filePath === "string") return [record.filePath];
+        return [];
+      });
+      const sessionRsiPrefix =
+        !isNewProviderSession || Option.isNone(rsiService)
+          ? ""
+          : yield* rsiService.value
+              .formatSessionPrefix({
+                cwd: resolvedRuntimePolicy.cwd,
+                activePaths,
+                provider: session.driver,
+                maxChars: 600,
+              })
+              .pipe(Effect.catchCause(() => Effect.succeed("")));
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
           const delivery = yield* deliverContextHandoffs({
@@ -1755,12 +1787,19 @@ export const layer: Layer.Layer<
           const context = [delivery.context, sideChatContext, restartNote]
             .filter((part) => part !== "")
             .join("\n\n");
+          const turnPrompt = goalCommand
+            ? userText
+            : withSessionRsiLessonsPrefix({
+                prompt: withInlineContext(context, userText),
+                rsiPrefix: compact ? undefined : sessionRsiPrefix,
+                isNewSession: !compact && isNewProviderSession,
+              });
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
           yield* start({
             ...(noteContinuation ? promptedInput : turnInput),
             message: {
               ...turnInput.message,
-              text: goalCommand ? userText : withInlineContext(context, userText),
+              text: turnPrompt,
             },
           }).pipe(
             // Clear pending handoff markers for refused prompts so the next turn retains the native session.
@@ -1820,7 +1859,8 @@ export const layer: Layer.Layer<
         retryHandoff.length === 0 &&
         sideChatHandoff === undefined &&
         restartNote === "" &&
-        !noteContinuation
+        !noteContinuation &&
+        sessionRsiPrefix === ""
           ? session
           : makeDeliverySession(session, startWithHandoffs);
       return runExecution.startRootRun({

@@ -356,6 +356,144 @@ const EnvironmentUnlinkTool = Tool.make("t3_environment_unlink", {
   .annotate(Tool.Idempotent, true)
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenWhileLinksOff);
 
+const RsiLessonScopeSchema = Schema.Literals(["global", "glob"]);
+
+const RsiLessonSchema = Schema.Struct({
+  id: Schema.String,
+  key: Schema.String,
+  title: Schema.String,
+  guidance: Schema.String,
+  rationaleTrace: Schema.String,
+  triggerCondition: Schema.String,
+  scope: RsiLessonScopeSchema,
+  globs: Schema.Array(Schema.String),
+  confidence: Schema.Number,
+  hits: Schema.Number,
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+});
+
+const RsiQueryLessonsInput = Schema.Struct({
+  scope: Schema.optional(RsiLessonScopeSchema),
+  provider: Schema.optional(Schema.String),
+  tool: Schema.optional(Schema.String),
+  cwd: Schema.optional(Schema.String),
+  activePaths: Schema.optional(Schema.Array(Schema.String)),
+  query: Schema.optional(Schema.String),
+  minConfidence: Schema.optional(Schema.Number),
+  limit: Schema.optional(Schema.Number),
+});
+
+const RsiQueryLessonsResult = Schema.Struct({
+  lessons: Schema.Array(RsiLessonSchema),
+  count: Schema.Number,
+});
+
+const RsiRecordLessonInput = Schema.Struct({
+  id: Schema.optional(Schema.String),
+  key: Schema.optional(Schema.String),
+  provider: Schema.optional(Schema.String),
+  tool: Schema.optional(Schema.String),
+  errorSignature: Schema.optional(Schema.String),
+  title: Schema.String,
+  guidance: Schema.String,
+  rationaleTrace: Schema.optional(Schema.String),
+  triggerCondition: Schema.optional(Schema.String),
+  scope: Schema.optional(RsiLessonScopeSchema),
+  globs: Schema.optional(Schema.Array(Schema.String)),
+  confidence: Schema.optional(Schema.Number),
+  hits: Schema.optional(Schema.Number),
+});
+
+const RsiRecordLessonResult = Schema.Struct({
+  lesson: RsiLessonSchema,
+});
+
+const RsiTelemetrySummaryInput = Schema.Struct({
+  threadId: Schema.optional(Schema.String),
+  provider: Schema.optional(Schema.String),
+  limit: Schema.optional(Schema.Number),
+});
+
+const RsiTelemetrySummaryResult = Schema.Struct({
+  totalRuns: Schema.Number,
+  successCount: Schema.Number,
+  failureCount: Schema.Number,
+  loopTrips: Schema.Number,
+  safetyBlocks: Schema.Number,
+  totalToolErrors: Schema.Number,
+  totalWastedReads: Schema.Number,
+  totalTokens: Schema.Number,
+  totalCachedInputTokens: Schema.Number,
+  avgCacheHitRate: Schema.Number,
+  avgDurationMs: Schema.Number,
+  byProvider: Schema.Array(
+    Schema.Struct({
+      provider: Schema.String,
+      runs: Schema.Number,
+      failures: Schema.Number,
+      loopTrips: Schema.Number,
+      safetyBlocks: Schema.Number,
+      avgCacheHitRate: Schema.Number,
+    }),
+  ),
+  recentRuns: Schema.Array(
+    Schema.Struct({
+      threadId: Schema.String,
+      runId: Schema.String,
+      provider: Schema.String,
+      model: Schema.String,
+      usedTokens: Schema.Number,
+      cachedInputTokens: Schema.Number,
+      cacheHitRate: Schema.Number,
+      toolErrorCount: Schema.Number,
+      loopTripped: Schema.Boolean,
+      safetyBlockedCount: Schema.Number,
+      wastedReads: Schema.Number,
+      outcome: Schema.String,
+      durationMs: Schema.Number,
+      timestamp: Schema.String,
+    }),
+  ),
+});
+
+const RsiQueryLessonsTool = Tool.make("rsi_query_lessons", {
+  description: "Query curated RSI lessons filtered by scope, provider, paths, or search text.",
+  parameters: RsiQueryLessonsInput,
+  success: RsiQueryLessonsResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Query RSI lessons")
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
+const RsiRecordLessonTool = Tool.make("rsi_record_lesson", {
+  description: "Record or reinforce an RSI lesson into the ACE-curated lesson store.",
+  parameters: RsiRecordLessonInput,
+  success: RsiRecordLessonResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Record RSI lesson")
+  .annotate(Tool.Destructive, false);
+
+const RsiTelemetrySummaryTool = Tool.make("rsi_telemetry_summary", {
+  description: "Summarize recent RSI run telemetry, cache hit rates, loop trips, and blocks.",
+  parameters: RsiTelemetrySummaryInput,
+  success: RsiTelemetrySummaryResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Get RSI telemetry summary")
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
 export const OrchestratorToolkit = Toolkit.make(
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
@@ -377,4 +515,7 @@ export const OrchestratorToolkit = Toolkit.make(
   EnvironmentLinksTool,
   EnvironmentLinkTool,
   EnvironmentUnlinkTool,
+  RsiQueryLessonsTool,
+  RsiRecordLessonTool,
+  RsiTelemetrySummaryTool,
 );

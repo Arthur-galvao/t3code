@@ -179,6 +179,10 @@
       "types": "./src/server/threadTitleContext.ts",
       "import": "./src/server/threadTitleContext.ts"
     },
+    "./server/toolSafetyGuard": {
+      "types": "./src/server/toolSafetyGuard.ts",
+      "import": "./src/server/toolSafetyGuard.ts"
+    },
     "./server/usage": {
       "types": "./src/server/usage.ts",
       "import": "./src/server/usage.ts"

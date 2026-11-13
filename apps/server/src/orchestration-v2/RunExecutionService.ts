@@ -54,6 +54,7 @@ import {
   makeProviderFailure,
   makeProviderFailureTurnItem,
 } from "@t3tools/provider-core/server/failure";
+import * as LoopCircuitBreaker from "./LoopCircuitBreaker.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
@@ -1037,6 +1038,18 @@ export const layer: Layer.Layer<
         const latestTurnItemOrdinal = yield* Ref.make(input.providerTurnOrdinal * 100);
         const latestProviderThread = yield* Ref.make(input.providerThread);
         const latestRootProviderTurn = yield* Ref.make<OrchestrationV2ProviderTurn | null>(null);
+        const loopCircuitBreakerEnabled = yield* serverSettings.getSettings.pipe(
+          Effect.map(
+            (settings) =>
+              resolveProjectSettings(settings, input.appThread.projectId).settings
+                .loopCircuitBreakerEnabled !== false,
+          ),
+          Effect.catchCause(() => Effect.succeed(true)),
+        );
+        const loopBreakerState = yield* Ref.make(
+          LoopCircuitBreaker.createLoopCircuitBreakerState(),
+        );
+        const loopBreakerTripped = yield* Ref.make(false);
         // Later root turns in one attempt are provider continuations, such as Codex goal turns.
         let firstRootProviderTurnId: ProviderTurnId | undefined;
         const analyticsContext = {
@@ -1661,6 +1674,98 @@ export const layer: Layer.Layer<
             yield* Ref.update(latestTurnItemOrdinal, (current) =>
               Math.max(current, event.turnItem.ordinal),
             );
+          }
+          if (
+            loopCircuitBreakerEnabled &&
+            event.type === "turn_item.updated" &&
+            event.turnItem.threadId === input.run.threadId &&
+            !(yield* Ref.get(loopBreakerTripped))
+          ) {
+            const evaluation = yield* Ref.modify(loopBreakerState, (current) => {
+              const result = LoopCircuitBreaker.evaluateLoopCircuitBreaker(current, event.turnItem);
+              return [result.decision, result.state];
+            });
+            if (evaluation.tripped) {
+              yield* Ref.set(loopBreakerTripped, true);
+              const reason = evaluation.reason;
+              yield* Effect.logWarning("orchestration V2 loop circuit breaker tripped", {
+                runId: input.run.id,
+                threadId: input.run.threadId,
+                category: evaluation.category,
+                signature: evaluation.signature,
+                reason,
+              });
+              const now = yield* DateTime.now;
+              const noticeEvent: OrchestrationV2DomainEvent = {
+                id: yield* idAllocator.allocate.event({ threadId: input.run.threadId }),
+                type: "turn-item.updated",
+                threadId: input.run.threadId,
+                runId: input.run.id,
+                providerInstanceId: input.run.providerInstanceId,
+                occurredAt: now,
+                payload: {
+                  id: idAllocator.derive.runSignalTurnItem({
+                    runId: input.run.id,
+                    signal: "loop-circuit-breaker",
+                  }),
+                  threadId: input.run.threadId,
+                  runId: input.run.id,
+                  nodeId: null,
+                  providerThreadId: event.turnItem.providerThreadId ?? null,
+                  providerTurnId: event.turnItem.providerTurnId ?? null,
+                  nativeItemRef: null,
+                  parentItemId: null,
+                  ordinal: yield* Ref.updateAndGet(latestTurnItemOrdinal, (ordinal) => ordinal + 1),
+                  status: "completed",
+                  title: "Circuit Breaker",
+                  startedAt: now,
+                  completedAt: now,
+                  updatedAt: now,
+                  type: "system_notice",
+                  message: `[Circuit Breaker] ${reason}`,
+                },
+              };
+              yield* Effect.suspend(() =>
+                eventSink.write({
+                  events: [noticeEvent],
+                }),
+              ).pipe(
+                Effect.catchCauseIf(
+                  (cause) => !Cause.hasInterruptsOnly(cause),
+                  (cause) =>
+                    Effect.logWarning(
+                      "orchestration V2 failed to record loop circuit breaker notice",
+                      { runId: input.run.id, cause },
+                    ),
+                ),
+              );
+              const routing = yield* Ref.get(eventRouting);
+              const rootProviderTurn = yield* Ref.get(latestRootProviderTurn);
+              const providerTurnId =
+                event.turnItem.providerTurnId ??
+                routing.rootProviderTurnId ??
+                rootProviderTurn?.id ??
+                null;
+              if (providerTurnId !== null && !routing.rootTurnEnded) {
+                yield* Ref.get(latestProviderThread).pipe(
+                  Effect.flatMap((providerThread) =>
+                    input.session.interruptTurn({
+                      providerThread,
+                      providerTurnId,
+                    }),
+                  ),
+                  Effect.catchCauseIf(
+                    (cause) => !Cause.hasInterruptsOnly(cause),
+                    (cause) =>
+                      Effect.logWarning(
+                        "orchestration V2 failed to interrupt turn after loop circuit breaker tripped",
+                        { runId: input.run.id, cause },
+                      ),
+                  ),
+                  Effect.forkIn(scope),
+                );
+              }
+            }
           }
           if (event.type === "turn.terminal") {
             yield* Ref.set(terminalEvent, event);

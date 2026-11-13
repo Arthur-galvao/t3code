@@ -47,6 +47,7 @@ import {
   getSessionMessages,
   getSubagentMessages,
   type HookCallback,
+  type HookJSONOutput,
   type McpServerStatus as ClaudeMcpServerStatus,
   query,
   resolveSettings as resolveClaudeSettings,
@@ -58,6 +59,7 @@ import {
   type Settings as ClaudeSdkSettings,
   type SpawnOptions as ClaudeSpawnOptions,
   type SpawnedProcess as ClaudeSpawnedProcess,
+  type SyncHookJSONOutput,
   type SDKAssistantMessage,
   type SDKAPIRetryMessage,
   type SDKMessage,
@@ -185,6 +187,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
+import { evaluateToolSafety } from "@t3tools/provider-core/server/toolSafetyGuard";
 import {
   claudeSignedOutMessage,
   makeClaudeEnvironment,
@@ -1965,6 +1968,7 @@ export function makeClaudeQueryOptions(input: {
   readonly onUserDialog?: ClaudeQueryOptions["onUserDialog"];
   readonly onElicitation?: ClaudeQueryOptions["onElicitation"];
   readonly supportedDialogKinds?: ClaudeQueryOptions["supportedDialogKinds"];
+  readonly hooks?: ClaudeQueryOptions["hooks"];
   readonly allowDangerouslySkipPermissions?: boolean;
   readonly appendSystemPromptFileText?: string;
   // Flag settings, because a user's settings.json env beats the process env in Claude Code.
@@ -2104,8 +2108,20 @@ export function makeClaudeQueryOptions(input: {
         ...launchAppendSystemPrompt,
       ].join("\n\n"),
     },
-    ...(deviceInstructions
-      ? { hooks: { SubagentStart: [{ hooks: [subagentDeviceInstructions] }] } }
+    ...(deviceInstructions || input.hooks !== undefined
+      ? {
+          hooks: {
+            ...input.hooks,
+            ...(deviceInstructions
+              ? {
+                  SubagentStart: [
+                    ...(input.hooks?.SubagentStart ?? []),
+                    { hooks: [subagentDeviceInstructions] },
+                  ],
+                }
+              : {}),
+          },
+        }
       : {}),
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };
@@ -2216,6 +2232,8 @@ export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
   "mcp__t3-code__t3_preview_list",
   "mcp__t3-code__t3_environment_read",
   "mcp__t3-code__t3_environment_links",
+  "mcp__t3-code__rsi_query_lessons",
+  "mcp__t3-code__rsi_telemetry_summary",
   "mcp__t3-code__html_preview",
   "mcp__t3-code__html_render",
 ];
@@ -5225,6 +5243,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
+  const readToolSafetyGuardEnabled = Effect.fnUntraced(function* () {
+    if (Option.isNone(serverSettings)) {
+      return true;
+    }
+    return yield* serverSettings.value.getSettings.pipe(
+      Effect.map((settings) => settings.toolSafetyGuardEnabled),
+      Effect.orElseSucceed(() => true),
+    );
+  });
   const { attachmentsDir, fileSystem, path, random, idAllocator, queryRunner } = adapterOptions;
   const loadModelCatalog = (
     adapterOptions.modelCatalog ?? Effect.succeed(BUNDLED_CLAUDE_MODEL_CATALOG)
@@ -11399,6 +11426,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
           const nativeRequestId = callbackOptions.toolUseID;
           const nativeToolInput = claudeNativeToolInputFromRecord(toolInput);
+          const safetyGuardEnabled = yield* readToolSafetyGuardEnabled();
+          const safetyEvaluation =
+            toolName === "AskUserQuestion" || toolName === "ExitPlanMode"
+              ? ({ decision: "allow" } as const)
+              : evaluateToolSafety({
+                  toolName,
+                  rawInput: toolInput,
+                  enabled: safetyGuardEnabled,
+                });
           const heldForEcho = context.heldRootFrames.length > 0;
           const startToolCall = toolName !== "Agent" && options?.startToolCall !== false;
           if (toolName === "Agent") {
@@ -11423,7 +11459,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           if (
             heldForEcho &&
             toolName !== "ExitPlanMode" &&
-            (toolName === "AskUserQuestion" || requiresClaudeApproval(context))
+            (toolName === "AskUserQuestion" ||
+              requiresClaudeApproval(context) ||
+              safetyEvaluation.decision === "ask")
           ) {
             // The SDK blocks prompt echoes on permission answers; release held output except for ExitPlanMode.
             yield* releaseHeldRootFrames(context);
@@ -11528,6 +11566,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             } satisfies PermissionResult;
           }
 
+          if (safetyEvaluation.decision === "deny") {
+            return {
+              behavior: "deny",
+              message: safetyEvaluation.reason ?? "Tool execution blocked by T3 tool safety guard.",
+              toolUseID: callbackOptions.toolUseID,
+            } satisfies PermissionResult;
+          }
+
           if (
             context.input.runtimePolicy.interactionMode === "plan" &&
             context.input.runtimePolicy.approvalPolicy === "never"
@@ -11540,7 +11586,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             } satisfies PermissionResult;
           }
 
-          if (!requiresClaudeApproval(context)) {
+          if (!requiresClaudeApproval(context) && safetyEvaluation.decision !== "ask") {
             return {
               behavior: "allow",
               updatedInput: toolInput,
@@ -11587,7 +11633,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             presentation: claudeApprovalPresentation({
               permissionMode: context.queryPolicy.permissionMode,
               prompt,
-              callbackOptions,
+              callbackOptions:
+                safetyEvaluation.decision === "ask"
+                  ? {
+                      ...callbackOptions,
+                      ...(callbackOptions.decisionReason !== undefined
+                        ? { decisionReason: callbackOptions.decisionReason }
+                        : safetyEvaluation.reason !== undefined
+                          ? { decisionReason: safetyEvaluation.reason }
+                          : {}),
+                      suppressAlwaysAllowRule: true,
+                    }
+                  : callbackOptions,
             }),
           });
           const decision = yield* Deferred.make<ClaudeApprovalResponse, never>();
@@ -11649,6 +11706,44 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
         const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
           runPromise(canUseToolEffect(toolName, toolInput, callbackOptions));
+
+        const preToolUseSafetyHookEffect = Effect.fn("ClaudeAdapterV2.preToolUseSafetyHook")(
+          function* (hookInput: Parameters<HookCallback>[0]): Effect.fn.Return<HookJSONOutput> {
+            if (hookInput.hook_event_name !== "PreToolUse") {
+              return {} satisfies SyncHookJSONOutput;
+            }
+            const guardEnabled = yield* readToolSafetyGuardEnabled();
+            const safety = evaluateToolSafety({
+              toolName: hookInput.tool_name,
+              rawInput: hookInput.tool_input,
+              enabled: guardEnabled,
+            });
+            if (safety.decision === "deny") {
+              return {
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse",
+                  permissionDecision: "deny",
+                  permissionDecisionReason:
+                    safety.reason ?? "Tool execution blocked by T3 tool safety guard.",
+                },
+              } satisfies SyncHookJSONOutput;
+            }
+            if (safety.decision === "ask") {
+              return {
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse",
+                  permissionDecision: "ask",
+                  permissionDecisionReason:
+                    safety.reason ?? "Tool execution requires user confirmation.",
+                },
+              } satisfies SyncHookJSONOutput;
+            }
+            return {} satisfies SyncHookJSONOutput;
+          },
+        );
+
+        const preToolUseSafetyHook: HookCallback = (hookInput) =>
+          runPromise(preToolUseSafetyHookEffect(hookInput));
 
         const onElicitationEffect = Effect.fn("ClaudeAdapterV2.onElicitation")(function* (
           request: ElicitationRequest,
@@ -12078,6 +12173,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   allowDangerouslySkipPermissions: queryPolicy.allowDangerouslySkipPermissions,
                 }),
             canUseTool,
+            hooks: { PreToolUse: [{ hooks: [preToolUseSafetyHook] }] },
             onUserDialog,
             onElicitation,
             supportedDialogKinds: ["resume_return"],

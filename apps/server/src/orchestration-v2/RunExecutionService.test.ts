@@ -3454,6 +3454,7 @@ function captureRootRunTermination(input: {
   readonly afterStart?: (
     closed: Deferred.Deferred<void>,
   ) => Effect.Effect<void, never, PreviewAgentActivity.PreviewAgentActivity>;
+  readonly settingsOverrides?: Parameters<typeof ServerSettings.layerTest>[0];
 }) {
   return Effect.gen(function* () {
     const ids = backgroundScenarioIds(input.key);
@@ -3531,7 +3532,7 @@ function captureRootRunTermination(input: {
           Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
             ingestNormalized: input.ingestNormalized ?? (() => Effect.succeed([])),
           }),
-          ServerSettings.layerTest(),
+          ServerSettings.layerTest(input.settingsOverrides),
           Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
             refresh: () => Effect.void,
             refreshAfterTurn: () =>
@@ -4623,5 +4624,124 @@ it.effect("drops a child's held text once the child is handed to another run", (
     yield* Fiber.join(scenario);
 
     assert.deepEqual(yield* Ref.get(staleWrites), []);
+  }),
+);
+
+it.effect(
+  "trips the loop circuit breaker on 3 consecutive identical tool failures, emits a notice, and interrupts the active turn",
+  () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const interruptCalls = yield* Ref.make(0);
+      const interrupted = yield* Deferred.make<void>();
+      const makeCommandFailure = (
+        ids: BackgroundScenarioIds,
+        ordinal: number,
+      ): ProviderAdapter.ProviderAdapterV2Event => ({
+        type: "turn_item.updated",
+        driver: ProviderDriverKind.make("codex"),
+        turnItem: {
+          id: TurnItemId.make(`breaker-fail-${ordinal}`),
+          threadId: ids.threadId,
+          runId: ids.runId,
+          nodeId: null,
+          providerThreadId: ids.providerThreadId,
+          providerTurnId: ids.rootProviderTurnId,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal,
+          status: "failed",
+          title: "Run tests",
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          type: "command_execution",
+          input: "vitest run src/foo.test.ts",
+          output: "AssertionError: expected 1 to be 2",
+          exitCode: 1,
+        },
+      });
+
+      const result = yield* captureRootRunTermination({
+        key: "loop-circuit-breaker-trips",
+        shouldFinalizeRun: () => Effect.succeed(true),
+        interruptTurn: () =>
+          Effect.gen(function* () {
+            yield* Ref.update(interruptCalls, (count) => count + 1);
+            yield* Deferred.succeed(interrupted, undefined);
+          }),
+        events: (ids) =>
+          Stream.fromIterable([
+            makeCommandFailure(ids, 1),
+            makeCommandFailure(ids, 2),
+            makeCommandFailure(ids, 3),
+          ]).pipe(
+            Stream.concat(
+              Stream.fromEffect(
+                Deferred.await(interrupted).pipe(Effect.as(rootTerminalEvent(ids, "interrupted"))),
+              ),
+            ),
+          ),
+      });
+
+      assert.strictEqual(yield* Ref.get(interruptCalls), 1);
+      const notice = result.written.find(
+        (item) => item.type === "system_notice" && item.message.startsWith("[Circuit Breaker]"),
+      );
+      assert.isDefined(notice);
+    }),
+);
+
+it.effect("does not trip or interrupt when loopCircuitBreakerEnabled is false", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const interruptCalls = yield* Ref.make(0);
+    const makeCommandFailure = (
+      ids: BackgroundScenarioIds,
+      ordinal: number,
+    ): ProviderAdapter.ProviderAdapterV2Event => ({
+      type: "turn_item.updated",
+      driver: ProviderDriverKind.make("codex"),
+      turnItem: {
+        id: TurnItemId.make(`breaker-disabled-fail-${ordinal}`),
+        threadId: ids.threadId,
+        runId: ids.runId,
+        nodeId: null,
+        providerThreadId: ids.providerThreadId,
+        providerTurnId: ids.rootProviderTurnId,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal,
+        status: "failed",
+        title: "Run tests",
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "command_execution",
+        input: "vitest run src/foo.test.ts",
+        output: "AssertionError: expected 1 to be 2",
+        exitCode: 1,
+      },
+    });
+
+    const result = yield* captureRootRunTermination({
+      key: "loop-circuit-breaker-disabled",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      settingsOverrides: { loopCircuitBreakerEnabled: false },
+      interruptTurn: () => Ref.update(interruptCalls, (count) => count + 1),
+      events: (ids) =>
+        Stream.fromIterable([
+          makeCommandFailure(ids, 1),
+          makeCommandFailure(ids, 2),
+          makeCommandFailure(ids, 3),
+          rootTerminalEvent(ids, "completed"),
+        ]),
+    });
+
+    assert.strictEqual(yield* Ref.get(interruptCalls), 0);
+    const notice = result.written.find(
+      (item) => item.type === "system_notice" && item.message.startsWith("[Circuit Breaker]"),
+    );
+    assert.isUndefined(notice);
   }),
 );

@@ -530,3 +530,34 @@ describe("server model preferences", () => {
     expect(decodeServerSettingsPatch(input)).toEqual(input);
   });
 });
+
+describe("workflow safety & fallback settings", () => {
+  it("defaults workflow protection and auto-fallback fields backwards-compatibly", () => {
+    const decoded = decodeServerSettings({});
+    expect(decoded.toolSafetyGuardEnabled).toBe(true);
+    expect(decoded.loopCircuitBreakerEnabled).toBe(true);
+    expect(decoded.rsiAutoDistillEnabled).toBe(true);
+    expect(decoded.autoFallbackOnUsageLimit).toBe(true);
+    expect(decoded.verificationGateMode).toBe("auto");
+    expect(DEFAULT_SERVER_SETTINGS).toMatchObject({
+      toolSafetyGuardEnabled: true,
+      loopCircuitBreakerEnabled: true,
+      rsiAutoDistillEnabled: true,
+      autoFallbackOnUsageLimit: true,
+      verificationGateMode: "auto",
+    });
+  });
+
+  it("round-trips and validates patches for workflow protection settings", () => {
+    const patch = {
+      toolSafetyGuardEnabled: false,
+      loopCircuitBreakerEnabled: false,
+      rsiAutoDistillEnabled: false,
+      autoFallbackOnUsageLimit: false,
+      verificationGateMode: "goal" as const,
+    };
+    expect(decodeServerSettingsPatch(patch)).toEqual(patch);
+    expect(encodeServerSettingsPatch(patch)).toEqual(patch);
+    expect(() => decodeServerSettingsPatch({ verificationGateMode: "invalid" })).toThrow();
+  });
+});

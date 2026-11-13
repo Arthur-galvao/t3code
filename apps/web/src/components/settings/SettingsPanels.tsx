@@ -25,6 +25,7 @@ import {
   SidebarProjectSortOrder,
   ScreenReaderAnnouncements,
   ToolCallVisibility,
+  type VerificationGateMode,
 } from "@t3tools/contracts/settings";
 import { desktopUpdateChannelOf } from "@t3tools/shared/cliRelease";
 import { createModelSelection } from "@t3tools/shared/model";
@@ -129,6 +130,18 @@ const RESPONSE_STREAMING_MODE_LABELS: Record<ResponseStreamingMode, string> = {
 const RESPONSE_STREAMING_MODE_DESCRIPTIONS: Record<ResponseStreamingMode, string> = {
   turn: "Text appears once the agent finishes its turn.",
   paragraph: "Each paragraph or code block appears as soon as it is complete.",
+};
+
+const VERIFICATION_GATE_MODE_LABELS: Record<VerificationGateMode, string> = {
+  off: "Off",
+  goal: "Goal threads only",
+  auto: "Automatic",
+};
+
+const VERIFICATION_GATE_MODE_DESCRIPTIONS: Record<VerificationGateMode, string> = {
+  off: "Skip automatic post-edit verification checks before ending turns.",
+  goal: "Require a passing test, typecheck, or lint run after source edits on /goal threads.",
+  auto: "Require a passing test, typecheck, or lint run after source code edits before settling.",
 };
 
 const SIDEBAR_PROJECT_SORT_ORDER_LABELS: Record<SidebarProjectSortOrder, string> = {
@@ -1759,6 +1772,7 @@ export function ThreadsSettingsPanel() {
   );
   const mixedAddProjectBaseDirectory = useScopedSettingsMixed(["addProjectBaseDirectory"]);
   const mixedTextGenerationModel = useScopedSettingsMixed(["textGenerationModelSelection"]);
+  const mixedVerificationGateMode = useScopedSettingsMixed(["verificationGateMode"]);
 
   return (
     <SettingsPageContainer>
@@ -1859,6 +1873,184 @@ export function ThreadsSettingsPanel() {
               }
               aria-label="Snooze until limits reset"
             />
+          }
+        />
+        <SettingsRow
+          serverScoped
+          id="auto-fallback-on-usage-limit"
+          title="Auto fallback on usage limit"
+          description="Automatically switch to your configured fallback provider (such as Claude <-> Antigravity) with a structured handoff when a usage limit is hit."
+          settingKeys={["autoFallbackOnUsageLimit"]}
+          resetAction={
+            hasServerTargets &&
+            settings.autoFallbackOnUsageLimit !==
+              DEFAULT_UNIFIED_SETTINGS.autoFallbackOnUsageLimit ? (
+              <SettingResetButton
+                label="auto fallback on usage limit"
+                onClick={() =>
+                  updateSettings({
+                    autoFallbackOnUsageLimit: DEFAULT_UNIFIED_SETTINGS.autoFallbackOnUsageLimit,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["autoFallbackOnUsageLimit"]}
+              checked={settings.autoFallbackOnUsageLimit}
+              onCheckedChange={(checked) =>
+                updateSettings({ autoFallbackOnUsageLimit: Boolean(checked) })
+              }
+              aria-label="Auto fallback on usage limit"
+            />
+          }
+        />
+      </SettingsSection>
+
+      <SettingsSection id="workflow-safeguards" title="Workflow safeguards">
+        <SettingsRow
+          serverScoped
+          id="tool-safety-guard"
+          title="Tool safety guard"
+          description="Block destructive shell commands, secret file access, and locked test tampering across providers even in Full access."
+          settingKeys={["toolSafetyGuardEnabled"]}
+          resetAction={
+            hasServerTargets &&
+            settings.toolSafetyGuardEnabled !== DEFAULT_UNIFIED_SETTINGS.toolSafetyGuardEnabled ? (
+              <SettingResetButton
+                label="tool safety guard"
+                onClick={() =>
+                  updateSettings({
+                    toolSafetyGuardEnabled: DEFAULT_UNIFIED_SETTINGS.toolSafetyGuardEnabled,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["toolSafetyGuardEnabled"]}
+              checked={settings.toolSafetyGuardEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ toolSafetyGuardEnabled: Boolean(checked) })
+              }
+              aria-label="Tool safety guard"
+            />
+          }
+        />
+        <SettingsRow
+          serverScoped
+          id="loop-circuit-breaker"
+          title="Anti-loop circuit breaker"
+          description="Interrupt turns automatically when repeated identical failures or A-B-A oscillation loops occur."
+          settingKeys={["loopCircuitBreakerEnabled"]}
+          resetAction={
+            hasServerTargets &&
+            settings.loopCircuitBreakerEnabled !==
+              DEFAULT_UNIFIED_SETTINGS.loopCircuitBreakerEnabled ? (
+              <SettingResetButton
+                label="anti-loop circuit breaker"
+                onClick={() =>
+                  updateSettings({
+                    loopCircuitBreakerEnabled: DEFAULT_UNIFIED_SETTINGS.loopCircuitBreakerEnabled,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["loopCircuitBreakerEnabled"]}
+              checked={settings.loopCircuitBreakerEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ loopCircuitBreakerEnabled: Boolean(checked) })
+              }
+              aria-label="Anti-loop circuit breaker"
+            />
+          }
+        />
+        <SettingsRow
+          serverScoped
+          id="rsi-auto-distill"
+          title="Auto RSI lesson distillation"
+          description="Record run telemetry and distill reusable lessons automatically from recurring failures and breaker trips."
+          settingKeys={["rsiAutoDistillEnabled"]}
+          resetAction={
+            hasServerTargets &&
+            settings.rsiAutoDistillEnabled !== DEFAULT_UNIFIED_SETTINGS.rsiAutoDistillEnabled ? (
+              <SettingResetButton
+                label="auto RSI lesson distillation"
+                onClick={() =>
+                  updateSettings({
+                    rsiAutoDistillEnabled: DEFAULT_UNIFIED_SETTINGS.rsiAutoDistillEnabled,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["rsiAutoDistillEnabled"]}
+              checked={settings.rsiAutoDistillEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ rsiAutoDistillEnabled: Boolean(checked) })
+              }
+              aria-label="Auto RSI lesson distillation"
+            />
+          }
+        />
+        <SettingsRow
+          serverScoped
+          id="verification-gate-mode"
+          title="Verification gate"
+          description={
+            mixedVerificationGateMode
+              ? "The selected targets use different verification gate modes."
+              : VERIFICATION_GATE_MODE_DESCRIPTIONS[settings.verificationGateMode]
+          }
+          settingKeys={["verificationGateMode"]}
+          resetAction={
+            hasServerTargets &&
+            settings.verificationGateMode !== DEFAULT_UNIFIED_SETTINGS.verificationGateMode ? (
+              <SettingResetButton
+                label="verification gate"
+                onClick={() =>
+                  updateSettings({
+                    verificationGateMode: DEFAULT_UNIFIED_SETTINGS.verificationGateMode,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Select
+              value={mixedVerificationGateMode ? null : settings.verificationGateMode}
+              onValueChange={(value) => {
+                if (value === "off" || value === "goal" || value === "auto") {
+                  updateSettings({ verificationGateMode: value });
+                }
+              }}
+            >
+              <SelectTrigger size="sm" className="w-full sm:w-56" aria-label="Verification gate">
+                <SelectValue>
+                  {(value: VerificationGateMode | null) =>
+                    value === null ? "Mixed" : VERIFICATION_GATE_MODE_LABELS[value]
+                  }
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                <SelectItem hideIndicator value="off">
+                  {VERIFICATION_GATE_MODE_LABELS.off}
+                </SelectItem>
+                <SelectItem hideIndicator value="goal">
+                  {VERIFICATION_GATE_MODE_LABELS.goal}
+                </SelectItem>
+                <SelectItem hideIndicator value="auto">
+                  {VERIFICATION_GATE_MODE_LABELS.auto}
+                </SelectItem>
+              </SelectPopup>
+            </Select>
           }
         />
       </SettingsSection>

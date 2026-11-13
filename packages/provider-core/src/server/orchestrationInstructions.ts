@@ -73,11 +73,31 @@ export interface T3AcpInstructionState {
   readonly hasDeviceTools: boolean;
 }
 
+function formatRsiLessonsBlock(rsiPrefix: string | undefined): string | undefined {
+  const trimmed = rsiPrefix?.trim() ?? "";
+  return trimmed === "" ? undefined : `<t3_code_rsi_lessons>\n${trimmed}\n</t3_code_rsi_lessons>`;
+}
+
+/** Prepend session-start RSI lessons only when establishing a new session (KV-cache safe). */
+export function withSessionRsiLessonsPrefix(input: {
+  readonly prompt: string;
+  readonly rsiPrefix?: string | undefined;
+  readonly isNewSession: boolean;
+}): string {
+  if (!input.isNewSession) return input.prompt;
+  // Native slash commands must remain at the start of the prompt.
+  if (input.prompt.trimStart().startsWith("/")) return input.prompt;
+  const block = formatRsiLessonsBlock(input.rsiPrefix);
+  if (block === undefined) return input.prompt;
+  return input.prompt.trim() === "" ? block : `${block}\n\n${input.prompt}`;
+}
+
 /** ACP lacks system/developer fields; inject context on first prompt and tool/mode changes. */
 export function t3AcpPromptWithInstructions(input: {
   readonly prompt: string;
   readonly state: T3AcpInstructionState;
   readonly previousState?: T3AcpInstructionState;
+  readonly rsiPrefix?: string | undefined;
 }): string {
   // Native slash commands must remain at the start of the prompt.
   if (input.prompt.trimStart().startsWith("/")) return input.prompt;
@@ -88,6 +108,8 @@ export function t3AcpPromptWithInstructions(input: {
   ) {
     return input.prompt;
   }
+  const rsiBlock =
+    input.previousState === undefined ? formatRsiLessonsBlock(input.rsiPrefix) : undefined;
   const instructions = [
     input.state.interactionMode === "plan"
       ? T3_CODE_ACP_PLAN_MODE_INSTRUCTIONS
@@ -100,6 +122,7 @@ export function t3AcpPromptWithInstructions(input: {
           T3_CODE_ACP_MCP_FALLBACK_INSTRUCTIONS,
         ]
       : []),
+    ...(rsiBlock !== undefined ? [rsiBlock] : []),
   ];
   return `<t3_code_instructions>\n${instructions.join("\n\n")}\n</t3_code_instructions>\n\n<user_request>\n${input.prompt}\n</user_request>`;
 }
@@ -120,13 +143,22 @@ export function t3OrchestrationPrompt(input: {
   readonly hasDeviceTools: boolean;
   readonly orchestrationDelivered: boolean;
   readonly deviceInstructionsDelivered: boolean;
+  readonly rsiPrefix?: string | undefined;
 }): string {
-  if (!input.hasT3Mcp) return input.prompt;
+  if (!input.hasT3Mcp) {
+    return withSessionRsiLessonsPrefix({
+      prompt: input.prompt,
+      rsiPrefix: input.rsiPrefix,
+      isNewSession: !input.orchestrationDelivered,
+    });
+  }
   if (!input.orchestrationDelivered) {
-    return prependT3OrchestrationInstructions(
-      input.prompt,
-      orchestrationInstructions(input.hasDeviceTools),
-    );
+    const rsiBlock = formatRsiLessonsBlock(input.rsiPrefix);
+    const instructions =
+      rsiBlock === undefined
+        ? orchestrationInstructions(input.hasDeviceTools)
+        : `${orchestrationInstructions(input.hasDeviceTools).trim()}\n\n${rsiBlock}`;
+    return prependT3OrchestrationInstructions(input.prompt, instructions);
   }
   return input.hasDeviceTools && !input.deviceInstructionsDelivered
     ? prependT3OrchestrationInstructions(input.prompt, T3_CODE_DEVICE_TOOL_INSTRUCTIONS)

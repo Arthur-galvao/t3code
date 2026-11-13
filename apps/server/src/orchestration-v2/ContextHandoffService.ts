@@ -20,6 +20,7 @@ import {
   handoffTokenCapConfig,
   handoffCoverage,
   historicalMessage,
+  historyCost,
   renderHistory,
   selectHistory,
 } from "@t3tools/provider-core/server/handoffBudget";
@@ -206,6 +207,280 @@ export const readForkHistoryItems = Effect.fn(
   ];
 });
 
+function boundUtf8(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const suffix = "...";
+  const targetBytes = Math.max(0, maxBytes - suffix.length);
+  let end = Math.min(text.length, targetBytes);
+  while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > targetBytes) {
+    end -= Math.max(
+      1,
+      Math.floor((Buffer.byteLength(text.slice(0, end), "utf8") - targetBytes) / 2),
+    );
+  }
+  if (end > 0) {
+    const last = text.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) {
+      end -= 1;
+    }
+  }
+  return end <= 0 ? "" : `${text.slice(0, end)}${suffix}`;
+}
+
+const VERIFICATION_COMMAND_RE =
+  /\b(test|vitest|jest|mocha|unittest|pytest|cargo\s+test|go\s+test|typecheck|tsc|tsgo|lint|oxlint|eslint|vp(?:\.cmd)?\s+(?:test|lint|check|run)|build|check|verify)\b/i;
+
+const DECISION_LINE_RE =
+  /^(?:[-*]\s+|#+\s+)|(?:\b(?:decided|decision|chose|choosing|switched|approach|architecture|implemented|added|fixed|updated|wired|note|constraint)\b)/i;
+
+const NEXT_STEP_LINE_RE =
+  /^(?:[-*]\s+)?(?:\b(?:next|todo|remaining|pending|still need|follow[- ]up|blocked on)\b)/i;
+
+function commandOutcomeLabel(
+  item: Extract<OrchestrationV2TurnItem, { readonly type: "command_execution" }>,
+): string {
+  if (
+    item.status === "failed" ||
+    item.outputIndicatesFailure === true ||
+    (item.exitCode !== undefined && item.exitCode !== 0)
+  ) {
+    return `failed (exit ${item.exitCode ?? "?"})`;
+  }
+  if (item.status === "completed") {
+    return `passed (exit ${item.exitCode ?? 0})`;
+  }
+  return item.status;
+}
+
+function summarizeCommandTail(output: string | undefined, maxLength = 160): string | null {
+  if (!output) return null;
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return null;
+  return compactText(lines.slice(-2).join(" | "), maxLength);
+}
+
+function extractHighlightLines(
+  text: string,
+  matcher: RegExp,
+  maxLines: number,
+  maxLineLength: number,
+): Array<string> {
+  const results: Array<string> = [];
+  const seen = new Set<string>();
+  for (const rawLine of text.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (trimmed.length === 0 || !matcher.test(trimmed)) continue;
+    const line = compactText(trimmed, maxLineLength);
+    if (seen.has(line)) continue;
+    seen.add(line);
+    results.push(line);
+    if (results.length >= maxLines) break;
+  }
+  return results;
+}
+
+/** Synthesize multi-turn / cross-provider activity into structured sections within a byte cap. */
+export function buildStructuredHandoffSummary(
+  items: ReadonlyArray<OrchestrationV2TurnItem>,
+  maxBytes = DEFAULT_HANDOFF_TOKEN_CAP,
+): string {
+  const userObjectives: Array<string> = [];
+  const decisionLines: Array<string> = [];
+  const filesByPath = new Map<string, string>();
+  const verificationByCmd = new Map<string, string>();
+  const openSteps: Array<string> = [];
+  let latestTodoList: Extract<OrchestrationV2TurnItem, { readonly type: "todo_list" }> | null =
+    null;
+  let latestAssistantText: string | null = null;
+
+  for (const item of items) {
+    switch (item.type) {
+      case "user_message": {
+        const text = item.text.trim();
+        if (text.length > 0 && text !== "/compact" && text !== "/logout") {
+          userObjectives.push(text);
+        }
+        break;
+      }
+      case "proposed_plan": {
+        const plan = compactText(item.markdown, 500);
+        if (plan.length > 0) {
+          decisionLines.push(`Plan: ${plan}`);
+        }
+        break;
+      }
+      case "assistant_message": {
+        const trimmed = item.text.trim();
+        if (trimmed.length === 0) break;
+        latestAssistantText = trimmed;
+        for (const line of extractHighlightLines(trimmed, DECISION_LINE_RE, 3, 280)) {
+          if (!decisionLines.includes(line)) {
+            decisionLines.push(line);
+          }
+        }
+        break;
+      }
+      case "compaction": {
+        if (item.summary) {
+          decisionLines.push(`Compacted summary: ${compactText(item.summary, 360)}`);
+        }
+        break;
+      }
+      case "file_change": {
+        if (item.changes && item.changes.length > 0) {
+          for (const change of item.changes) {
+            const detail = change.oldPath
+              ? `${change.operation}: ${change.path} (from ${change.oldPath})`
+              : `${change.operation}: ${change.path}`;
+            filesByPath.set(change.path, detail);
+          }
+        } else {
+          filesByPath.set(item.fileName, item.fileName);
+        }
+        break;
+      }
+      case "checkpoint": {
+        for (const file of item.files) {
+          if (!filesByPath.has(file.path)) {
+            filesByPath.set(file.path, `${file.kind}: ${file.path}`);
+          }
+        }
+        break;
+      }
+      case "command_execution": {
+        const command = compactText(item.input, 160);
+        if (command.length === 0) break;
+        const outcome = commandOutcomeLabel(item);
+        const isVerification = VERIFICATION_COMMAND_RE.test(item.input);
+        const isFailure = outcome.startsWith("failed");
+        if (isVerification || isFailure) {
+          const tail = isFailure ? summarizeCommandTail(item.output) : null;
+          verificationByCmd.set(
+            command,
+            tail ? `\`${command}\` -> ${outcome} (${tail})` : `\`${command}\` -> ${outcome}`,
+          );
+        }
+        break;
+      }
+      case "todo_list": {
+        latestTodoList = item;
+        break;
+      }
+      case "error": {
+        openSteps.push(
+          `Resolve provider error (${item.failure.class}): ${compactText(item.failure.message, 240)}`,
+        );
+        break;
+      }
+      case "run_interrupt_result": {
+        openSteps.push(`Interrupted: ${compactText(item.message, 200)}`);
+        break;
+      }
+      case "user_input_request":
+      case "approval_request": {
+        if (item.status !== "completed") {
+          openSteps.push(`Pending ${item.type} (${item.requestId})`);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  const objectiveBullets: Array<string> = [];
+  if (userObjectives.length === 0) {
+    objectiveBullets.push("- No user objective recorded.");
+  } else {
+    objectiveBullets.push(`- Primary: ${compactText(userObjectives[0]!, 500)}`);
+    const latest = userObjectives.at(-1)!;
+    if (userObjectives.length > 1 && latest !== userObjectives[0]) {
+      objectiveBullets.push(`- Latest request: ${compactText(latest, 400)}`);
+    }
+  }
+
+  if (decisionLines.length === 0 && latestAssistantText !== null) {
+    decisionLines.push(compactText(latestAssistantText, 400));
+  }
+  const decisionBullets =
+    decisionLines.length === 0
+      ? ["- No key decisions recorded."]
+      : decisionLines.slice(-6).map((line) => (line.startsWith("- ") ? line : `- ${line}`));
+
+  const fileEntries = Array.from(filesByPath.values());
+  const fileBullets =
+    fileEntries.length === 0
+      ? ["- None recorded."]
+      : fileEntries.slice(-25).map((entry) => `- ${entry}`);
+
+  const verificationEntries = Array.from(verificationByCmd.values());
+  const verificationBullets =
+    verificationEntries.length === 0
+      ? ["- No verification commands recorded."]
+      : verificationEntries.slice(-10).map((entry) => `- ${entry}`);
+
+  if (latestTodoList !== null) {
+    for (const step of latestTodoList.steps) {
+      if (step.status !== "completed") {
+        openSteps.push(`[${step.status}] ${compactText(step.text, 200)}`);
+      }
+    }
+  }
+  if (openSteps.length === 0 && latestAssistantText !== null) {
+    for (const line of extractHighlightLines(latestAssistantText, NEXT_STEP_LINE_RE, 3, 240)) {
+      openSteps.push(line.replace(/^[-*]\s+/, ""));
+    }
+  }
+  const nextStepBullets =
+    openSteps.length === 0
+      ? ["- Continue from the latest completed state."]
+      : openSteps.slice(-6).map((step) => `- ${step}`);
+
+  const renderSections = (limits: {
+    readonly files: number;
+    readonly verification: number;
+    readonly decisions: number;
+    readonly nextSteps: number;
+  }) =>
+    [
+      "## Objective",
+      ...objectiveBullets,
+      "",
+      "## Key Decisions",
+      ...decisionBullets.slice(-limits.decisions),
+      "",
+      "## Files Modified",
+      ...fileBullets.slice(-limits.files),
+      "",
+      "## Verification State",
+      ...verificationBullets.slice(-limits.verification),
+      "",
+      "## Open Next Steps",
+      ...nextStepBullets.slice(-limits.nextSteps),
+    ].join("\n");
+
+  const candidateLimits = [
+    { files: 25, verification: 10, decisions: 6, nextSteps: 6 },
+    { files: 15, verification: 6, decisions: 3, nextSteps: 4 },
+    { files: 8, verification: 4, decisions: 2, nextSteps: 2 },
+    { files: 4, verification: 2, decisions: 1, nextSteps: 1 },
+  ];
+  for (const limits of candidateLimits) {
+    const rendered = renderSections(limits);
+    if (Buffer.byteLength(rendered, "utf8") <= maxBytes) {
+      return rendered;
+    }
+  }
+  return boundUtf8(
+    renderSections({ files: 4, verification: 2, decisions: 1, nextSteps: 1 }),
+    maxBytes,
+  );
+}
+
 function summarizeDeltaItem(item: OrchestrationV2TurnItem): string | null {
   switch (item.type) {
     case "user_message":
@@ -213,11 +488,15 @@ function summarizeDeltaItem(item: OrchestrationV2TurnItem): string | null {
     case "assistant_message":
       return `- Assistant: ${compactText(item.text)}`;
     case "command_execution":
-      return `- Command: ${compactText(item.input)}`;
+      return `- Command (${commandOutcomeLabel(item)}): ${compactText(item.input, 320)}`;
     case "file_change":
-      return `- File change: ${compactText(item.changes?.map((change) => change.path).join(", ") ?? item.fileName)}`;
+      return `- File change: ${compactText(item.changes?.map((change) => change.path).join(", ") ?? item.fileName, 400)}`;
     case "checkpoint":
       return `- Checkpoint: ${item.files.length} files`;
+    case "proposed_plan":
+      return `- Plan: ${compactText(item.markdown, 320)}`;
+    case "error":
+      return `- Error (${item.failure.class}): ${compactText(item.failure.message, 320)}`;
     case "handoff":
       return `- Handoff: ${compactText(item.summary ?? item.strategy)}`;
     default:
@@ -230,20 +509,23 @@ function makeForkDeltaSummary(input: {
   readonly targetThreadId: ThreadId;
   readonly coveredRunOrdinals: OrchestrationV2ContextHandoff["coveredRunOrdinals"];
   readonly deltaItems: ReadonlyArray<OrchestrationV2TurnItem>;
+  readonly maxBytes?: number;
 }): string {
-  const itemLines = input.deltaItems.flatMap((item) => {
-    const line = summarizeDeltaItem(item);
-    return line === null ? [] : [line];
-  });
-  return [
+  const header = [
     "Merge-back context from forked conversation.",
     `Source thread: ${input.sourceThreadId}`,
     `Target thread: ${input.targetThreadId}`,
     `Covered fork runs: ${input.coveredRunOrdinals.from}-${input.coveredRunOrdinals.to}`,
     "",
-    "Fork delta:",
-    ...(itemLines.length === 0 ? ["- No user-visible delta items."] : itemLines),
   ].join("\n");
+  if (input.deltaItems.length === 0) {
+    return `${header}Fork delta:\n- No user-visible delta items.`;
+  }
+  const budget = Math.max(
+    512,
+    (input.maxBytes ?? DEFAULT_HANDOFF_TOKEN_CAP) - Buffer.byteLength(header, "utf8"),
+  );
+  return `${header}${buildStructuredHandoffSummary(input.deltaItems, budget)}`;
 }
 
 const SIDE_CHAT_CONTEXT_MAX_CHARS = 8_000;
@@ -471,7 +753,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           strategy: "fork_delta_summary",
           status: "ready",
           summaryMessageId: null,
-          summaryText: makeForkDeltaSummary(input),
+          summaryText: makeForkDeltaSummary({ ...input, maxBytes: tokenCap }),
           history: {
             messages: selected.messages,
             coverage,
@@ -524,10 +806,32 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           ),
         );
       const runStatuses = new Map(input.runs?.map((run) => [run.id, run.status]));
-      const coverage = handoffCoverage({
+      const baseCoverage = handoffCoverage({
         ...input,
         threadId: input.sourceThreadId ?? input.threadId,
       });
+      // Keep structured synthesis under ContextHandoffDelivery's 4KB / half-budget coverage limit
+      // so the target provider receives exact files touched and verification state verbatim.
+      const maxCoverageCost = Math.min(3_800, Math.floor(tokenCap / 2));
+      let synthesisBudget = Math.max(
+        0,
+        maxCoverageCost - historyCost([], `${baseCoverage}\n\n`) - 128,
+      );
+      let structuredSynthesis =
+        synthesisBudget >= 256 ? buildStructuredHandoffSummary(input.items, synthesisBudget) : "";
+      while (
+        structuredSynthesis.length > 0 &&
+        historyCost([], `${baseCoverage}\n\n${structuredSynthesis}`) > maxCoverageCost &&
+        synthesisBudget > 256
+      ) {
+        synthesisBudget = Math.floor(synthesisBudget * 0.75);
+        structuredSynthesis = buildStructuredHandoffSummary(input.items, synthesisBudget);
+      }
+      const coverage =
+        structuredSynthesis.length > 0 &&
+        historyCost([], `${baseCoverage}\n\n${structuredSynthesis}`) <= maxCoverageCost
+          ? `${baseCoverage}\n\n${structuredSynthesis}`
+          : baseCoverage;
       const selected = selectHistory({
         messages: input.items.flatMap((item) => {
           const message = historicalMessage(item);

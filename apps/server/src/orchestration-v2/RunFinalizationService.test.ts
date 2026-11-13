@@ -2,13 +2,28 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointScopeId,
+  MessageId,
+  NodeId,
   ProjectId,
+  ProviderInstanceId,
+  ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
   RunId,
   ThreadId,
+  TurnItemId,
+  type OrchestrationV2AppThread,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
+  type OrchestrationV2Run,
   type OrchestrationV2ThreadShell,
+  type OrchestrationV2TurnItem,
   type Project,
   type RepositoryIdentity,
 } from "@t3tools/contracts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -18,6 +33,7 @@ import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as TestClock from "effect/testing/TestClock";
 
+import * as ServerSettings from "../serverSettings.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ProjectEnrichment from "../project/ProjectEnrichmentService.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
@@ -27,7 +43,9 @@ import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as VcsStatusBroadcaster from "../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../workspace/WorkspaceEntries.ts";
 import * as CheckpointCapture from "./CheckpointCaptureService.ts";
+import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as RsiService from "./RsiService.ts";
 import * as RunFinalization from "./RunFinalizationService.ts";
 
 // Without a project the observer never touches enrichment, so its methods stay unimplemented.
@@ -396,3 +414,311 @@ it.effect("returns from the post-turn refresh while the identity resolver is sti
     assert.strictEqual(change.enrichment.repositoryIdentity?.canonicalKey, identity.canonicalKey);
   }).pipe(Effect.scoped, Effect.provide(layerIdentityRefresh(workspaceRoot, resolver)));
 });
+
+const makeFinalizationIntegrationFixture = (input: {
+  readonly key: string;
+  readonly turnItems: ReadonlyArray<OrchestrationV2TurnItem>;
+  readonly status?: OrchestrationV2Run["status"];
+}) =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make(`thread_${input.key}`);
+    const runId = RunId.make(`run_${input.key}`);
+    const scopeId = CheckpointScopeId.make(`scope_${input.key}`);
+    const attemptId = RunAttemptId.make(`attempt_${input.key}`);
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const providerThreadId = ProviderThreadId.make(`pt_${input.key}`);
+    const providerTurnId = ProviderTurnId.make(`pturn_${input.key}`);
+    const projectId = ProjectId.make(`proj_${input.key}`);
+
+    const writtenEvents: OrchestrationV2DomainEvent[] = [];
+    const telemetryInputs: RsiService.RsiRunTelemetryInput[] = [];
+
+    const appThread: OrchestrationV2AppThread = {
+      id: threadId,
+      projectId,
+      title: "Verification test thread",
+      modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      workspaceStrategy: { type: "root" },
+      lineage: { kind: "root", rootThreadId: threadId },
+      activeRunId: null,
+      latestRunId: runId,
+      archivedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    } as unknown as OrchestrationV2AppThread;
+
+    const run: OrchestrationV2Run = {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId,
+      modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
+      providerThreadId,
+      userMessageId: MessageId.make(`msg_${input.key}`),
+      rootNodeId: NodeId.make(`node_${input.key}`),
+      activeAttemptId: attemptId,
+      status: input.status ?? "completed",
+      requestedAt: now,
+      startedAt: now,
+      completedAt: DateTime.add(now, { seconds: 2 }),
+      checkpointId: null,
+      contextHandoffId: null,
+    };
+
+    const providerTurn: OrchestrationV2ProviderTurn = {
+      id: providerTurnId,
+      providerThreadId,
+      nodeId: NodeId.make(`node_${input.key}`),
+      runAttemptId: attemptId,
+      nativeTurnRef: null,
+      ordinal: 1,
+      status: "completed",
+      startedAt: now,
+      completedAt: now,
+      tokenUsage: {
+        usedTokens: 1200,
+        cachedInputTokens: 900,
+        updatedAt: DateTime.formatIso(now),
+      },
+      model: "gpt-5.4",
+    };
+
+    const providerThread: OrchestrationV2ProviderThread = {
+      id: providerThreadId,
+      driver: "codex",
+      providerInstanceId,
+      appThreadId: threadId,
+      nativeThreadRef: null,
+      status: "idle",
+      createdAt: now,
+      updatedAt: now,
+    } as OrchestrationV2ProviderThread;
+
+    const layer = RunFinalization.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(CheckpointCapture.CheckpointCaptureServiceV2)({
+            execute: () => Effect.void,
+          }),
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getCheckpointContext: () =>
+              Effect.succeed({
+                runs: [run],
+                checkpointScopes: [{ id: scopeId, runId, kind: "root_run" as const, cwd: "/repo" }],
+                checkpoints: [],
+              }),
+            getThreadRecords: () =>
+              Effect.succeed({
+                thread: appThread,
+                runs: [run],
+                providerThreads: [providerThread],
+                providerTurns: [providerTurn],
+                turnItems: input.turnItems,
+              }) as never,
+          }),
+          Layer.succeed(RunFinalization.RunFinalizationObserver, {
+            refresh: () => Effect.void,
+            refreshAfterTurn: () => Effect.void,
+          }),
+          Layer.mock(EventSink.EventSinkV2)({
+            write: (payload) =>
+              Effect.sync(() => {
+                writtenEvents.push(...payload.events);
+                return [];
+              }),
+          }),
+          IdAllocator.layer,
+          ServerSettings.layerTest(),
+          Layer.mock(RsiService.RsiService)({
+            recordRunTelemetry: (telemetry) =>
+              Effect.sync(() => {
+                telemetryInputs.push(telemetry);
+                return {
+                  ...telemetry,
+                  cacheHitRate: telemetry.cacheHitRate ?? 0,
+                  timestamp: DateTime.formatIso(now),
+                };
+              }),
+          }),
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const finalization = yield* RunFinalization.RunFinalizationService;
+      yield* finalization.finalize({ threadId, runId, scopeId });
+    }).pipe(Effect.provide(layer));
+
+    return { threadId, runId, writtenEvents, telemetryInputs };
+  });
+
+it.effect(
+  "emits Verification Gate notice for unverified source edits and records RSI telemetry on finalize",
+  () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread_gate_unverified");
+      const runId = RunId.make("run_gate_unverified");
+      const result = yield* makeFinalizationIntegrationFixture({
+        key: "gate_unverified",
+        turnItems: [
+          {
+            id: TurnItemId.make("edit-1"),
+            threadId,
+            runId,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "completed",
+            title: "Edit file",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "file_change",
+            fileName: "apps/server/src/app.ts",
+            changes: [{ operation: "edit", path: "apps/server/src/app.ts" }],
+          },
+        ],
+      });
+
+      assert.strictEqual(result.telemetryInputs.length, 1);
+      assert.strictEqual(result.telemetryInputs[0]?.usedTokens, 1200);
+      assert.strictEqual(result.telemetryInputs[0]?.cachedInputTokens, 900);
+      assert.strictEqual(result.telemetryInputs[0]?.durationMs, 2000);
+      assert.strictEqual(result.telemetryInputs[0]?.outcome, "completed");
+
+      const gateEvent = result.writtenEvents.find(
+        (event) =>
+          event.type === "turn-item.updated" &&
+          event.payload.type === "system_notice" &&
+          event.payload.message.startsWith("[Verification Gate]"),
+      );
+      assert.isDefined(gateEvent);
+    }),
+);
+
+it.effect(
+  "skips Verification Gate notice once verification succeeds and caps at retry limit 2",
+  () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const passedThreadId = ThreadId.make("thread_gate_passed");
+      const passedRunId = RunId.make("run_gate_passed");
+      const verifiedResult = yield* makeFinalizationIntegrationFixture({
+        key: "gate_passed",
+        turnItems: [
+          {
+            id: TurnItemId.make("edit-pass-1"),
+            threadId: passedThreadId,
+            runId: passedRunId,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "completed",
+            title: "Edit file",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "file_change",
+            fileName: "apps/server/src/app.ts",
+            changes: [{ operation: "edit", path: "apps/server/src/app.ts" }],
+          },
+          {
+            id: TurnItemId.make("verify-pass-1"),
+            threadId: passedThreadId,
+            runId: passedRunId,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 2,
+            status: "completed",
+            title: "Run tests",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "command_execution",
+            input: "vp.cmd test run src/app.test.ts",
+            exitCode: 0,
+          },
+        ],
+      });
+      assert.strictEqual(verifiedResult.writtenEvents.length, 0);
+
+      const cappedThreadId = ThreadId.make("thread_gate_capped");
+      const cappedRunId = RunId.make("run_gate_capped");
+      const cappedResult = yield* makeFinalizationIntegrationFixture({
+        key: "gate_capped",
+        turnItems: [
+          {
+            id: TurnItemId.make("notice-cap-1"),
+            threadId: cappedThreadId,
+            runId: null,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "completed",
+            title: "Verification Gate",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "system_notice",
+            message: "[Verification Gate] retry 1",
+          },
+          {
+            id: TurnItemId.make("notice-cap-2"),
+            threadId: cappedThreadId,
+            runId: null,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 2,
+            status: "completed",
+            title: "Verification Gate",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "system_notice",
+            message: "[Verification Gate] retry 2",
+          },
+          {
+            id: TurnItemId.make("edit-cap-3"),
+            threadId: cappedThreadId,
+            runId: cappedRunId,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 3,
+            status: "completed",
+            title: "Edit file",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "file_change",
+            fileName: "apps/server/src/app.ts",
+            changes: [{ operation: "edit", path: "apps/server/src/app.ts" }],
+          },
+        ],
+      });
+      assert.strictEqual(cappedResult.writtenEvents.length, 0);
+    }),
+);

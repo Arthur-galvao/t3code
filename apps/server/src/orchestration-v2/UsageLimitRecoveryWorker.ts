@@ -1,9 +1,15 @@
-import { CommandId, MessageId, type OrchestrationV2Command } from "@t3tools/contracts";
+import {
+  CommandId,
+  MessageId,
+  type ModelSelection,
+  type OrchestrationV2Command,
+  type OrchestrationV2DomainEvent,
+  resolveProjectProviderInstanceEnabled,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
-import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
 import * as DueHint from "../scheduling/DueHint.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { forkParked } from "../serverActivation.ts";
@@ -13,6 +19,71 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 
 export const MAX_OVERDUE_ARM_MS = 24 * 60 * 60 * 1000;
+export const USAGE_LIMIT_FALLBACK_PROMPT =
+  "Continue where you left off using the fallback provider.";
+
+export interface UsageLimitFallbackInput {
+  readonly thread: ProjectionStore.ProjectionLimitRecoveryCandidate;
+  readonly currentModelSelection: ModelSelection;
+  readonly fallbackModelSelection: ModelSelection | null;
+  readonly autoFallback: boolean;
+  readonly nowMs: number;
+}
+
+export function usageLimitFallbackCommands(
+  input: UsageLimitFallbackInput,
+): ReadonlyArray<OrchestrationV2Command> {
+  const { thread, currentModelSelection, fallbackModelSelection, autoFallback, nowMs } = input;
+  if (
+    !autoFallback ||
+    fallbackModelSelection === null ||
+    thread.status !== "failed" ||
+    thread.lastErrorClass !== "usage_limit" ||
+    !thread.latestRunId ||
+    thread.archivedAt !== null ||
+    thread.settledOverride === "settled" ||
+    thread.pendingRuntimeRequest !== null
+  ) {
+    return [];
+  }
+  if (thread.snoozedUntil != null && DateTime.toEpochMillis(thread.snoozedUntil) > nowMs) {
+    return [];
+  }
+  if (thread.usageLimitResetAt != null) {
+    const resetMs = Date.parse(thread.usageLimitResetAt);
+    if (Number.isFinite(resetMs) && nowMs - resetMs > MAX_OVERDUE_ARM_MS) {
+      return [];
+    }
+  }
+  if (
+    currentModelSelection.instanceId === fallbackModelSelection.instanceId &&
+    currentModelSelection.model === fallbackModelSelection.model
+  ) {
+    return [];
+  }
+  const identity = `${thread.id}:${thread.latestRunId}:${fallbackModelSelection.instanceId}:${fallbackModelSelection.model}`;
+  return [
+    {
+      type: "provider.switch",
+      commandId: CommandId.make(`limit-fallback-switch:${identity}`),
+      threadId: thread.id,
+      modelSelection: fallbackModelSelection,
+    },
+    {
+      type: "message.dispatch",
+      commandId: CommandId.make(`limit-fallback-continue:${identity}`),
+      messageId: MessageId.make(`limit-fallback-continue:${identity}`),
+      threadId: thread.id,
+      modelSelection: fallbackModelSelection,
+      manualContinuationOfRunId: thread.latestRunId,
+      text: USAGE_LIMIT_FALLBACK_PROMPT,
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "agent",
+      creationSource: "server",
+    },
+  ];
+}
 
 export function limitRecoveryCommand(
   thread: ProjectionStore.ProjectionLimitRecoveryCandidate,
@@ -93,25 +164,77 @@ const makeSweep = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const settings = yield* ServerSettings.ServerSettingsService;
   const due = DueHint.make();
+  const attemptedFallbackRuns = new Set<string>();
   yield* forkParked(
     Stream.runForEach(orchestrator.streamDomainEvents, (event) =>
       affectsLimitRecovery(event) ? due.invalidate : Effect.void,
     ),
   );
-  yield* forkParked(Stream.runForEach(settings.streamChanges, () => due.invalidate));
+  yield* forkParked(
+    Stream.runForEach(settings.streamChanges, () =>
+      Effect.sync(() => {
+        attemptedFallbackRuns.clear();
+      }).pipe(Effect.andThen(due.invalidate)),
+    ),
+  );
   return Effect.fn("UsageLimitRecoveryWorker.sweep")(function* () {
     const now = yield* DateTime.now;
     const nowMs = DateTime.toEpochMillis(now);
     if (yield* due.isIdle(nowMs)) return;
     const readVersion = yield* due.version;
     const preferences = yield* settings.getSettings;
+    const fallbackSelection =
+      preferences.autoFallbackOnUsageLimit === true
+        ? (preferences.fallbackModelSelection ?? null)
+        : null;
     const candidates = yield* projections.getLimitRecoveryCandidates({
       now,
-      autoResume: preferences.autoResumeLimitedThreads,
+      autoResume: preferences.autoResumeLimitedThreads || fallbackSelection !== null,
       snooze: preferences.snoozeLimitedThreads,
     });
     let acted = false;
     for (const thread of candidates) {
+      if (fallbackSelection !== null && thread.latestRunId !== null) {
+        const fallbackKey = `${thread.id}:${thread.latestRunId}:${fallbackSelection.instanceId}:${fallbackSelection.model}`;
+        if (!attemptedFallbackRuns.has(fallbackKey)) {
+          const appThread = yield* projections
+            .getThread(thread.id)
+            .pipe(Effect.catchCause(() => Effect.succeed(null)));
+          const targetEnabled =
+            appThread !== null &&
+            (preferences.providerInstances === undefined ||
+              resolveProjectProviderInstanceEnabled(
+                preferences,
+                appThread.projectId,
+                fallbackSelection.instanceId,
+              ));
+          const fallbackCommands =
+            appThread !== null && targetEnabled
+              ? usageLimitFallbackCommands({
+                  thread,
+                  currentModelSelection: appThread.modelSelection,
+                  fallbackModelSelection: fallbackSelection,
+                  autoFallback: preferences.autoFallbackOnUsageLimit,
+                  nowMs,
+                })
+              : [];
+          if (fallbackCommands.length > 0) {
+            acted = true;
+            attemptedFallbackRuns.add(fallbackKey);
+            yield* Effect.forEach(fallbackCommands, (cmd) => threads.dispatch(cmd), {
+              discard: true,
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("orchestration-v2.limit-recovery.fallback-failed", {
+                  threadId: thread.id,
+                  cause,
+                }),
+              ),
+            );
+            continue;
+          }
+        }
+      }
       const command = limitRecoveryCommand(
         thread,
         preferences.autoResumeLimitedThreads,
