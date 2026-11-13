@@ -52,4 +52,17 @@ describe("buildRuntimeInstructions", () => {
     );
     assert.include(instructions, "call unwatch_pull_request");
   });
+
+  it("includes output shaper instructions by default and omits them when outputShaperEnabled is false", () => {
+    const enabled = buildRuntimeInstructions({ harness: "Claude Code" });
+    assert.include(enabled, "<output_shaper>");
+    assert.include(enabled, "context_retrieve");
+
+    const disabled = buildRuntimeInstructions({
+      harness: "Claude Code",
+      outputShaperEnabled: false,
+    });
+    assert.notInclude(disabled, "<output_shaper>");
+    assert.include(disabled, "<pull_request_linking>");
+  });
 });

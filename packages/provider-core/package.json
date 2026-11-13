@@ -23,9 +23,17 @@
       "types": "./src/server/auth.ts",
       "import": "./src/server/auth.ts"
     },
+    "./server/ccrStore": {
+      "types": "./src/server/ccrStore.ts",
+      "import": "./src/server/ccrStore.ts"
+    },
     "./server/collectStreamText": {
       "types": "./src/server/collectStreamText.ts",
       "import": "./src/server/collectStreamText.ts"
+    },
+    "./server/contextCompressor": {
+      "types": "./src/server/contextCompressor.ts",
+      "import": "./src/server/contextCompressor.ts"
     },
     "./server/driver": {
       "types": "./src/server/driver.ts",

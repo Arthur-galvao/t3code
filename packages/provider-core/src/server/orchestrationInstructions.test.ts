@@ -4,6 +4,7 @@ import {
   T3_CODE_DEVICE_TOOL_INSTRUCTIONS,
   T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH,
   T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+  T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS,
   t3AcpPromptWithInstructions,
   t3OrchestrationPrompt,
   t3OrchestrationSystemPrompt,
@@ -150,5 +151,11 @@ describe("T3 device instructions", () => {
       }),
       "<t3_code_rsi_lessons>",
     );
+  });
+
+  it("exports concise KV-cache-friendly output shaper instructions", () => {
+    assert.include(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS, "<output_shaper>");
+    assert.include(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS, "context_retrieve");
+    assert.isBelow(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS.length, 400);
   });
 });

@@ -89,6 +89,11 @@ import * as Stream from "effect/Stream";
 
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import {
+  defaultCcrStore,
+  type CcrRetrieveInput,
+  type CcrRetrieveResult,
+} from "@t3tools/provider-core/server/ccrStore";
+import {
   subagentResultForRun,
   delegatedTaskProgress,
 } from "@t3tools/provider-core/server/subagentProjection";
@@ -235,6 +240,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: RsiService.RsiTelemetrySummaryInput,
   ) => Effect.Effect<RsiService.RsiTelemetrySummary, OrchestratorMcpFailure>;
+  readonly contextRetrieve: (
+    scope: McpInvocationScope,
+    input: CcrRetrieveInput,
+  ) => Effect.Effect<CcrRetrieveResult, OrchestratorMcpFailure>;
 }
 
 export class OrchestratorMcpService extends Context.Service<
@@ -3384,6 +3393,12 @@ const make = Effect.gen(function* () {
         return yield* rsi.getTelemetrySummary(input);
       },
     ),
+    contextRetrieve: Effect.fn("OrchestratorMcpService.contextRetrieve")(function* (_scope, input) {
+      if (input.ccrId.trim() === "") {
+        return yield* failure("invalid_request", "CCR ID must be non-empty.");
+      }
+      return defaultCcrStore.retrieve(input);
+    }),
   });
 });
 

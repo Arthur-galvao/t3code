@@ -10,6 +10,7 @@ import * as Semaphore from "effect/Semaphore";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { type CcrStore, defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
 
 export const MAX_LESSONS = 25;
 const DEFAULT_SESSION_PREFIX_MAX_CHARS = 600;
@@ -85,6 +86,8 @@ export interface RsiRunTelemetryInput {
   readonly wastedReads: number;
   readonly outcome: string;
   readonly durationMs: number;
+  readonly tokensSavedEst?: number | undefined;
+  readonly compressedCallsCount?: number | undefined;
   readonly failureSignature?: RsiRunFailureSignature | undefined;
   readonly timestamp?: string | undefined;
 }
@@ -103,6 +106,8 @@ export interface RsiRunTelemetryRecord {
   readonly wastedReads: number;
   readonly outcome: string;
   readonly durationMs: number;
+  readonly tokensSavedEst?: number | undefined;
+  readonly compressedCallsCount?: number | undefined;
   readonly timestamp: string;
 }
 
@@ -131,6 +136,8 @@ export interface RsiTelemetrySummary {
   readonly totalWastedReads: number;
   readonly totalTokens: number;
   readonly totalCachedInputTokens: number;
+  readonly totalTokensSavedEst: number;
+  readonly totalCompressedCalls: number;
   readonly avgCacheHitRate: number;
   readonly avgDurationMs: number;
   readonly byProvider: ReadonlyArray<RsiProviderTelemetryBreakdown>;
@@ -530,15 +537,21 @@ function encodeTelemetryLine(record: RsiRunTelemetryRecord): string {
 export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   readonly persistence?: PersistenceHandles;
   readonly isAutoDistillEnabled?: () => Effect.Effect<boolean>;
+  readonly ccrStore?: CcrStore;
 }): Effect.fn.Return<RsiServiceShape> {
   const lessonsRef = yield* Ref.make<ReadonlyArray<RsiLesson>>([]);
   const telemetryRef = yield* Ref.make<ReadonlyArray<RsiRunTelemetryRecord>>([]);
   const recurrenceRef = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
+  const lastSyncedCcrRef = yield* Ref.make<{
+    readonly tokensSavedEst: number;
+    readonly compressedCallsCount: number;
+  }>({ tokensSavedEst: 0, compressedCallsCount: 0 });
   const hydratedRef = yield* Ref.make(false);
   const mutex = Semaphore.makeUnsafe(1);
 
   const persistence = input?.persistence;
   const isAutoDistillEnabled = input?.isAutoDistillEnabled ?? (() => Effect.succeed(true));
+  const ccrStore = input?.ccrStore ?? defaultCcrStore;
 
   const hydrateLocked = Effect.fn("RsiService.hydrateLocked")(function* () {
     if (yield* Ref.get(hydratedRef)) return;
@@ -644,39 +657,87 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         : usedTokens > 0
           ? Math.max(0, Math.min(1, cachedInputTokens / usedTokens))
           : 0;
-    const record: RsiRunTelemetryRecord = {
-      threadId: telemetryInput.threadId,
-      runId: telemetryInput.runId,
-      provider: telemetryInput.provider,
-      model: telemetryInput.model,
-      usedTokens,
-      cachedInputTokens,
-      cacheHitRate: Math.round(computedRate * 10_000) / 10_000,
-      toolErrorCount: Math.floor(clampNonNegativeNumber(telemetryInput.toolErrorCount)),
-      loopTripped: telemetryInput.loopTripped,
-      safetyBlockedCount: Math.floor(clampNonNegativeNumber(telemetryInput.safetyBlockedCount)),
-      wastedReads: Math.floor(clampNonNegativeNumber(telemetryInput.wastedReads)),
-      outcome: telemetryInput.outcome,
-      durationMs: Math.round(clampNonNegativeNumber(telemetryInput.durationMs)),
-      timestamp: nowIso,
-    };
 
     const autoDistill = yield* isAutoDistillEnabled();
 
-    yield* mutex.withPermits(1)(
+    return yield* mutex.withPermits(1)(
       Effect.gen(function* () {
         yield* hydrateLocked();
+
+        const storeStats = ccrStore.getStats();
+        const lastSynced = yield* Ref.get(lastSyncedCcrRef);
+        const baseTokens =
+          storeStats.tokensSavedEst < lastSynced.tokensSavedEst ? 0 : lastSynced.tokensSavedEst;
+        const baseCalls =
+          storeStats.compressedCallsCount < lastSynced.compressedCallsCount
+            ? 0
+            : lastSynced.compressedCallsCount;
+        const deltaTokens = Math.max(0, storeStats.tokensSavedEst - baseTokens);
+        const deltaCalls = Math.max(0, storeStats.compressedCallsCount - baseCalls);
+
+        const resolvedTokensSavedEst =
+          telemetryInput.tokensSavedEst !== undefined
+            ? Math.floor(clampNonNegativeNumber(telemetryInput.tokensSavedEst))
+            : deltaTokens > 0
+              ? deltaTokens
+              : undefined;
+        const resolvedCompressedCallsCount =
+          telemetryInput.compressedCallsCount !== undefined
+            ? Math.floor(clampNonNegativeNumber(telemetryInput.compressedCallsCount))
+            : deltaCalls > 0
+              ? deltaCalls
+              : undefined;
+
+        if (
+          telemetryInput.tokensSavedEst === undefined ||
+          telemetryInput.compressedCallsCount === undefined
+        ) {
+          yield* Ref.set(lastSyncedCcrRef, {
+            tokensSavedEst:
+              telemetryInput.tokensSavedEst === undefined
+                ? storeStats.tokensSavedEst
+                : lastSynced.tokensSavedEst,
+            compressedCallsCount:
+              telemetryInput.compressedCallsCount === undefined
+                ? storeStats.compressedCallsCount
+                : lastSynced.compressedCallsCount,
+          });
+        }
+
+        const record: RsiRunTelemetryRecord = {
+          threadId: telemetryInput.threadId,
+          runId: telemetryInput.runId,
+          provider: telemetryInput.provider,
+          model: telemetryInput.model,
+          usedTokens,
+          cachedInputTokens,
+          cacheHitRate: Math.round(computedRate * 10_000) / 10_000,
+          toolErrorCount: Math.floor(clampNonNegativeNumber(telemetryInput.toolErrorCount)),
+          loopTripped: telemetryInput.loopTripped,
+          safetyBlockedCount: Math.floor(clampNonNegativeNumber(telemetryInput.safetyBlockedCount)),
+          wastedReads: Math.floor(clampNonNegativeNumber(telemetryInput.wastedReads)),
+          outcome: telemetryInput.outcome,
+          durationMs: Math.round(clampNonNegativeNumber(telemetryInput.durationMs)),
+          ...(resolvedTokensSavedEst !== undefined
+            ? { tokensSavedEst: resolvedTokensSavedEst }
+            : {}),
+          ...(resolvedCompressedCallsCount !== undefined
+            ? { compressedCallsCount: resolvedCompressedCallsCount }
+            : {}),
+          timestamp: nowIso,
+        };
+
         yield* Ref.update(telemetryRef, (rows) => [...rows, record]);
         yield* appendTelemetryLocked(record);
 
-        if (!autoDistill) return;
+        if (!autoDistill) return record;
         const sig = telemetryInput.failureSignature;
         const hasFailureSignal =
           record.loopTripped ||
           record.safetyBlockedCount > 0 ||
           record.toolErrorCount > 0 ||
           isFailureOutcome(record.outcome);
-        if (!hasFailureSignal) return;
+        if (!hasFailureSignal) return record;
 
         const tool =
           sig?.tool ??
@@ -736,10 +797,10 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
             nowIso,
           );
         }
+
+        return record;
       }),
     );
-
-    return record;
   });
 
   const queryLessons: RsiServiceShape["queryLessons"] = Effect.fn("RsiService.queryLessons")(
@@ -801,10 +862,13 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   const getTelemetrySummary: RsiServiceShape["getTelemetrySummary"] = Effect.fn(
     "RsiService.getTelemetrySummary",
   )(function* (summaryInput) {
-    const allRows = yield* mutex.withPermits(1)(
+    const { allRows, lastSynced } = yield* mutex.withPermits(1)(
       Effect.gen(function* () {
         yield* hydrateLocked();
-        return yield* Ref.get(telemetryRef);
+        return {
+          allRows: yield* Ref.get(telemetryRef),
+          lastSynced: yield* Ref.get(lastSyncedCcrRef),
+        };
       }),
     );
     const filtered = allRows.filter((row) => {
@@ -829,6 +893,8 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     let totalWastedReads = 0;
     let totalTokens = 0;
     let totalCachedInputTokens = 0;
+    let totalTokensSavedEst = 0;
+    let totalCompressedCalls = 0;
     let cacheHitRateSum = 0;
     let durationSum = 0;
 
@@ -852,6 +918,8 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       totalWastedReads += row.wastedReads;
       totalTokens += row.usedTokens;
       totalCachedInputTokens += row.cachedInputTokens;
+      totalTokensSavedEst += clampNonNegativeNumber(row.tokensSavedEst ?? 0);
+      totalCompressedCalls += Math.floor(clampNonNegativeNumber(row.compressedCallsCount ?? 0));
       cacheHitRateSum += row.cacheHitRate;
       durationSum += row.durationMs;
 
@@ -868,6 +936,18 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       existing.safetyBlocks += row.safetyBlockedCount;
       existing.cacheRateSum += row.cacheHitRate;
       byProviderMap.set(row.provider, existing);
+    }
+
+    if (summaryInput?.threadId === undefined && summaryInput?.provider === undefined) {
+      const storeStats = ccrStore.getStats();
+      const baseTokens =
+        storeStats.tokensSavedEst < lastSynced.tokensSavedEst ? 0 : lastSynced.tokensSavedEst;
+      const baseCalls =
+        storeStats.compressedCallsCount < lastSynced.compressedCallsCount
+          ? 0
+          : lastSynced.compressedCallsCount;
+      totalTokensSavedEst += Math.max(0, storeStats.tokensSavedEst - baseTokens);
+      totalCompressedCalls += Math.max(0, storeStats.compressedCallsCount - baseCalls);
     }
 
     const totalRuns = filtered.length;
@@ -893,6 +973,8 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       totalWastedReads,
       totalTokens,
       totalCachedInputTokens,
+      totalTokensSavedEst,
+      totalCompressedCalls,
       avgCacheHitRate:
         totalRuns > 0 ? Math.round((cacheHitRateSum / totalRuns) * 10_000) / 10_000 : 0,
       avgDurationMs: totalRuns > 0 ? Math.round(durationSum / totalRuns) : 0,

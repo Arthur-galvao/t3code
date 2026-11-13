@@ -38,6 +38,8 @@ import { normalizeAntigravitySessionUpdate } from "../../provider/acp/Antigravit
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
+import * as ServerSettings from "../../serverSettings.ts";
 import {
   makeAntigravityAcpAdapterFlavor,
   makeAntigravityAdapterV2,
@@ -574,6 +576,234 @@ describe("AntigravityAdapterV2 client file system", () => {
       );
       assert.equal(envExampleAllowed.content, "API_KEY=\n");
     }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect(
+    "compresses unbounded large readTextFile outputs while keeping targeted line/limit reads verbatim",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let readTextFile: Parameters<RuntimeService["handleReadTextFile"]>[0] | undefined;
+        const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-log-" });
+        const requestLog = path.join(logs, "requests.ndjson");
+        const crypto = yield* SecureRandom.SecureRandom;
+        const instanceId = ProviderInstanceId.make("antigravity-compress-read-test");
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          makeRuntime: (input) =>
+            makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: { T3_ACP_ANTIGRAVITY: "1", T3_ACP_REQUEST_LOG_PATH: requestLog },
+              },
+            }).pipe(
+              Effect.provideService(SecureRandom.SecureRandom, crypto),
+              Effect.map((runtime): RuntimeService => ({
+                ...runtime,
+                handleReadTextFile: (handler) =>
+                  Effect.sync(() => {
+                    readTextFile = handler;
+                  }).pipe(Effect.andThen(runtime.handleReadTextFile(handler))),
+              })),
+            ),
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-compress-",
+        });
+        const largeLogPath = path.join(workspace, "server.log");
+        const largeLogContent = Array.from({ length: 140 }, (_, index) =>
+          index === 72
+            ? "2026-11-13T01:10:00Z ERROR failed to flush projection checkpoint"
+            : `2026-11-13T01:09:00Z INFO heartbeat seq=${index + 1} status=healthy`,
+        ).join("\n");
+        yield* fileSystem.writeFileString(largeLogPath, largeLogContent);
+
+        const largeCodePath = path.join(workspace, "largeModule.ts");
+        const largeCodeContent = Array.from({ length: 40 }, (_, index) =>
+          [
+            `export function helper${index}(value: number): number {`,
+            `  const step1 = value + ${index};`,
+            `  const step2 = step1 * 2;`,
+            `  const step3 = step2 - 3;`,
+            `  const step4 = step3 + 7;`,
+            `  const step5 = step4 * 5;`,
+            `  const step6 = step5 - ${index};`,
+            `  return step6;`,
+            `}`,
+          ].join("\n"),
+        ).join("\n\n");
+        assert.isAtLeast(largeCodeContent.length, 6_000);
+        yield* fileSystem.writeFileString(largeCodePath, largeCodeContent);
+
+        const mediumCodePath = path.join(workspace, "mediumModule.ts");
+        const mediumCodeContent = Array.from({ length: 30 }, (_, index) =>
+          [
+            `export function medium${index}(value: number): number {`,
+            `  const a = value + ${index};`,
+            `  const b = a * 2;`,
+            `  const c = b + 1;`,
+            `  return c;`,
+            `}`,
+          ].join("\n"),
+        ).join("\n\n");
+        assert.isAbove(mediumCodeContent.length, 3_000);
+        assert.isBelow(mediumCodeContent.length, 6_000);
+        yield* fileSystem.writeFileString(mediumCodePath, mediumCodeContent);
+
+        const threadId = ThreadId.make("thread-antigravity-compress-read");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-compress-read"),
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
+        if (readTextFile === undefined) {
+          return yield* Effect.die("Antigravity sessions must serve client file reads");
+        }
+        const context = (method: string) => ({ requestId: `test-${method}`, method });
+
+        const unboundedLog = yield* readTextFile(
+          { sessionId: "mock-session-1", path: largeLogPath },
+          context("fs/read_text_file"),
+        );
+        assert.include(unboundedLog.content, "[T3 CCR:");
+        assert.include(unboundedLog.content, "ERROR failed to flush projection checkpoint");
+        assert.isBelow(unboundedLog.content.length, largeLogContent.length);
+        const ccrMatch = /\[T3 CCR:(ccr_\d+)/.exec(unboundedLog.content);
+        assert.isNotNull(ccrMatch);
+        const retrieved = defaultCcrStore.retrieve({ ccrId: ccrMatch![1]!, query: "projection" });
+        assert.isTrue(retrieved.found);
+        assert.include(retrieved.content, "L73:");
+
+        const boundedLog = yield* readTextFile(
+          { sessionId: "mock-session-1", path: largeLogPath, line: 72, limit: 3 },
+          context("fs/read_text_file"),
+        );
+        assert.notInclude(boundedLog.content, "[T3 CCR:");
+        assert.include(boundedLog.content, "ERROR failed to flush projection checkpoint");
+        assert.equal(boundedLog.content.split("\n").length, 3);
+
+        const unboundedCode = yield* readTextFile(
+          { sessionId: "mock-session-1", path: largeCodePath },
+          context("fs/read_text_file"),
+        );
+        assert.include(unboundedCode.content, "[T3 CCR:");
+        assert.isBelow(unboundedCode.content.length, largeCodeContent.length);
+
+        const mediumCode = yield* readTextFile(
+          { sessionId: "mock-session-1", path: mediumCodePath },
+          context("fs/read_text_file"),
+        );
+        assert.equal(mediumCode.content, mediumCodeContent);
+        assert.notInclude(mediumCode.content, "[T3 CCR:");
+      }).pipe(
+        Effect.provide(Layer.mergeAll(layerSession, ServerSettings.layerTest())),
+        Effect.scoped,
+      ),
+  );
+
+  it.effect("leaves unbounded readTextFile verbatim when contextCompressionEnabled is false", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let readTextFile: Parameters<RuntimeService["handleReadTextFile"]>[0] | undefined;
+      const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-log-" });
+      const requestLog = path.join(logs, "requests.ndjson");
+      const crypto = yield* SecureRandom.SecureRandom;
+      const instanceId = ProviderInstanceId.make("antigravity-nocompress-read-test");
+      const adapter = yield* makeAntigravityAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        makeRuntime: (input) =>
+          makeAntigravityAcpRuntime({
+            ...input,
+            childProcessSpawner,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: input.cwd,
+              env: { T3_ACP_ANTIGRAVITY: "1", T3_ACP_REQUEST_LOG_PATH: requestLog },
+            },
+          }).pipe(
+            Effect.provideService(SecureRandom.SecureRandom, crypto),
+            Effect.map((runtime): RuntimeService => ({
+              ...runtime,
+              handleReadTextFile: (handler) =>
+                Effect.sync(() => {
+                  readTextFile = handler;
+                }).pipe(Effect.andThen(runtime.handleReadTextFile(handler))),
+            })),
+          ),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.undefined,
+      });
+      const workspace = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-antigravity-nocompress-",
+      });
+      const largeLogPath = path.join(workspace, "server.log");
+      const largeLogContent = Array.from(
+        { length: 140 },
+        (_, index) => `2026-11-13T01:09:00Z INFO heartbeat seq=${index + 1} status=healthy`,
+      ).join("\n");
+      yield* fileSystem.writeFileString(largeLogPath, largeLogContent);
+
+      const threadId = ThreadId.make("thread-antigravity-nocompress-read");
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: workspace,
+      });
+      const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-antigravity-nocompress"),
+        modelSelection,
+        runtimePolicy,
+      });
+      yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
+      if (readTextFile === undefined) {
+        return yield* Effect.die("Antigravity sessions must serve client file reads");
+      }
+      const readResult = yield* readTextFile(
+        { sessionId: "mock-session-1", path: largeLogPath },
+        { requestId: "test-read", method: "fs/read_text_file" },
+      );
+      assert.equal(readResult.content, largeLogContent);
+      assert.notInclude(readResult.content, "[T3 CCR:");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          layerSession,
+          ServerSettings.layerTest({ contextCompressionEnabled: false }),
+        ),
+      ),
+      Effect.scoped,
+    ),
   );
 });
 

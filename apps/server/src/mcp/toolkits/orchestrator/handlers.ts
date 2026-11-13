@@ -255,6 +255,13 @@ const handlers = {
       return yield* service.rsiTelemetrySummary(scope, input);
     }),
   ),
+  context_retrieve: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      return yield* service.contextRetrieve(scope, input);
+    }),
+  ),
 } satisfies McpToolAccess.Handlers<typeof OrchestratorToolkit.tools>;
 
 export const layer = McpToolAccess.toLayer(OrchestratorToolkit, handlers);

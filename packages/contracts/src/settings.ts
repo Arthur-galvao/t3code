@@ -1448,6 +1448,8 @@ export const ServerSettings = Schema.Struct({
   toolSafetyGuardEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   loopCircuitBreakerEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   rsiAutoDistillEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  contextCompressionEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  outputShaperEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   verificationGateMode: VerificationGateMode.pipe(
     Schema.withDecodingDefault(Effect.succeed("auto" as const)),
   ),
@@ -1895,6 +1897,8 @@ export const ServerSettingsPatch = Schema.Struct({
   toolSafetyGuardEnabled: Schema.optionalKey(Schema.Boolean),
   loopCircuitBreakerEnabled: Schema.optionalKey(Schema.Boolean),
   rsiAutoDistillEnabled: Schema.optionalKey(Schema.Boolean),
+  contextCompressionEnabled: Schema.optionalKey(Schema.Boolean),
+  outputShaperEnabled: Schema.optionalKey(Schema.Boolean),
   verificationGateMode: Schema.optionalKey(VerificationGateMode),
   snoozePresets: Schema.optionalKey(SnoozePresetSettings),
   hiddenThreadTags: Schema.optionalKey(Schema.Array(Schema.String)),

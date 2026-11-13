@@ -537,12 +537,16 @@ describe("workflow safety & fallback settings", () => {
     expect(decoded.toolSafetyGuardEnabled).toBe(true);
     expect(decoded.loopCircuitBreakerEnabled).toBe(true);
     expect(decoded.rsiAutoDistillEnabled).toBe(true);
+    expect(decoded.contextCompressionEnabled).toBe(true);
+    expect(decoded.outputShaperEnabled).toBe(true);
     expect(decoded.autoFallbackOnUsageLimit).toBe(true);
     expect(decoded.verificationGateMode).toBe("auto");
     expect(DEFAULT_SERVER_SETTINGS).toMatchObject({
       toolSafetyGuardEnabled: true,
       loopCircuitBreakerEnabled: true,
       rsiAutoDistillEnabled: true,
+      contextCompressionEnabled: true,
+      outputShaperEnabled: true,
       autoFallbackOnUsageLimit: true,
       verificationGateMode: "auto",
     });
@@ -553,6 +557,8 @@ describe("workflow safety & fallback settings", () => {
       toolSafetyGuardEnabled: false,
       loopCircuitBreakerEnabled: false,
       rsiAutoDistillEnabled: false,
+      contextCompressionEnabled: false,
+      outputShaperEnabled: false,
       autoFallbackOnUsageLimit: false,
       verificationGateMode: "goal" as const,
     };

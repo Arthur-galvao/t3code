@@ -2002,6 +2002,67 @@ export function ThreadsSettingsPanel() {
         />
         <SettingsRow
           serverScoped
+          id="context-compression"
+          title="Context compression (CCR)"
+          description="Compress oversized tool outputs and unbounded file reads reversibly while keeping full content retrievable via context_retrieve."
+          settingKeys={["contextCompressionEnabled"]}
+          resetAction={
+            hasServerTargets &&
+            settings.contextCompressionEnabled !==
+              DEFAULT_UNIFIED_SETTINGS.contextCompressionEnabled ? (
+              <SettingResetButton
+                label="context compression"
+                onClick={() =>
+                  updateSettings({
+                    contextCompressionEnabled: DEFAULT_UNIFIED_SETTINGS.contextCompressionEnabled,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["contextCompressionEnabled"]}
+              checked={settings.contextCompressionEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ contextCompressionEnabled: Boolean(checked) })
+              }
+              aria-label="Context compression (CCR)"
+            />
+          }
+        />
+        <SettingsRow
+          serverScoped
+          id="output-shaper"
+          title="Concise output shaper"
+          description="Instruct agents to keep responses concise, skip filler, and reference file paths or symbols directly."
+          settingKeys={["outputShaperEnabled"]}
+          resetAction={
+            hasServerTargets &&
+            settings.outputShaperEnabled !== DEFAULT_UNIFIED_SETTINGS.outputShaperEnabled ? (
+              <SettingResetButton
+                label="concise output shaper"
+                onClick={() =>
+                  updateSettings({
+                    outputShaperEnabled: DEFAULT_UNIFIED_SETTINGS.outputShaperEnabled,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["outputShaperEnabled"]}
+              checked={settings.outputShaperEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ outputShaperEnabled: Boolean(checked) })
+              }
+              aria-label="Concise output shaper"
+            />
+          }
+        />
+        <SettingsRow
+          serverScoped
           id="verification-gate-mode"
           title="Verification gate"
           description={

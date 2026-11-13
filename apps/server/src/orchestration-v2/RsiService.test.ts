@@ -8,10 +8,12 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { createCcrStore, defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
 import {
   MAX_LESSONS,
   RsiService,
   buildAutoLessonKey,
+  makeRsiService,
   normalizeSignaturePart,
 } from "./RsiService.ts";
 
@@ -310,6 +312,95 @@ describe("RsiService", () => {
         expect(summary.loopTrips).toBe(1);
         expect(summary.safetyBlocks).toBe(1);
       }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect(
+    "records explicit compression savings and syncs live CCR store stats without double-counting",
+    () =>
+      Effect.gen(function* () {
+        const store = createCcrStore();
+        const rsi = yield* makeRsiService({ ccrStore: store });
+
+        // 1. Live unsynced CCR savings show up immediately in getTelemetrySummary.
+        store.recordCompression(5_000, 1_000); // 4_000 saved chars => 1_000 tokensSavedEst, 1 call
+        const preRunSummary = yield* rsi.getTelemetrySummary();
+        expect(preRunSummary.totalRuns).toBe(0);
+        expect(preRunSummary.totalTokensSavedEst).toBe(1_000);
+        expect(preRunSummary.totalCompressedCalls).toBe(1);
+
+        // 2. recordRunTelemetry without explicit metrics flushes the CCR delta into the run record.
+        const firstRun = yield* rsi.recordRunTelemetry({
+          threadId: "t-ccr",
+          runId: "r-ccr-1",
+          provider: "claudeAgent",
+          model: "sonnet",
+          usedTokens: 2_000,
+          cachedInputTokens: 1_000,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 1_200,
+        });
+        expect(firstRun.tokensSavedEst).toBe(1_000);
+        expect(firstRun.compressedCallsCount).toBe(1);
+
+        const afterFirstRun = yield* rsi.getTelemetrySummary();
+        expect(afterFirstRun.totalTokensSavedEst).toBe(1_000);
+        expect(afterFirstRun.totalCompressedCalls).toBe(1);
+
+        // 3. Subsequent CCR compression only adds the new delta, and explicit overrides work too.
+        store.recordCompression(2_400, 400); // +2_000 saved chars => +500 tokens, +1 call
+        const midRunSummary = yield* rsi.getTelemetrySummary();
+        expect(midRunSummary.totalTokensSavedEst).toBe(1_500);
+        expect(midRunSummary.totalCompressedCalls).toBe(2);
+
+        const explicitRun = yield* rsi.recordRunTelemetry({
+          threadId: "t-other",
+          runId: "r-explicit",
+          provider: "antigravity",
+          model: "gemini",
+          usedTokens: 1_500,
+          cachedInputTokens: 500,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 900,
+          tokensSavedEst: 250,
+          compressedCallsCount: 2,
+        });
+        expect(explicitRun.tokensSavedEst).toBe(250);
+        expect(explicitRun.compressedCallsCount).toBe(2);
+
+        // Filtered summary uses recorded run metrics only (does not mix global unsynced CCR stats).
+        const filteredSummary = yield* rsi.getTelemetrySummary({ threadId: "t-other" });
+        expect(filteredSummary.totalTokensSavedEst).toBe(250);
+        expect(filteredSummary.totalCompressedCalls).toBe(2);
+
+        // Global summary combines recorded runs (1000 + 250) + unsynced CCR delta (500), calls (1 + 2 + 1).
+        const globalSummary = yield* rsi.getTelemetrySummary();
+        expect(globalSummary.totalTokensSavedEst).toBe(1_750);
+        expect(globalSummary.totalCompressedCalls).toBe(4);
+      }),
+  );
+
+  it.effect("reads defaultCcrStore.getStats() by default in RsiService.layer", () =>
+    Effect.gen(function* () {
+      defaultCcrStore.clear();
+      yield* Effect.ensuring(
+        Effect.gen(function* () {
+          defaultCcrStore.recordCompression(4_000, 800); // 3_200 saved chars => 800 tokens
+          const rsi = yield* RsiService;
+          const summary = yield* rsi.getTelemetrySummary();
+          expect(summary.totalTokensSavedEst).toBe(800);
+          expect(summary.totalCompressedCalls).toBe(1);
+        }).pipe(Effect.provide(RsiService.layer)),
+        Effect.sync(() => defaultCcrStore.clear()),
+      );
     }),
   );
 });

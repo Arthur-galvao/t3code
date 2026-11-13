@@ -494,6 +494,42 @@ const RsiTelemetrySummaryTool = Tool.make("rsi_telemetry_summary", {
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true);
 
+const ContextRetrieveInput = Schema.Struct({
+  ccrId: Schema.String,
+  query: Schema.optional(Schema.String),
+  startLine: Schema.optional(Schema.Int),
+  endLine: Schema.optional(Schema.Int),
+  maxChars: Schema.optional(Schema.Int),
+});
+
+const ContextRetrieveResult = Schema.Struct({
+  found: Schema.Boolean,
+  ccrId: Schema.String,
+  contentType: Schema.optional(Schema.String),
+  sourceLabel: Schema.optional(Schema.String),
+  path: Schema.optional(Schema.String),
+  totalLines: Schema.Number,
+  matchedLines: Schema.Number,
+  startLine: Schema.optional(Schema.Number),
+  endLine: Schema.optional(Schema.Number),
+  truncated: Schema.Boolean,
+  content: Schema.String,
+});
+
+const ContextRetrieveTool = Tool.make("context_retrieve", {
+  description:
+    "Retrieve exact line slices or regex/substring matches from a compressed `[T3 CCR:ccr_XXXX]` output.",
+  parameters: ContextRetrieveInput,
+  success: ContextRetrieveResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Retrieve compressed CCR output")
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
 export const OrchestratorToolkit = Toolkit.make(
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
@@ -518,4 +554,5 @@ export const OrchestratorToolkit = Toolkit.make(
   RsiQueryLessonsTool,
   RsiRecordLessonTool,
   RsiTelemetrySummaryTool,
+  ContextRetrieveTool,
 );

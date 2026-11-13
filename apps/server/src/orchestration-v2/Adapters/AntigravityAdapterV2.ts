@@ -20,6 +20,8 @@ import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { PULL_REQUEST_LINKING_INSTRUCTIONS } from "@t3tools/provider-core/server/runtimeInstructions";
+import { defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
+import { compressToolOutput } from "@t3tools/provider-core/server/contextCompressor";
 import { evaluateToolSafety } from "@t3tools/provider-core/server/toolSafetyGuard";
 import { acpPermissionDisposition } from "@t3tools/provider-acp/server/clientPolicy";
 import * as ServerSettings from "../../serverSettings.ts";
@@ -90,6 +92,7 @@ export interface AntigravityAdapterV2Options {
   readonly defaultModel: Effect.Effect<string | undefined>;
   readonly supportsNativeGoals?: Effect.Effect<boolean>;
   readonly toolSafetyGuardEnabled?: Effect.Effect<boolean>;
+  readonly contextCompressionEnabled?: Effect.Effect<boolean>;
   readonly onSessionStarted?: (
     started: AcpSessionRuntime.AcpSessionRuntimeStartResult,
     cwd: string,
@@ -161,11 +164,25 @@ function antigravitySafetyInput(request: EffectAcpSchema.RequestPermissionReques
   };
 }
 
+function antigravityReadMinCompressChars(filePath: string): number {
+  const lowerPath = filePath.trim().toLowerCase().split(/[?#]/)[0] ?? "";
+  if (
+    lowerPath.endsWith(".json") ||
+    lowerPath.endsWith(".jsonl") ||
+    lowerPath.endsWith(".ndjson") ||
+    lowerPath.endsWith(".log")
+  ) {
+    return 3_000;
+  }
+  return 6_000;
+}
+
 export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
   let safetyGuardEnabled = true;
+  let compressionEnabled = true;
   const refreshSafetyGuardEnabled = options.toolSafetyGuardEnabled
     ? options.toolSafetyGuardEnabled.pipe(
         Effect.tap((enabled) =>
@@ -177,11 +194,23 @@ export function makeAntigravityAcpAdapterFlavor(
         Effect.ignore,
       )
     : Effect.void;
+  const refreshCompressionEnabled = options.contextCompressionEnabled
+    ? options.contextCompressionEnabled.pipe(
+        Effect.tap((enabled) =>
+          Effect.sync(() => {
+            compressionEnabled = enabled;
+          }),
+        ),
+        Effect.asVoid,
+        Effect.ignore,
+      )
+    : Effect.void;
   const antigravityClientFileRoots = (cwd: string | null) =>
     cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
       yield* refreshSafetyGuardEnabled;
+      yield* refreshCompressionEnabled;
       const scope = yield* Scope.fork(yield* Effect.scope);
       const runtime = yield* options
         .withProcess(
@@ -224,6 +253,7 @@ export function makeAntigravityAcpAdapterFlavor(
           ),
         prompt: (payload, promptOptions) =>
           refreshSafetyGuardEnabled.pipe(
+            Effect.andThen(refreshCompressionEnabled),
             Effect.andThen(Effect.sync(reads.reset)),
             Effect.andThen(runtime.prompt(payload, promptOptions)),
           ),
@@ -318,12 +348,35 @@ export function makeAntigravityAcpAdapterFlavor(
             ),
           );
         }
-        return readAntigravityClientTextFile({
+        const readEffect = readAntigravityClientTextFile({
           fileSystem: options.fileSystem,
           path: options.path,
           allowedRoots: antigravityClientFileRoots(cwd),
           request,
         });
+        if (request.line != null || request.limit != null) {
+          return readEffect;
+        }
+        return refreshCompressionEnabled.pipe(
+          Effect.andThen(readEffect),
+          Effect.map((response) => {
+            if (!compressionEnabled) {
+              return response;
+            }
+            const minChars = antigravityReadMinCompressChars(request.path);
+            if (response.content.length < minChars) {
+              return response;
+            }
+            const result = compressToolOutput({
+              text: response.content,
+              path: request.path,
+              sourceLabel: "readTextFile",
+              minChars,
+              store: defaultCcrStore,
+            });
+            return result.compressed ? { ...response, content: result.text } : response;
+          }),
+        );
       },
     },
     approvalOptions: antigravityApprovalOptions,
@@ -373,11 +426,20 @@ export const makeAntigravityAdapterV2 = Effect.fn("makeAntigravityAdapterV2")(fu
           Effect.orElseSucceed(() => true),
         )
       : Effect.succeed(true));
+  const contextCompressionEnabled =
+    options.contextCompressionEnabled ??
+    (Option.isSome(serverSettings)
+      ? serverSettings.value.getSettings.pipe(
+          Effect.map((settings) => settings.contextCompressionEnabled),
+          Effect.orElseSucceed(() => true),
+        )
+      : Effect.succeed(true));
   return yield* makeAcpAdapterV2({
     instanceId: options.instanceId,
     flavor: makeAntigravityAcpAdapterFlavor({
       ...options,
       toolSafetyGuardEnabled,
+      contextCompressionEnabled,
       ...services,
     }),
     selfInvocation: options.selfInvocation,

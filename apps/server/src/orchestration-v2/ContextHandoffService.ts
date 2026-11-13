@@ -15,6 +15,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
+import { compressToolOutput } from "@t3tools/provider-core/server/contextCompressor";
 import {
   DEFAULT_HANDOFF_TOKEN_CAP,
   handoffTokenCapConfig,
@@ -253,8 +254,53 @@ function commandOutcomeLabel(
   return item.status;
 }
 
+const HANDOFF_COMPRESS_MIN_CHARS = 1_200;
+const CRITICAL_HANDOFF_LOG_RE =
+  /(?:ERROR|FATAL|Exception|Traceback|FAIL|panic|AssertionError|TypeError|SyntaxError)/;
+
+function compressHandoffDeltaText(
+  text: string,
+  maxLength: number,
+  sourceLabel = "handoff",
+): string {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return "";
+  if (trimmed.length >= HANDOFF_COMPRESS_MIN_CHARS) {
+    const compressed = compressToolOutput({
+      text: trimmed,
+      minChars: HANDOFF_COMPRESS_MIN_CHARS,
+      includeFooter: false,
+      sourceLabel,
+    });
+    const source = compressed.compressed ? compressed.text : trimmed;
+    const lines = source
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !/^\[\.\.\. \d+ .* omitted \.\.\.\]$/.test(line));
+    const criticalLines = lines.filter((line) => CRITICAL_HANDOFF_LOG_RE.test(line));
+    if (criticalLines.length > 0) {
+      const selected = criticalLines.slice(0, 3);
+      const tail = lines.at(-1);
+      if (tail !== undefined && !selected.includes(tail)) {
+        selected.push(tail);
+      }
+      return compactText(selected.join(" | "), Math.max(maxLength, 480));
+    }
+    return compactText(lines.join(" | "), maxLength);
+  }
+  return compactText(trimmed, maxLength);
+}
+
 function summarizeCommandTail(output: string | undefined, maxLength = 160): string | null {
   if (!output) return null;
+  if (output.length >= HANDOFF_COMPRESS_MIN_CHARS) {
+    const summary = compressHandoffDeltaText(
+      output,
+      Math.max(maxLength, 480),
+      "handoff-command-output",
+    );
+    return summary.length > 0 ? summary : null;
+  }
   const lines = output
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -326,7 +372,9 @@ export function buildStructuredHandoffSummary(
       }
       case "compaction": {
         if (item.summary) {
-          decisionLines.push(`Compacted summary: ${compactText(item.summary, 360)}`);
+          decisionLines.push(
+            `Compacted summary: ${compressHandoffDeltaText(item.summary, 360, "handoff-compaction")}`,
+          );
         }
         break;
       }
@@ -372,7 +420,7 @@ export function buildStructuredHandoffSummary(
       }
       case "error": {
         openSteps.push(
-          `Resolve provider error (${item.failure.class}): ${compactText(item.failure.message, 240)}`,
+          `Resolve provider error (${item.failure.class}): ${compressHandoffDeltaText(item.failure.message, 240, "handoff-error")}`,
         );
         break;
       }
@@ -404,7 +452,7 @@ export function buildStructuredHandoffSummary(
   }
 
   if (decisionLines.length === 0 && latestAssistantText !== null) {
-    decisionLines.push(compactText(latestAssistantText, 400));
+    decisionLines.push(compressHandoffDeltaText(latestAssistantText, 400, "handoff-assistant"));
   }
   const decisionBullets =
     decisionLines.length === 0
@@ -484,21 +532,30 @@ export function buildStructuredHandoffSummary(
 function summarizeDeltaItem(item: OrchestrationV2TurnItem): string | null {
   switch (item.type) {
     case "user_message":
-      return `- User: ${compactText(item.text)}`;
+      return `- User: ${compressHandoffDeltaText(item.text, 240, "handoff-user")}`;
     case "assistant_message":
-      return `- Assistant: ${compactText(item.text)}`;
-    case "command_execution":
-      return `- Command (${commandOutcomeLabel(item)}): ${compactText(item.input, 320)}`;
+      return `- Assistant: ${compressHandoffDeltaText(item.text, 240, "handoff-assistant")}`;
+    case "command_execution": {
+      const command = compactText(item.input, 320);
+      const outcome = commandOutcomeLabel(item);
+      const tail =
+        outcome.startsWith("failed") || (item.output?.length ?? 0) >= HANDOFF_COMPRESS_MIN_CHARS
+          ? summarizeCommandTail(item.output, 240)
+          : null;
+      return tail
+        ? `- Command (${outcome}): ${command} (${tail})`
+        : `- Command (${outcome}): ${command}`;
+    }
     case "file_change":
       return `- File change: ${compactText(item.changes?.map((change) => change.path).join(", ") ?? item.fileName, 400)}`;
     case "checkpoint":
       return `- Checkpoint: ${item.files.length} files`;
     case "proposed_plan":
-      return `- Plan: ${compactText(item.markdown, 320)}`;
+      return `- Plan: ${compressHandoffDeltaText(item.markdown, 320, "handoff-plan")}`;
     case "error":
-      return `- Error (${item.failure.class}): ${compactText(item.failure.message, 320)}`;
+      return `- Error (${item.failure.class}): ${compressHandoffDeltaText(item.failure.message, 320, "handoff-error")}`;
     case "handoff":
-      return `- Handoff: ${compactText(item.summary ?? item.strategy)}`;
+      return `- Handoff: ${compressHandoffDeltaText(item.summary ?? item.strategy, 240, "handoff-summary")}`;
     default:
       return null;
   }

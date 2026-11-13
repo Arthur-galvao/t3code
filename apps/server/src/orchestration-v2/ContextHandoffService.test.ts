@@ -520,4 +520,102 @@ it.layer(layerTest)("ContextHandoffService structured cross-provider synthesis",
     assert.include(summary, "## Objective");
     assert.include(summary, "## Files Modified");
   });
+
+  it.effect(
+    "compresses oversized failed command logs in handoffs while preserving ERROR and FATAL lines without CCR footer bloat",
+    () =>
+      Effect.gen(function* () {
+        const now = DateTime.makeUnsafe("2026-11-13T01:00:00.000Z");
+        const threadId = ThreadId.make("thread:oversized-handoff-logs");
+        const noisyLog = [
+          ...Array.from(
+            { length: 30 },
+            (_, idx) => `2026-11-13T01:00:00Z INFO compiling module_${idx} status=ok`,
+          ),
+          "2026-11-13T01:00:31Z FATAL schema checksum mismatch in migration 042",
+          "2026-11-13T01:00:32Z ERROR TypeError: cannot read property 'id' of undefined",
+          ...Array.from(
+            { length: 30 },
+            (_, idx) => `2026-11-13T01:01:00Z INFO cleanup step_${idx} done`,
+          ),
+          "Command exited with status 1",
+        ].join("\n");
+        assert.isAtLeast(noisyLog.length, 1_200);
+
+        const items: ReadonlyArray<OrchestrationV2TurnItem> = [
+          {
+            id: TurnItemId.make("item:user-1"),
+            threadId,
+            runId: RunId.make("run:1"),
+            nodeId: null,
+            providerThreadId: ProviderThreadId.make("provider-thread:claude"),
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "completed",
+            title: null,
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "user_message",
+            messageId: MessageId.make("msg:1"),
+            createdBy: "user",
+            creationSource: "web",
+            inputIntent: "turn_start",
+            attachments: [],
+            text: "Fix the failing verification run and hand off to Antigravity.",
+          },
+          {
+            id: TurnItemId.make("item:cmd-1"),
+            threadId,
+            runId: RunId.make("run:1"),
+            nodeId: null,
+            providerThreadId: ProviderThreadId.make("provider-thread:claude"),
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 2,
+            status: "failed",
+            title: null,
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "command_execution",
+            input: "vp.cmd run verify",
+            exitCode: 1,
+            output: noisyLog,
+          },
+        ];
+
+        const service = yield* ContextHandoffService.ContextHandoffServiceV2;
+        const handoff = yield* service.prepareProviderHandoff({
+          threadId,
+          targetRunId: RunId.make("run:2"),
+          transferId: ContextTransferId.make("transfer:oversized-logs"),
+          fromProviderThreadIds: [ProviderThreadId.make("provider-thread:claude")],
+          toProviderThreadId: ProviderThreadId.make("provider-thread:antigravity"),
+          fromProviderInstanceId: ProviderInstanceId.make("claudeAgent"),
+          toProviderInstanceId: ProviderInstanceId.make("antigravity"),
+          coveredRunOrdinals: { from: 1, to: 1 },
+          strategy: "full_thread_summary",
+          items,
+          createdAt: now,
+        });
+
+        const coverage = handoff.history?.coverage ?? "";
+        assert.include(coverage, "FATAL schema checksum mismatch in migration 042");
+        assert.include(coverage, "ERROR TypeError: cannot read property 'id' of undefined");
+        assert.notInclude(coverage, "[T3 CCR:");
+        assert.notInclude(handoff.summaryText, "[T3 CCR:");
+
+        const sideChat = ContextHandoffService.makeSideChatContext({
+          parentThreadId: threadId,
+          digest: items,
+        });
+        assert.include(sideChat, "FATAL schema checksum mismatch in migration 042");
+        assert.include(sideChat, "ERROR TypeError: cannot read property 'id' of undefined");
+        assert.notInclude(sideChat, "[T3 CCR:");
+      }),
+  );
 });

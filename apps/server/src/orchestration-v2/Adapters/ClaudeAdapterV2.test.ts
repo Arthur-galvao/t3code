@@ -85,8 +85,13 @@ import * as PortScanner from "../../preview/PortScanner.ts";
 import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { WorkflowAgentTranscriptReadObserver } from "../workflowAgentTranscript.ts";
 import * as ServerConfig from "../../config.ts";
+import * as ServerSettings from "../../serverSettings.ts";
+import { defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
-import { T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH } from "@t3tools/provider-core/server/orchestrationInstructions";
+import {
+  T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH,
+  T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS,
+} from "@t3tools/provider-core/server/orchestrationInstructions";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { PreviewControlsToolkit } from "../../mcp/toolkits/previewControls/tools.ts";
 import { HtmlToolkit } from "../../mcp/toolkits/html/tools.ts";
@@ -5291,6 +5296,211 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             ),
           ),
         ),
+    );
+  });
+
+  describe("PostToolUse context compression", () => {
+    it("registers PostToolUse hook and toggles output shaper instructions in makeClaudeQueryOptions", () => {
+      const enabledOptions = ClaudeAdapterV2.makeClaudeQueryOptions({
+        modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+        nativeThreadId: "native-post-tool-shaper-on",
+        resume: false,
+        cwd: "/workspace",
+      });
+      assert.isDefined(enabledOptions.hooks?.PostToolUse);
+      assert.include(
+        (enabledOptions.systemPrompt as { readonly append?: string }).append ?? "",
+        T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS,
+      );
+
+      const disabledOptions = ClaudeAdapterV2.makeClaudeQueryOptions({
+        modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+        nativeThreadId: "native-post-tool-shaper-off",
+        resume: false,
+        cwd: "/workspace",
+        outputShaperEnabled: false,
+        contextCompressionEnabled: false,
+      });
+      assert.isUndefined(disabledOptions.hooks?.PostToolUse);
+      assert.notInclude(
+        (disabledOptions.systemPrompt as { readonly append?: string }).append ?? "",
+        T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS,
+      );
+    });
+
+    it.effect(
+      "compresses oversized tool responses, skips context_retrieve, and respects contextCompressionEnabled",
+      () =>
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: "/workspace",
+          });
+          const input = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-post-tool-compression"),
+            text: "Run logs and retrieve.",
+            attachments: [],
+            runtimePolicy,
+          });
+          yield* harness.runtime.startTurn({
+            ...input,
+            appThread: {
+              ...input.appThread,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+            },
+          });
+          const openedOptions = harness.getOpenedOptions();
+          assert.isDefined(openedOptions?.hooks?.PostToolUse);
+          const postHooks = openedOptions!.hooks!.PostToolUse!.flatMap((matcher) => matcher.hooks);
+
+          const evalPostToolUse = async (
+            toolName: string,
+            toolInput: unknown,
+            toolResponse: unknown,
+          ) => {
+            const outputs = await Promise.all(
+              postHooks.map((hook) =>
+                hook(
+                  {
+                    hook_event_name: "PostToolUse",
+                    tool_name: toolName,
+                    tool_input: toolInput,
+                    tool_response: toolResponse,
+                    tool_use_id: "tool-post-1",
+                    session_id: "native-thread-post",
+                    transcript_path: "/transcript.jsonl",
+                    cwd: "/workspace",
+                  },
+                  "tool-post-1",
+                  { signal: new AbortController().signal },
+                ),
+              ),
+            );
+            return outputs[0];
+          };
+
+          const largeLog = Array.from({ length: 120 }, (_, index) =>
+            index === 55
+              ? "2026-11-13T01:00:55Z ERROR worker failed on shard 7"
+              : `2026-11-13T01:00:00Z INFO heartbeat line=${index + 1} status=ok`,
+          ).join("\n");
+          assert.isAbove(largeLog.length, 3_000);
+
+          const compressedOut = yield* Effect.promise(() =>
+            evalPostToolUse("Bash", { command: "cat app.log" }, largeLog),
+          );
+          const updated =
+            compressedOut &&
+            "hookSpecificOutput" in compressedOut &&
+            compressedOut.hookSpecificOutput?.hookEventName === "PostToolUse"
+              ? compressedOut.hookSpecificOutput.updatedToolOutput
+              : undefined;
+          assert.isString(updated);
+          assert.include(updated as string, "[T3 CCR:");
+          assert.include(updated as string, "ERROR worker failed on shard 7");
+          const ccrMatch = /\[T3 CCR:(ccr_\d+)/.exec(updated as string);
+          assert.isNotNull(ccrMatch);
+          const retrieved = defaultCcrStore.retrieve({ ccrId: ccrMatch![1]!, query: "shard 7" });
+          assert.isTrue(retrieved.found);
+          assert.include(retrieved.content, "L56: 2026-11-13T01:00:55Z ERROR worker failed");
+
+          const skippedRetrieve = yield* Effect.promise(() =>
+            evalPostToolUse("context_retrieve", { ccrId: ccrMatch![1]! }, largeLog),
+          );
+          assert.deepEqual(skippedRetrieve, {});
+
+          const skippedMcpRetrieve = yield* Effect.promise(() =>
+            evalPostToolUse("mcp__t3-code__context_retrieve", { ccrId: ccrMatch![1]! }, largeLog),
+          );
+          assert.deepEqual(skippedMcpRetrieve, {});
+
+          const skippedAlreadyCompressed = yield* Effect.promise(() =>
+            evalPostToolUse("Bash", { command: "cat out" }, updated),
+          );
+          assert.deepEqual(skippedAlreadyCompressed, {});
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+              ServerSettings.layerTest(),
+            ),
+          ),
+        ),
+    );
+
+    it.effect("disables PostToolUse compression when contextCompressionEnabled is false", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: "/workspace",
+        });
+        const input = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-claude-post-tool-disabled"),
+          text: "Run logs with compression disabled.",
+          attachments: [],
+          runtimePolicy,
+        });
+        yield* harness.runtime.startTurn({
+          ...input,
+          appThread: { ...input.appThread, runtimeMode: "full-access", interactionMode: "default" },
+        });
+        const openedOptions = harness.getOpenedOptions();
+        assert.notInclude(
+          (openedOptions?.systemPrompt as { readonly append?: string } | undefined)?.append ?? "",
+          T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS,
+        );
+        const postHooks = openedOptions!.hooks!.PostToolUse!.flatMap((matcher) => matcher.hooks);
+        const largeLog = Array.from(
+          { length: 120 },
+          (_, index) => `2026-11-13T01:00:00Z INFO heartbeat line=${index + 1} status=ok`,
+        ).join("\n");
+        const hookResult = yield* Effect.promise(() =>
+          postHooks[0]!(
+            {
+              hook_event_name: "PostToolUse",
+              tool_name: "Bash",
+              tool_input: { command: "cat app.log" },
+              tool_response: largeLog,
+              tool_use_id: "tool-post-off",
+              session_id: "native-thread-post-off",
+              transcript_path: "/transcript.jsonl",
+              cwd: "/workspace",
+            },
+            "tool-post-off",
+            { signal: new AbortController().signal },
+          ),
+        );
+        assert.deepEqual(hookResult, {});
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+            ServerSettings.layerTest({
+              contextCompressionEnabled: false,
+              outputShaperEnabled: false,
+            }),
+          ),
+        ),
+      ),
     );
   });
 

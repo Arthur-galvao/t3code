@@ -188,6 +188,11 @@ import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
 import { evaluateToolSafety } from "@t3tools/provider-core/server/toolSafetyGuard";
+import { defaultCcrStore, type CcrStore } from "@t3tools/provider-core/server/ccrStore";
+import {
+  compressToolOutput,
+  type CompressionContentType,
+} from "@t3tools/provider-core/server/contextCompressor";
 import {
   claudeSignedOutMessage,
   makeClaudeEnvironment,
@@ -1942,6 +1947,128 @@ const subagentDeviceInstructions: HookCallback = () =>
     },
   });
 
+const CLAUDE_POST_TOOL_USE_MIN_CHARS = 3_000;
+const CLAUDE_CCR_MARKER = "[T3 CCR:";
+
+function isContextRetrieveTool(toolName: string): boolean {
+  return (
+    toolName === "context_retrieve" ||
+    toolName === "mcp__t3-code__context_retrieve" ||
+    toolName.endsWith("__context_retrieve")
+  );
+}
+
+function extractPathFromToolInput(toolInput: unknown): string | undefined {
+  if (typeof toolInput !== "object" || toolInput === null || Array.isArray(toolInput)) {
+    return undefined;
+  }
+  for (const key of ["file_path", "path", "filePath", "target_file", "notebook_path"]) {
+    const value = Reflect.get(toolInput, key);
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function inferCompressionHint(
+  toolName: string,
+  toolInput: unknown,
+): CompressionContentType | undefined {
+  if (toolName.toLowerCase().includes("diff")) {
+    return "diff";
+  }
+  if (
+    toolName === "Bash" &&
+    typeof toolInput === "object" &&
+    toolInput !== null &&
+    !Array.isArray(toolInput)
+  ) {
+    const command = Reflect.get(toolInput, "command");
+    if (typeof command === "string" && /\b(?:git\s+(?:diff|show)|diff)\b/i.test(command)) {
+      return "diff";
+    }
+  }
+  return undefined;
+}
+
+function extractClaudePostToolUseText(toolResponse: unknown): string | null {
+  if (typeof toolResponse === "string") {
+    return toolResponse;
+  }
+  if (toolResponse === null || toolResponse === undefined) {
+    return null;
+  }
+  if (typeof toolResponse === "object" && !Array.isArray(toolResponse)) {
+    const content = Reflect.get(toolResponse, "content");
+    if (
+      Array.isArray(content) &&
+      content.length > 0 &&
+      content.every(
+        (part) =>
+          typeof part === "object" &&
+          part !== null &&
+          Reflect.get(part, "type") === "text" &&
+          typeof Reflect.get(part, "text") === "string",
+      )
+    ) {
+      return content.map((part) => Reflect.get(part, "text") as string).join("\n");
+    }
+  }
+  try {
+    return JSON.stringify(toolResponse, null, 2);
+  } catch {
+    return null;
+  }
+}
+
+function evaluateClaudePostToolUseCompression(input: {
+  readonly hookInput: Parameters<HookCallback>[0];
+  readonly enabled: boolean;
+  readonly store?: CcrStore;
+}): SyncHookJSONOutput {
+  if (!input.enabled || input.hookInput.hook_event_name !== "PostToolUse") {
+    return {};
+  }
+  const toolName = input.hookInput.tool_name;
+  if (isContextRetrieveTool(toolName)) {
+    return {};
+  }
+  const text = extractClaudePostToolUseText(input.hookInput.tool_response);
+  if (
+    text === null ||
+    text.length <= CLAUDE_POST_TOOL_USE_MIN_CHARS ||
+    text.includes(CLAUDE_CCR_MARKER)
+  ) {
+    return {};
+  }
+  const result = compressToolOutput({
+    text,
+    contentTypeHint: inferCompressionHint(toolName, input.hookInput.tool_input),
+    sourceLabel: toolName,
+    path: extractPathFromToolInput(input.hookInput.tool_input),
+    minChars: CLAUDE_POST_TOOL_USE_MIN_CHARS,
+    store: input.store ?? defaultCcrStore,
+  });
+  if (!result.compressed) {
+    return {};
+  }
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PostToolUse",
+      updatedToolOutput: result.text,
+    },
+  };
+}
+
+const defaultPostToolUseCompressionHook: HookCallback = (hookInput) =>
+  Promise.resolve(
+    evaluateClaudePostToolUseCompression({
+      hookInput,
+      enabled: true,
+    }),
+  );
+
 const CLAUDE_CODE_MODEL_ALIASES = new Set(["opus", "sonnet", "haiku", "fable"]);
 
 export function makeClaudeQueryOptions(input: {
@@ -1973,6 +2100,8 @@ export function makeClaudeQueryOptions(input: {
   readonly appendSystemPromptFileText?: string;
   // Flag settings, because a user's settings.json env beats the process env in Claude Code.
   readonly toolSearchOverride?: "true";
+  readonly contextCompressionEnabled?: boolean;
+  readonly outputShaperEnabled?: boolean;
 }): ClaudeAgentSdkQueryOptions {
   const compiledSelection = compileClaudeModelSelection(input.modelSelection, input.modelCatalog);
   const {
@@ -2044,6 +2173,25 @@ export function makeClaudeQueryOptions(input: {
           },
         } as ClaudeSdkSettings);
   const deviceInstructions = input.mcpServers !== undefined && input.deviceToolsAvailable === true;
+  const registerDefaultPostToolUse =
+    input.hooks?.PostToolUse === undefined && input.contextCompressionEnabled !== false;
+  const hooks: ClaudeQueryOptions["hooks"] | undefined =
+    deviceInstructions || input.hooks !== undefined || registerDefaultPostToolUse
+      ? {
+          ...input.hooks,
+          ...(deviceInstructions
+            ? {
+                SubagentStart: [
+                  ...(input.hooks?.SubagentStart ?? []),
+                  { hooks: [subagentDeviceInstructions] },
+                ],
+              }
+            : {}),
+          ...(registerDefaultPostToolUse
+            ? { PostToolUse: [{ hooks: [defaultPostToolUseCompressionHook] }] }
+            : {}),
+        }
+      : undefined;
   const options: ClaudeAgentSdkQueryOptions = {
     model: compiledSelection.apiModelId,
     // T3 names threads; a supplied title skips Claude's redundant naming request.
@@ -2097,7 +2245,12 @@ export function makeClaudeQueryOptions(input: {
       type: "preset" as const,
       preset: "claude_code" as const,
       append: [
-        buildRuntimeInstructions({ harness: "Claude Code" }) +
+        buildRuntimeInstructions({
+          harness: "Claude Code",
+          ...(input.outputShaperEnabled === undefined
+            ? {}
+            : { outputShaperEnabled: input.outputShaperEnabled }),
+        }) +
           (input.mcpServers === undefined
             ? ""
             : T3_CODE_ORCHESTRATION_INSTRUCTIONS +
@@ -2108,21 +2261,7 @@ export function makeClaudeQueryOptions(input: {
         ...launchAppendSystemPrompt,
       ].join("\n\n"),
     },
-    ...(deviceInstructions || input.hooks !== undefined
-      ? {
-          hooks: {
-            ...input.hooks,
-            ...(deviceInstructions
-              ? {
-                  SubagentStart: [
-                    ...(input.hooks?.SubagentStart ?? []),
-                    { hooks: [subagentDeviceInstructions] },
-                  ],
-                }
-              : {}),
-          },
-        }
-      : {}),
+    ...(hooks === undefined ? {} : { hooks }),
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };
   const additionalDirectories = [
@@ -2234,6 +2373,7 @@ export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
   "mcp__t3-code__t3_environment_links",
   "mcp__t3-code__rsi_query_lessons",
   "mcp__t3-code__rsi_telemetry_summary",
+  "mcp__t3-code__context_retrieve",
   "mcp__t3-code__html_preview",
   "mcp__t3-code__html_render",
 ];
@@ -5249,6 +5389,24 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     }
     return yield* serverSettings.value.getSettings.pipe(
       Effect.map((settings) => settings.toolSafetyGuardEnabled),
+      Effect.orElseSucceed(() => true),
+    );
+  });
+  const readContextCompressionEnabled = Effect.fnUntraced(function* () {
+    if (Option.isNone(serverSettings)) {
+      return true;
+    }
+    return yield* serverSettings.value.getSettings.pipe(
+      Effect.map((settings) => settings.contextCompressionEnabled),
+      Effect.orElseSucceed(() => true),
+    );
+  });
+  const readOutputShaperEnabled = Effect.fnUntraced(function* () {
+    if (Option.isNone(serverSettings)) {
+      return true;
+    }
+    return yield* serverSettings.value.getSettings.pipe(
+      Effect.map((settings) => settings.outputShaperEnabled),
       Effect.orElseSucceed(() => true),
     );
   });
@@ -11745,6 +11903,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const preToolUseSafetyHook: HookCallback = (hookInput) =>
           runPromise(preToolUseSafetyHookEffect(hookInput));
 
+        const postToolUseCompressionHookEffect = Effect.fn(
+          "ClaudeAdapterV2.postToolUseCompressionHook",
+        )(function* (hookInput: Parameters<HookCallback>[0]): Effect.fn.Return<HookJSONOutput> {
+          const compressionEnabled = yield* readContextCompressionEnabled();
+          return evaluateClaudePostToolUseCompression({
+            hookInput,
+            enabled: compressionEnabled,
+          });
+        });
+
+        const postToolUseCompressionHook: HookCallback = (hookInput) =>
+          runPromise(postToolUseCompressionHookEffect(hookInput));
+
         const onElicitationEffect = Effect.fn("ClaudeAdapterV2.onElicitation")(function* (
           request: ElicitationRequest,
           callbackOptions: Parameters<NonNullable<ClaudeQueryOptions["onElicitation"]>>[1],
@@ -12173,7 +12344,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   allowDangerouslySkipPermissions: queryPolicy.allowDangerouslySkipPermissions,
                 }),
             canUseTool,
-            hooks: { PreToolUse: [{ hooks: [preToolUseSafetyHook] }] },
+            hooks: {
+              PreToolUse: [{ hooks: [preToolUseSafetyHook] }],
+              PostToolUse: [{ hooks: [postToolUseCompressionHook] }],
+            },
+            outputShaperEnabled: yield* readOutputShaperEnabled(),
             onUserDialog,
             onElicitation,
             supportedDialogKinds: ["resume_return"],
