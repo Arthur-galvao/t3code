@@ -542,6 +542,8 @@ describe("workflow safety & fallback settings", () => {
     expect(decoded.autoFallbackOnUsageLimit).toBe(true);
     expect(decoded.verificationGateMode).toBe("auto");
     expect(decoded.autoVerifyEnabled).toBe(true);
+    expect(decoded.obsidianMemorySyncEnabled).toBe(true);
+    expect(decoded.obsidianVaultPath).toBe("");
     expect(DEFAULT_SERVER_SETTINGS).toMatchObject({
       toolSafetyGuardEnabled: true,
       loopCircuitBreakerEnabled: true,
@@ -551,6 +553,8 @@ describe("workflow safety & fallback settings", () => {
       autoFallbackOnUsageLimit: true,
       verificationGateMode: "auto",
       autoVerifyEnabled: true,
+      obsidianMemorySyncEnabled: true,
+      obsidianVaultPath: "",
     });
   });
 
@@ -564,6 +568,8 @@ describe("workflow safety & fallback settings", () => {
       autoFallbackOnUsageLimit: false,
       verificationGateMode: "goal" as const,
       autoVerifyEnabled: false,
+      obsidianMemorySyncEnabled: false,
+      obsidianVaultPath: "/tmp/obsidian-vault",
     };
     expect(decodeServerSettingsPatch(patch)).toEqual(patch);
     expect(encodeServerSettingsPatch(patch)).toEqual(patch);

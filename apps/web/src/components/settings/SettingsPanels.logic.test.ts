@@ -91,15 +91,22 @@ describe("getChangedBrowserSettingLabels", () => {
 });
 
 describe("workflow safeguards & RSI settings search", () => {
-  it("defaults autoVerifyEnabled to true", () => {
+  it("defaults autoVerifyEnabled and Obsidian second-brain settings", () => {
     expect(DEFAULT_UNIFIED_SETTINGS.autoVerifyEnabled).toBe(true);
+    expect(DEFAULT_UNIFIED_SETTINGS.obsidianMemorySyncEnabled).toBe(true);
+    expect(DEFAULT_UNIFIED_SETTINGS.obsidianVaultPath).toBe("");
   });
 
-  it("indexes auto-verify and RSI & CCR observability in settings search", () => {
+  it("indexes auto-verify, Obsidian second-brain, and RSI & CCR observability in settings search", () => {
     const autoVerifyMatches = searchSettings("Auto-verify code edits");
     expect(autoVerifyMatches[0]?.id).toBe("auto-verify");
     expect(autoVerifyMatches[0]?.to).toBe("/settings/threads");
     expect(autoVerifyMatches[0]?.targetId).toBe("auto-verify");
+
+    const obsidianMatches = searchSettings("Obsidian second-brain");
+    expect(obsidianMatches[0]?.id).toBe("obsidian-memory");
+    expect(obsidianMatches[0]?.to).toBe("/settings/threads");
+    expect(obsidianMatches[0]?.targetId).toBe("obsidian-memory");
 
     const rsiMatches = searchSettings("RSI & CCR");
     expect(rsiMatches[0]?.id).toBe("rsi-ccr-observability");

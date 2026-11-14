@@ -599,6 +599,12 @@ export function useSettingsRestore(onRestored?: () => void) {
     ...(settings.enableAgentBrowserAccess !== DEFAULT_UNIFIED_SETTINGS.enableAgentBrowserAccess
       ? ["Agent browser access"]
       : []),
+    ...(settings.obsidianMemorySyncEnabled !== DEFAULT_UNIFIED_SETTINGS.obsidianMemorySyncEnabled
+      ? ["Obsidian second-brain sync"]
+      : []),
+    ...(settings.obsidianVaultPath !== DEFAULT_UNIFIED_SETTINGS.obsidianVaultPath
+      ? ["Obsidian vault path"]
+      : []),
   ];
 
   const restoreDefaults = async () => {
@@ -724,6 +730,8 @@ export function useSettingsRestore(onRestored?: () => void) {
       browserAutoShowFloatingPreview: DEFAULT_UNIFIED_SETTINGS.browserAutoShowFloatingPreview,
       pullRequestLinksOpenInApp: DEFAULT_UNIFIED_SETTINGS.pullRequestLinksOpenInApp,
       enableAgentBrowserAccess: DEFAULT_UNIFIED_SETTINGS.enableAgentBrowserAccess,
+      obsidianMemorySyncEnabled: DEFAULT_UNIFIED_SETTINGS.obsidianMemorySyncEnabled,
+      obsidianVaultPath: DEFAULT_UNIFIED_SETTINGS.obsidianVaultPath,
     });
     onRestored?.();
   };
@@ -1773,6 +1781,7 @@ export function ThreadsSettingsPanel() {
   const mixedAddProjectBaseDirectory = useScopedSettingsMixed(["addProjectBaseDirectory"]);
   const mixedTextGenerationModel = useScopedSettingsMixed(["textGenerationModelSelection"]);
   const mixedVerificationGateMode = useScopedSettingsMixed(["verificationGateMode"]);
+  const mixedObsidianVaultPath = useScopedSettingsMixed(["obsidianVaultPath"]);
 
   return (
     <SettingsPageContainer>
@@ -2141,6 +2150,70 @@ export function ThreadsSettingsPanel() {
             />
           }
         />
+        <SettingsRow
+          serverScoped
+          {...searchableSetting("obsidian-memory")}
+          description="Mirror distilled RSI lessons and a Map of Content (00-MOC-Memory.md) into an Obsidian-compatible Markdown folder (T3-Brain/)."
+          settingKeys={["obsidianMemorySyncEnabled"]}
+          resetAction={
+            hasServerTargets &&
+            settings.obsidianMemorySyncEnabled !==
+              DEFAULT_UNIFIED_SETTINGS.obsidianMemorySyncEnabled ? (
+              <SettingResetButton
+                label="Obsidian second-brain sync"
+                onClick={() =>
+                  updateSettings({
+                    obsidianMemorySyncEnabled: DEFAULT_UNIFIED_SETTINGS.obsidianMemorySyncEnabled,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["obsidianMemorySyncEnabled"]}
+              checked={settings.obsidianMemorySyncEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ obsidianMemorySyncEnabled: Boolean(checked) })
+              }
+              aria-label="Obsidian second-brain sync"
+            />
+          }
+        />
+        {settings.obsidianMemorySyncEnabled ? (
+          <SettingsRow
+            serverScoped
+            id="obsidian-vault-path"
+            title="Obsidian vault path"
+            description="Optional absolute path to your Obsidian vault root. Leave empty to use <stateDir>/obsidian-vault."
+            settingKeys={["obsidianVaultPath"]}
+            resetAction={
+              hasServerTargets &&
+              settings.obsidianVaultPath !== DEFAULT_UNIFIED_SETTINGS.obsidianVaultPath ? (
+                <SettingResetButton
+                  label="Obsidian vault path"
+                  onClick={() =>
+                    updateSettings({
+                      obsidianVaultPath: DEFAULT_UNIFIED_SETTINGS.obsidianVaultPath,
+                    })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <DraftInput
+                size="sm"
+                className="w-full sm:w-72"
+                value={mixedObsidianVaultPath ? "" : settings.obsidianVaultPath}
+                onCommit={(next) => updateSettings({ obsidianVaultPath: next })}
+                normalizeDraft={resolvePastedPath}
+                placeholder={mixedObsidianVaultPath ? "Mixed" : "<stateDir>/obsidian-vault"}
+                spellCheck={false}
+                aria-label="Obsidian vault path"
+              />
+            }
+          />
+        ) : null}
         <SettingsRow
           id="rsi-ccr-telemetry-link"
           title="RSI & CCR Telemetry"

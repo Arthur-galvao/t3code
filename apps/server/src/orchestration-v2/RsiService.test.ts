@@ -616,4 +616,116 @@ describe("RsiService", () => {
       expect(summary.totalCompressedCalls).toBe(1);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect(
+    "mirrors RSI lessons into Obsidian T3-Brain vault with MOC index and respects vault settings",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-obsidian-" });
+        const customVaultRoot = path.join(tempRoot, "my-obsidian-vault");
+        const stateDir = path.join(tempRoot, "state");
+
+        const configLayer = ServerConfig.layerTest(stateDir, stateDir);
+        const enabledSettingsLayer = Layer.succeed(ServerSettings.ServerSettingsService, {
+          getSettings: Effect.succeed({
+            rsiAutoDistillEnabled: true,
+            obsidianMemorySyncEnabled: true,
+            obsidianVaultPath: customVaultRoot,
+          } as unknown as Effect.Success<
+            ServerSettings.ServerSettingsService["Service"]["getSettings"]
+          >),
+        } as unknown as ServerSettings.ServerSettingsService["Service"]);
+
+        const serviceLayer = RsiService.makeLayer({ persistCcr: false }).pipe(
+          Layer.provide(configLayer),
+          Layer.provide(enabledSettingsLayer),
+          Layer.provide(NodeServices.layer),
+        );
+
+        let recordedId = "";
+        yield* Effect.gen(function* () {
+          const rsi = yield* RsiService;
+          const globalLesson = yield* rsi.recordLesson({
+            key: "manual:obsidian-global",
+            title: "Use Base UI primitives",
+            guidance: "Do not pass override classes via className to ui primitives.",
+            triggerCondition: "touching apps/web/src/components/**",
+            rationaleTrace: "Prevents shadcn/no-restyle oxlint failures.",
+            scope: "global",
+            confidence: 0.9,
+          });
+          const scopedLesson = yield* rsi.recordLesson({
+            key: "manual:obsidian-scoped",
+            title: "Use Effect.fn in server",
+            guidance: "Wrap reusable Effect functions with Effect.fn.",
+            scope: "glob",
+            globs: ["apps/server/src/**/*.ts"],
+            confidence: 0.8,
+          });
+          recordedId = globalLesson.id;
+
+          const brainDir = path.join(customVaultRoot, "T3-Brain");
+          const mocPath = path.join(brainDir, "00-MOC-Memory.md");
+          const globalNotePath = path.join(brainDir, "Lessons", `${globalLesson.id}.md`);
+          const scopedNotePath = path.join(brainDir, "Lessons", `${scopedLesson.id}.md`);
+
+          expect(yield* fs.exists(mocPath)).toBe(true);
+          expect(yield* fs.exists(globalNotePath)).toBe(true);
+          expect(yield* fs.exists(scopedNotePath)).toBe(true);
+
+          const mocContent = yield* fs.readFileString(mocPath);
+          expect(mocContent).toContain("totalLessons: 2");
+          expect(mocContent).toContain(`[[Lessons/${globalLesson.id}|Use Base UI primitives]]`);
+          expect(mocContent).toContain(`[[Lessons/${scopedLesson.id}|Use Effect.fn in server]]`);
+          expect(mocContent).toContain("## Global Lessons (1)");
+          expect(mocContent).toContain("## Scoped (Glob) Lessons (1)");
+
+          const noteContent = yield* fs.readFileString(globalNotePath);
+          expect(noteContent).toContain("[[00-MOC-Memory]]");
+          expect(noteContent).toContain("## Guidance");
+          expect(noteContent).toContain("## Trigger Condition");
+          expect(noteContent).toContain("## Rationale Trace");
+
+          const deleted = yield* rsi.deleteLesson({ id: globalLesson.id });
+          expect(deleted).toEqual({ deleted: true });
+          expect(yield* fs.exists(globalNotePath)).toBe(false);
+          expect(yield* fs.exists(scopedNotePath)).toBe(true);
+
+          const updatedMoc = yield* fs.readFileString(mocPath);
+          expect(updatedMoc).toContain("totalLessons: 1");
+          expect(updatedMoc).not.toContain(`[[Lessons/${recordedId}|`);
+        }).pipe(Effect.provide(serviceLayer));
+
+        // Disabled obsidianMemorySyncEnabled skips syncing into a separate vault directory.
+        const disabledVaultRoot = path.join(tempRoot, "disabled-vault");
+        const disabledStateDir = path.join(tempRoot, "disabled-state");
+        const disabledLayer = RsiService.makeLayer({ persistCcr: false }).pipe(
+          Layer.provide(ServerConfig.layerTest(disabledStateDir, disabledStateDir)),
+          Layer.provide(
+            Layer.succeed(ServerSettings.ServerSettingsService, {
+              getSettings: Effect.succeed({
+                rsiAutoDistillEnabled: true,
+                obsidianMemorySyncEnabled: false,
+                obsidianVaultPath: disabledVaultRoot,
+              } as unknown as Effect.Success<
+                ServerSettings.ServerSettingsService["Service"]["getSettings"]
+              >),
+            } as unknown as ServerSettings.ServerSettingsService["Service"]),
+          ),
+          Layer.provide(NodeServices.layer),
+        );
+
+        yield* Effect.gen(function* () {
+          const rsi = yield* RsiService;
+          yield* rsi.recordLesson({
+            title: "Should stay out of disabled vault",
+            guidance: "Vault sync is disabled.",
+          });
+        }).pipe(Effect.provide(disabledLayer));
+
+        expect(yield* fs.exists(path.join(disabledVaultRoot, "T3-Brain"))).toBe(false);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });

@@ -531,6 +531,7 @@ interface PersistenceHandles {
   readonly rsiDir: string;
   readonly lessonsPath: string;
   readonly telemetryPath: string;
+  readonly resolveObsidianBrainDir?: () => Effect.Effect<string | null>;
 }
 
 function parseLessonsFile(raw: string): ReadonlyArray<RsiLesson> {
@@ -613,6 +614,113 @@ function encodeTelemetryLine(record: RsiRunTelemetryRecord): string {
   return `${JSON.stringify(record)}\n`;
 }
 
+function escapeWikilinkAlias(raw: string): string {
+  return raw.replace(/[\r\n|[\]]+/g, " ").trim() || "Untitled Lesson";
+}
+
+function obsidianLessonFileName(lessonId: string): string {
+  return `${lessonId.replace(/[^a-zA-Z0-9._-]/g, "_")}.md`;
+}
+
+function formatObsidianLessonMarkdown(lesson: RsiLesson): string {
+  const frontmatter = [
+    "---",
+    `id: ${JSON.stringify(lesson.id)}`,
+    `key: ${JSON.stringify(lesson.key)}`,
+    `title: ${JSON.stringify(lesson.title)}`,
+    `scope: ${lesson.scope}`,
+    `confidence: ${lesson.confidence.toFixed(2)}`,
+    `hits: ${lesson.hits}`,
+    `globs: ${JSON.stringify(lesson.globs)}`,
+    `createdAt: ${JSON.stringify(lesson.createdAt)}`,
+    `updatedAt: ${JSON.stringify(lesson.updatedAt)}`,
+    `tags: ${JSON.stringify(["t3-memory", "rsi-lesson", lesson.scope])}`,
+    "---",
+  ].join("\n");
+
+  const globSuffix =
+    lesson.globs.length > 0 ? ` (${lesson.globs.map((g) => `\`${g}\``).join(", ")})` : "";
+  const lines: Array<string> = [
+    frontmatter,
+    "",
+    `# ${lesson.title}`,
+    "",
+    `> **Scope:** \`${lesson.scope}\`${globSuffix} | **Confidence:** ${lesson.confidence.toFixed(2)} | **Hits:** ${lesson.hits}`,
+    "> **Index:** [[00-MOC-Memory]]",
+    "",
+    "## Guidance",
+    "",
+    lesson.guidance,
+  ];
+  if (lesson.triggerCondition.trim() !== "") {
+    lines.push("", "## Trigger Condition", "", lesson.triggerCondition);
+  }
+  if (lesson.rationaleTrace.trim() !== "") {
+    lines.push("", "## Rationale Trace", "", lesson.rationaleTrace);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+function latestLessonUpdatedAt(lessons: ReadonlyArray<RsiLesson>): string {
+  let latest = "";
+  for (const lesson of lessons) {
+    if (lesson.updatedAt > latest) {
+      latest = lesson.updatedAt;
+    }
+  }
+  return latest !== "" ? latest : "1970-01-01T00:00:00.000Z";
+}
+
+function formatObsidianMocMarkdown(lessons: ReadonlyArray<RsiLesson>, updatedAt: string): string {
+  const sorted = [...lessons].toSorted(
+    (a, b) => b.confidence - a.confidence || b.hits - a.hits || a.id.localeCompare(b.id),
+  );
+  const globalLessons = sorted.filter((lesson) => lesson.scope === "global");
+  const globLessons = sorted.filter((lesson) => lesson.scope === "glob");
+
+  const frontmatter = [
+    "---",
+    'title: "T3 Code Second Brain: Memory MOC"',
+    `updatedAt: ${JSON.stringify(updatedAt)}`,
+    `totalLessons: ${sorted.length}`,
+    'tags: ["t3-memory", "moc"]',
+    "---",
+  ].join("\n");
+
+  const renderEntry = (lesson: RsiLesson, includeGlobs: boolean): string => {
+    const noteStem = obsidianLessonFileName(lesson.id).slice(0, -3);
+    const alias = escapeWikilinkAlias(lesson.title);
+    const globList =
+      includeGlobs && lesson.globs.length > 0
+        ? ` [${lesson.globs.map((g) => `\`${g}\``).join(", ")}]`
+        : "";
+    return `- [[Lessons/${noteStem}|${alias}]]: \`${lesson.key}\`${globList} (confidence: ${lesson.confidence.toFixed(2)}, hits: ${lesson.hits})`;
+  };
+
+  const lines: Array<string> = [
+    frontmatter,
+    "",
+    "# T3 Code Second Brain: Memory MOC",
+    "",
+    `Active distilled lessons: **${sorted.length}** (${globalLessons.length} global, ${globLessons.length} scoped).`,
+    "",
+    `## Global Lessons (${globalLessons.length})`,
+    "",
+    ...(globalLessons.length > 0
+      ? globalLessons.map((lesson) => renderEntry(lesson, false))
+      : ["_No global lessons recorded yet._"]),
+    "",
+    `## Scoped (Glob) Lessons (${globLessons.length})`,
+    "",
+    ...(globLessons.length > 0
+      ? globLessons.map((lesson) => renderEntry(lesson, true))
+      : ["_No scoped lessons recorded yet._"]),
+    "",
+  ];
+  return lines.join("\n");
+}
+
 export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   readonly persistence?: PersistenceHandles;
   readonly isAutoDistillEnabled?: () => Effect.Effect<boolean>;
@@ -640,6 +748,49 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     ccrStore.configurePersistence(persistence.path.join(persistence.rsiDir, "ccr-cache.json"));
   }
 
+  const syncObsidianBrainLocked = Effect.fn("RsiService.syncObsidianBrainLocked")(function* (
+    lessons: ReadonlyArray<RsiLesson>,
+  ) {
+    if (persistence?.resolveObsidianBrainDir === undefined) return;
+    const brainDir = yield* persistence.resolveObsidianBrainDir();
+    if (brainDir === null || brainDir.trim() === "") return;
+
+    const lessonsDir = persistence.path.join(brainDir, "Lessons");
+    yield* Effect.gen(function* () {
+      yield* persistence.fs.makeDirectory(lessonsDir, { recursive: true });
+      const expectedFiles = new Set<string>();
+      for (const lesson of lessons) {
+        const fileName = obsidianLessonFileName(lesson.id);
+        expectedFiles.add(fileName);
+        yield* persistence.fs.writeFileString(
+          persistence.path.join(lessonsDir, fileName),
+          formatObsidianLessonMarkdown(lesson),
+        );
+      }
+
+      const existingEntries = yield* persistence.fs
+        .readDirectory(lessonsDir)
+        .pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<string>));
+      for (const entry of existingEntries) {
+        if (entry.endsWith(".md") && !expectedFiles.has(entry)) {
+          yield* persistence.fs
+            .remove(persistence.path.join(lessonsDir, entry), { force: true })
+            .pipe(Effect.ignore);
+        }
+      }
+
+      const mocMarkdown = formatObsidianMocMarkdown(lessons, latestLessonUpdatedAt(lessons));
+      yield* persistence.fs.writeFileString(
+        persistence.path.join(brainDir, "00-MOC-Memory.md"),
+        mocMarkdown,
+      );
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("RsiService: failed to sync Obsidian second-brain vault", { cause }),
+      ),
+    );
+  });
+
   const hydrateLocked = Effect.fn("RsiService.hydrateLocked")(function* () {
     if (yield* Ref.get(hydratedRef)) return;
     if (persistence !== undefined) {
@@ -647,7 +798,11 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         .readFileString(persistence.lessonsPath)
         .pipe(Effect.orElseSucceed(() => ""));
       if (lessonsRaw.trim() !== "") {
-        yield* Ref.set(lessonsRef, parseLessonsFile(lessonsRaw));
+        const loadedLessons = parseLessonsFile(lessonsRaw);
+        yield* Ref.set(lessonsRef, loadedLessons);
+        if (loadedLessons.length > 0) {
+          yield* syncObsidianBrainLocked(loadedLessons);
+        }
       }
       const telemetryRaw = yield* persistence.fs
         .readFileString(persistence.telemetryPath)
@@ -670,6 +825,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     yield* persistence.fs
       .writeFileString(persistence.lessonsPath, payload)
       .pipe(Effect.catch((cause) => Effect.logWarning("Failed to write RSI lessons", { cause })));
+    yield* syncObsidianBrainLocked(lessons);
   });
 
   const appendTelemetryLocked = Effect.fn("RsiService.appendTelemetryLocked")(function* (
@@ -1469,12 +1625,40 @@ const makeLayerEffect = Effect.fn("RsiService.makeLayer")(function* (options?: {
     configOpt.value.stateDir.trim() !== ""
       ? (() => {
           const rsiDir = pathOpt.value.join(configOpt.value.stateDir, "rsi");
+          const defaultBrainDir = pathOpt.value.join(
+            configOpt.value.stateDir,
+            "obsidian-vault",
+            "T3-Brain",
+          );
+          const resolveObsidianBrainDir = (): Effect.Effect<string | null> =>
+            Option.isNone(settingsOpt)
+              ? Effect.succeed(defaultBrainDir)
+              : settingsOpt.value.getSettings.pipe(
+                  Effect.map((settings) => {
+                    if (
+                      "obsidianMemorySyncEnabled" in settings &&
+                      settings.obsidianMemorySyncEnabled === false
+                    ) {
+                      return null;
+                    }
+                    const customRoot =
+                      "obsidianVaultPath" in settings &&
+                      typeof settings.obsidianVaultPath === "string"
+                        ? settings.obsidianVaultPath.trim()
+                        : "";
+                    return customRoot !== ""
+                      ? pathOpt.value.join(customRoot, "T3-Brain")
+                      : defaultBrainDir;
+                  }),
+                  Effect.orElseSucceed(() => defaultBrainDir),
+                );
           return {
             fs: fsOpt.value,
             path: pathOpt.value,
             rsiDir,
             lessonsPath: pathOpt.value.join(rsiDir, "lessons.json"),
             telemetryPath: pathOpt.value.join(rsiDir, "telemetry.jsonl"),
+            resolveObsidianBrainDir,
           };
         })()
       : undefined;

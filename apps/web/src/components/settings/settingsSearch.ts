@@ -802,6 +802,16 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["rsi verification tests typecheck lint safeguards workflow autoVerifyEnabled"],
   },
   {
+    id: "obsidian-memory",
+    title: "Obsidian second-brain sync",
+    to: "/settings/threads",
+    targetId: "obsidian-memory",
+    scope: "project-defaults",
+    searchTerms: [
+      "obsidian vault second brain memory markdown notes moc rsi knowledge base obsidianMemorySyncEnabled obsidianVaultPath",
+    ],
+  },
+  {
     id: "worktree-submodules",
     title: "Submodules",
     to: "/settings/worktrees",

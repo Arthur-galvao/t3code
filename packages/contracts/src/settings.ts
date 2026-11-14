@@ -1454,6 +1454,8 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed("auto" as const)),
   ),
   autoVerifyEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  obsidianMemorySyncEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  obsidianVaultPath: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   snoozePresets: SnoozePresetSettings.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_SNOOZE_PRESETS)),
   ),
@@ -1902,6 +1904,8 @@ export const ServerSettingsPatch = Schema.Struct({
   outputShaperEnabled: Schema.optionalKey(Schema.Boolean),
   verificationGateMode: Schema.optionalKey(VerificationGateMode),
   autoVerifyEnabled: Schema.optionalKey(Schema.Boolean),
+  obsidianMemorySyncEnabled: Schema.optionalKey(Schema.Boolean),
+  obsidianVaultPath: Schema.optionalKey(TrimmedString),
   snoozePresets: Schema.optionalKey(SnoozePresetSettings),
   hiddenThreadTags: Schema.optionalKey(Schema.Array(Schema.String)),
   hideTaggedThreads: Schema.optionalKey(Schema.Boolean),

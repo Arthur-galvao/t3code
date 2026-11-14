@@ -23,14 +23,17 @@ Follow these six phases for multi-file features, orchestration changes, provider
 - Define exact `effect/Schema` changes in `packages/contracts/src/` first (backwards-compatible decoding defaults via `Schema.withDecodingDefault`, forward-compatible optionals where older clients/servers interact).
 - Specify service shapes (`Context.Service` tag + methods + typed `Schema.TaggedError` failures), adapter hooks, and pure helper boundaries.
 - Keep `Orchestrator` pure (no I/O); isolate subprocess, filesystem, and network I/O in Effect services and `OrchestrationEffectWorkerV2`.
+- Run the **`egm-review`** `Zoom-Out` and `Design` lenses on the spec to eliminate parallel abstractions and unmitigated failure modes.
 
 ## 3. Plan
 
 - Split changes into minimal, non-overlapping file slices per layer (`contracts` -> `provider-core` / `server` -> `client-runtime` / `web`).
 - Decide verification scope upfront: which package `typecheck`s, unit/logic tests (`*.test.ts` / `*.logic.test.ts`), browser tests (`*.browser.test.tsx`), and `evals/` cases (if changing model-facing instructions or MCP tool schemas) are required.
-- Do not commit scratch plans or working notes inside the repo (`AGENTS.md` § Plans and work artifacts).
+- Apply the **`egm-review`** `Implementation Readiness` and `Structural` lenses before coding; do not commit scratch plans or working notes inside the repo (`AGENTS.md` § Plans and work artifacts).
 
 ## 4. Implement
+
+- For Web UI work in `apps/web`, follow the **`frontend-stack`** skill (`@base-ui/react`, `@coss`/`@spell`/`@magicui`/`@react-bits` boundaries, and `21st.dev` adaptation).
 
 ### Effect v4 & Server Conventions (`docs/internals/effect-services.md`)
 
@@ -60,6 +63,6 @@ Follow these six phases for multi-file features, orchestration changes, provider
 
 ## 6. Learn
 
-- If a recurring failure pattern, workspace quirk, or architectural invariant was discovered:
-  - Record an ACE-curated lesson via the `rsi_record_lesson` MCP tool (when `RsiService` is enabled) so future sessions inherit it in `[RSI Lessons]`.
+- Apply **`obsidian-brain`** + **`egm-review`** after complex fixes:
+  - Record an ACE-curated lesson via the `rsi_record_lesson` MCP tool (when `RsiService` is enabled) so future sessions inherit it in `[RSI Lessons]` and mirror it into Obsidian (`T3-Brain/00-MOC-Memory.md` and `T3-Brain/Lessons/`).
   - Update `docs/internals/` only if an architectural boundary or hidden constraint changed across modules.
