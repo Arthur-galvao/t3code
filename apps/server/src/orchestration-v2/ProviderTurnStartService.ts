@@ -1751,13 +1751,19 @@ export const layer: Layer.Layer<
         !isNewProviderSession || Option.isNone(rsiService)
           ? ""
           : yield* rsiService.value
-              .formatSessionPrefix({
+              .formatSessionPrefixWithMetadata({
                 cwd: resolvedRuntimePolicy.cwd,
                 activePaths,
                 provider: session.driver,
+                providerInstanceId: run.providerInstanceId,
+                threadId: projection.thread.id,
+                runId: run.id,
                 maxChars: 600,
               })
-              .pipe(Effect.catchCause(() => Effect.succeed("")));
+              .pipe(
+                Effect.map((result) => result.prefix),
+                Effect.catchCause(() => Effect.succeed("")),
+              );
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
           const delivery = yield* deliverContextHandoffs({

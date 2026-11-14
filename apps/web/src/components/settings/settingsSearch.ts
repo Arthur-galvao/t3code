@@ -794,6 +794,14 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["default workspace mode draft local worktree"],
   },
   {
+    id: "auto-verify",
+    title: "Auto-verify code edits",
+    to: "/settings/threads",
+    targetId: "auto-verify",
+    scope: "project-defaults",
+    searchTerms: ["rsi verification tests typecheck lint safeguards workflow autoVerifyEnabled"],
+  },
+  {
     id: "worktree-submodules",
     title: "Submodules",
     to: "/settings/worktrees",
@@ -906,6 +914,14 @@ export const SETTINGS_SEARCH_ITEMS = [
     targetId: "telemetry-export",
     scope: "environment",
     searchTerms: ["OTel OTLP telemetry export endpoints logs traces metrics Grafana"],
+  },
+  {
+    id: "rsi-ccr-observability",
+    title: "RSI & CCR Observability",
+    to: "/settings/diagnostics",
+    targetId: "rsi-ccr-observability",
+    scope: "environment",
+    searchTerms: ["rsi ccr telemetry lessons cache hit rate tokens saved loop trips safety blocks"],
   },
   {
     id: "diagnostics",

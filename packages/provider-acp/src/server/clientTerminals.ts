@@ -12,6 +12,8 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as NodeBuffer from "node:buffer";
+import { defaultCcrStore, type CcrStore } from "@t3tools/provider-core/server/ccrStore";
+import { compressToolOutput } from "@t3tools/provider-core/server/contextCompressor";
 
 const MAX_LIVE_TERMINALS = 16;
 const MAX_UNRELEASED_TERMINALS = 64;
@@ -19,6 +21,8 @@ const MAX_RETAINED_TERMINALS = 32;
 const MAX_RETAINED_OUTPUT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_OUTPUT_BYTE_LIMIT = 4 * 1024 * 1024;
 const MAX_OUTPUT_BYTE_LIMIT = 8 * 1024 * 1024;
+const DEFAULT_TERMINAL_COMPRESSION_MIN_CHARS = 3_000;
+const TERMINAL_CCR_MARKER = "[T3 CCR:";
 const OUTPUT_DRAIN_GRACE = "1 second";
 
 const terminalRequestError = (message: string, cause?: unknown) =>
@@ -89,12 +93,15 @@ interface ManagedAcpTerminal {
   readonly terminalId: string;
   readonly sessionId: string;
   readonly commandLine: string;
+  readonly boundedOutput: boolean;
   readonly buffer: OutputBufferState;
   readonly exit: Deferred.Deferred<EffectAcpSchema.WaitForTerminalExitResponse>;
   readonly kill: Effect.Effect<void>;
   readonly dispose: Effect.Effect<void>;
   exitStatus: EffectAcpSchema.TerminalExitStatus | undefined;
   released: boolean;
+  compressedOutput?: string | undefined;
+  compressionEvaluated?: boolean;
 }
 
 export interface AcpClientTerminals {
@@ -131,6 +138,11 @@ export interface AcpClientTerminalsOptions {
     | ((sessionId: string) => NodeJS.ProcessEnv | undefined)
     | undefined;
   readonly forceKillAfter?: Duration.Input | undefined;
+  readonly contextCompressionEnabled?: (() => Effect.Effect<boolean>) | boolean | undefined;
+  readonly threadIdForSession?:
+    | ((sessionId: string) => Effect.Effect<string | undefined> | string | undefined)
+    | undefined;
+  readonly ccrStore?: CcrStore | undefined;
 }
 
 function acpTerminalCommand(input: {
@@ -258,6 +270,7 @@ export const makeAcpClientTerminals = Effect.fn("makeAcpClientTerminals")(functi
             terminalId,
             sessionId: request.sessionId,
             commandLine: [request.command, ...(request.args ?? [])].join(" "),
+            boundedOutput: request.outputByteLimit !== undefined,
             buffer: {
               chunks: [],
               bytes: 0,
@@ -319,13 +332,72 @@ export const makeAcpClientTerminals = Effect.fn("makeAcpClientTerminals")(functi
       ),
     );
 
+  const isContextCompressionEnabled = (): Effect.Effect<boolean> => {
+    if (options.contextCompressionEnabled === undefined) {
+      return Effect.succeed(true);
+    }
+    if (typeof options.contextCompressionEnabled === "boolean") {
+      return Effect.succeed(options.contextCompressionEnabled);
+    }
+    return options.contextCompressionEnabled();
+  };
+
+  const resolveThreadId = (sessionId: string): Effect.Effect<string | undefined> => {
+    if (options.threadIdForSession === undefined) {
+      return Effect.undefined;
+    }
+    const resolved = options.threadIdForSession(sessionId);
+    return Effect.isEffect(resolved) ? resolved : Effect.succeed(resolved);
+  };
+
   const output: AcpClientTerminals["output"] = (request) =>
     requireTerminal(request.sessionId, request.terminalId, "terminal/output").pipe(
-      Effect.map((terminal) => ({
-        output: readOutput(terminal.buffer),
-        truncated: terminal.buffer.truncated,
-        ...(terminal.exitStatus === undefined ? {} : { exitStatus: terminal.exitStatus }),
-      })),
+      Effect.flatMap(
+        Effect.fnUntraced(function* (terminal) {
+          const rawOutput = readOutput(terminal.buffer);
+          // Only compress finalized unbounded command outputs so streaming polls stay raw.
+          if (
+            terminal.exitStatus !== undefined &&
+            !terminal.boundedOutput &&
+            rawOutput.length >= DEFAULT_TERMINAL_COMPRESSION_MIN_CHARS &&
+            !rawOutput.includes(TERMINAL_CCR_MARKER)
+          ) {
+            const compressionEnabled = yield* isContextCompressionEnabled();
+            if (compressionEnabled) {
+              if (!terminal.compressionEvaluated) {
+                const threadId = yield* resolveThreadId(request.sessionId);
+                const sourceLabel =
+                  terminal.commandLine.trim().length > 0
+                    ? `terminal: ${terminal.commandLine.trim().slice(0, 80)}`
+                    : "terminal";
+                const compressed = compressToolOutput({
+                  text: rawOutput,
+                  ...(threadId === undefined ? {} : { threadId }),
+                  sourceLabel,
+                  minChars: DEFAULT_TERMINAL_COMPRESSION_MIN_CHARS,
+                  store: options.ccrStore ?? defaultCcrStore,
+                });
+                terminal.compressionEvaluated = true;
+                if (compressed.compressed) {
+                  terminal.compressedOutput = compressed.text;
+                }
+              }
+              if (terminal.compressedOutput !== undefined) {
+                return {
+                  output: terminal.compressedOutput,
+                  truncated: terminal.buffer.truncated,
+                  exitStatus: terminal.exitStatus,
+                };
+              }
+            }
+          }
+          return {
+            output: rawOutput,
+            truncated: terminal.buffer.truncated,
+            ...(terminal.exitStatus === undefined ? {} : { exitStatus: terminal.exitStatus }),
+          };
+        }),
+      ),
     );
 
   const waitForExit: AcpClientTerminals["waitForExit"] = (request) =>

@@ -111,6 +111,7 @@ import { RpcGroup, RpcSerialization, RpcServer } from "effect/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as NativeChildWorkQuery from "./orchestration-v2/NativeChildWorkQuery.ts";
+import * as RsiService from "./orchestration-v2/RsiService.ts";
 import * as ServerConfig from "./config.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -1473,6 +1474,10 @@ export const layerWsRpc = (
       const deviceHostContext =
         yield* Effect.context<Effect.Services<ReturnType<typeof remoteSshDeviceHosts>>>();
       const orchestrationEngine = yield* Orchestrator.OrchestratorV2;
+      const rsiServiceOpt = yield* Effect.serviceOption(RsiService.RsiService);
+      const rsiService = Option.isSome(rsiServiceOpt)
+        ? rsiServiceOpt.value
+        : yield* RsiService.makeRsiService();
       const random = yield* SecureRandom.SecureRandom;
       // RPC client ids are only unique within one socket; terminals share viewers across sockets.
       const terminalViewerPrefix = yield* random.uuidV4();
@@ -3456,6 +3461,11 @@ export const layerWsRpc = (
               Stream.concat(Stream.make(latest), changes),
             ),
           ),
+        [WS_METHODS.rsiGetTelemetrySummary]: (input) => rsiService.getTelemetrySummary(input),
+        [WS_METHODS.rsiQueryLessons]: (input) => rsiService.queryLessons(input),
+        [WS_METHODS.rsiRecordLesson]: (input) => rsiService.recordLesson(input),
+        [WS_METHODS.rsiDemoteLesson]: (input) => rsiService.demoteLesson(input),
+        [WS_METHODS.rsiDeleteLesson]: (input) => rsiService.deleteLesson(input),
       });
       const splitHandlers: Pick<typeof handlers, SplitWsRpc["_tag"]> = handlers;
       const otherHandlers: Pick<typeof handlers, Exclude<ServerWsRpc, SplitWsRpc>["_tag"]> =

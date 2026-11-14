@@ -1,9 +1,12 @@
 import type {
+  EnvironmentId,
   ProviderInstanceId,
   ServerProvider,
   ServerProviderUsageWindow,
+  ThreadId,
   UsageLimitSourceSnapshots,
 } from "@t3tools/contracts";
+import { formatCount, formatPercent, formatTokens } from "@t3tools/shared/usageFormat";
 import {
   collectProviderUsageLimits,
   formatDuration,
@@ -19,6 +22,8 @@ import { useNowMinute } from "../../hooks/useNowMinute";
 import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
 import { formatContextWindowTokens } from "../../lib/contextWindow";
 import { cn } from "../../lib/utils";
+import { usePrimaryEnvironmentId } from "../../state/environments";
+import { hasNonZeroRsiCcrSavings, useRsiTelemetrySummary } from "../../state/rsi";
 import { formatUpcomingTimestamp } from "../../timestampFormat";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { formatContextWindowCompactionMessage } from "./compaction.logic";
@@ -83,7 +88,25 @@ export function ThreadDetailsUsage({
 }
 
 /** The thread's context window. The bar fills as context is used; the tick marks auto-compaction. */
-export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowSnapshot }) {
+export function ThreadDetailsContext({
+  usage,
+  environmentId,
+  threadId,
+}: {
+  readonly usage: ContextWindowSnapshot;
+  readonly environmentId?: EnvironmentId | null | undefined;
+  readonly threadId?: ThreadId | null | undefined;
+}) {
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const targetEnvironmentId = environmentId === undefined ? primaryEnvironmentId : environmentId;
+  const telemetryInput = threadId ? { threadId } : undefined;
+  const { data: telemetry } = useRsiTelemetrySummary(targetEnvironmentId, telemetryInput);
+  const showTelemetryRows = telemetry !== null && hasNonZeroRsiCcrSavings(telemetry);
+  const cacheHitPercent =
+    telemetry !== null
+      ? Math.round(Math.max(0, Math.min(100, telemetry.avgCacheHitRate * 100)))
+      : 0;
+
   const maxTokens = usage.maxTokens != null && usage.maxTokens > 0 ? usage.maxTokens : null;
   const used =
     maxTokens !== null && usage.usedPercentage !== null
@@ -133,6 +156,52 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
             </>
           }
         />
+        {showTelemetryRows &&
+        (telemetry.avgCacheHitRate > 0 || telemetry.totalCachedInputTokens > 0) ? (
+          <UsageRow
+            label="Cache hit"
+            fill={cacheHitPercent}
+            tone={null}
+            tick={null}
+            muted
+            value={formatPercent(telemetry.avgCacheHitRate, 1)}
+            ariaValue={`${formatPercent(telemetry.avgCacheHitRate, 1)} cache hit rate`}
+            tooltip={
+              <>
+                <span className="text-foreground">
+                  Cache hit rate: {formatPercent(telemetry.avgCacheHitRate, 1)}
+                </span>
+                <span className="text-muted-foreground">
+                  {formatTokens(telemetry.totalCachedInputTokens)} cached input tokens across{" "}
+                  {formatTokens(telemetry.totalTokens)} total tokens
+                </span>
+              </>
+            }
+          />
+        ) : null}
+        {showTelemetryRows &&
+        (telemetry.totalTokensSavedEst > 0 || telemetry.totalCompressedCalls > 0) ? (
+          <UsageRow
+            label="CCR saved"
+            fill={null}
+            tone={null}
+            tick={null}
+            muted
+            value={`${formatTokens(telemetry.totalTokensSavedEst)} (${formatCount(telemetry.totalCompressedCalls)} calls)`}
+            ariaValue={`${formatTokens(telemetry.totalTokensSavedEst)} estimated tokens saved`}
+            tooltip={
+              <>
+                <span className="text-foreground">
+                  CCR tokens saved: {formatTokens(telemetry.totalTokensSavedEst)}
+                </span>
+                <span className="text-muted-foreground">
+                  Across {formatCount(telemetry.totalCompressedCalls)} compressed tool call
+                  {telemetry.totalCompressedCalls === 1 ? "" : "s"}
+                </span>
+              </>
+            }
+          />
+        ) : null}
       </div>
     </ThreadDetailsSection>
   );

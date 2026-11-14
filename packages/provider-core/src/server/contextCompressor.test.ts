@@ -199,4 +199,23 @@ describe("compressToolOutput", () => {
     assert.equal(result.text, allCriticalLogs);
     assert.equal(store.getStats().entriesCount, 0);
   });
+
+  it("forwards optional threadId to store.put and store.recordCompression", () => {
+    const store = createCcrStore();
+    const lines = Array.from({ length: 120 }, (_, i) => `2026-11-14T00:00:00Z INFO row ${i % 2}`);
+    const result = compressToolOutput({
+      text: lines.join("\n"),
+      contentTypeHint: "logs",
+      threadId: "thread-xyz",
+      store,
+    });
+
+    assert.equal(result.compressed, true);
+    assert.isDefined(result.ccrId);
+    assert.equal(store.get(result.ccrId!)?.threadId, "thread-xyz");
+    assert.equal(store.getStats("thread-xyz").entriesCount, 1);
+    assert.equal(store.getStats("thread-xyz").compressedCallsCount, 1);
+    assert.isAbove(store.getStats("thread-xyz").tokensSavedEst, 0);
+    assert.equal(store.getStats("other-thread").entriesCount, 0);
+  });
 });

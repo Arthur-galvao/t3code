@@ -1,9 +1,11 @@
+import { useAtomValue } from "@effect/atom-react";
 import { ProcessSignalActions } from "./ProcessSignalActions";
 import { resolveUsageAccess } from "@t3tools/client-runtime/state/usage-access";
 import { environmentSession } from "../../state/session";
-import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
+import { AuthOrchestrationOperateScope, type EnvironmentId } from "@t3tools/contracts";
 import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
 import { AuthEnvironmentMaintainScope } from "@t3tools/contracts";
+import { formatPercent, formatTokens } from "@t3tools/shared/usageFormat";
 import { RefreshIcon } from "~/components/ui/refresh-icon";
 import {
   AlertTriangleIcon,
@@ -32,8 +34,15 @@ import { ensureLocalApi } from "../../localApi";
 import { useOpenInPreferredEditor } from "../../editorPreferences";
 import { useRelativeTimeState } from "../../hooks/useRelativeTimeState";
 import { useEnvironmentQuery } from "../../state/query";
+import {
+  rsiEnvironment,
+  useRsiLessons,
+  useRsiObservabilityRefresh,
+  useRsiTelemetrySummary,
+} from "../../state/rsi";
 import { serverEnvironment } from "../../state/server";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
+import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { ScrollArea } from "../ui/scroll-area";
 import { Toggle, ToggleGroup } from "../ui/toggle-group";
@@ -711,6 +720,264 @@ function DiagnosticsRefreshButton({
   );
 }
 
+function RsiObservabilityDiagnostics({
+  environmentId,
+}: {
+  readonly environmentId: EnvironmentId | null;
+}) {
+  const telemetryQuery = useRsiTelemetrySummary(environmentId);
+  const lessonsQuery = useRsiLessons(environmentId);
+  const rsiRefresh = useRsiObservabilityRefresh(environmentId);
+  const demoteLesson = useAtomCommand(rsiEnvironment.demoteLesson);
+  const deleteLesson = useAtomCommand(rsiEnvironment.deleteLesson);
+  const canDemoteLesson = useAtomValue(rsiEnvironment.demoteLesson.permissionAtom(environmentId));
+  const canDeleteLesson = useAtomValue(rsiEnvironment.deleteLesson.permissionAtom(environmentId));
+  const [pendingLessonId, setPendingLessonId] = useState<string | null>(null);
+  const pendingLessonRef = useRef<string | null>(null);
+
+  const telemetry = telemetryQuery.data;
+  const lessons = lessonsQuery.data ?? [];
+  const isRsiRefreshing = telemetryQuery.isPending || lessonsQuery.isPending;
+  const isTelemetryInitialLoading = telemetryQuery.isPending && telemetry === null;
+  const isLessonsInitialLoading = lessonsQuery.isPending && lessonsQuery.data === null;
+  const rsiError = telemetryQuery.error ?? lessonsQuery.error;
+
+  const handleDemoteLesson = async (lessonId: string, lessonTitle: string) => {
+    if (
+      environmentId === null ||
+      !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)
+    ) {
+      return;
+    }
+    if (pendingLessonRef.current !== null) return;
+    pendingLessonRef.current = lessonId;
+    setPendingLessonId(lessonId);
+    const result = await demoteLesson({
+      environmentId,
+      input: { id: lessonId },
+    });
+    pendingLessonRef.current = null;
+    setPendingLessonId(null);
+    if (result._tag === "Failure") {
+      if (!isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        toastManager.add({
+          type: "error",
+          title: "Could not demote lesson",
+          description: error instanceof Error ? error.message : `Failed to demote ${lessonTitle}.`,
+        });
+      }
+      return;
+    }
+    rsiRefresh.refresh();
+  };
+
+  const handleDeleteLesson = async (lessonId: string, lessonTitle: string) => {
+    if (
+      environmentId === null ||
+      !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)
+    ) {
+      return;
+    }
+    if (pendingLessonRef.current !== null) return;
+    pendingLessonRef.current = lessonId;
+    setPendingLessonId(lessonId);
+    const result = await deleteLesson({
+      environmentId,
+      input: { id: lessonId },
+    });
+    pendingLessonRef.current = null;
+    setPendingLessonId(null);
+    if (result._tag === "Failure") {
+      if (!isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        toastManager.add({
+          type: "error",
+          title: "Could not delete lesson",
+          description: error instanceof Error ? error.message : `Failed to delete ${lessonTitle}.`,
+        });
+      }
+      return;
+    }
+    rsiRefresh.refresh();
+  };
+
+  const totalSafeguardEvents = telemetry ? telemetry.loopTrips + telemetry.safetyBlocks : 0;
+
+  return (
+    <SettingsSection
+      id="rsi-ccr-observability"
+      title="RSI & CCR Observability"
+      headerAction={
+        <DiagnosticsRefreshButton
+          isPending={isRsiRefreshing}
+          label="Refresh RSI & CCR observability"
+          onClick={rsiRefresh.refresh}
+        />
+      }
+    >
+      <StatsGrid>
+        <StatBlock
+          label="Total Runs"
+          value={telemetry ? formatCount(telemetry.totalRuns) : "..."}
+          tooltip={
+            telemetry
+              ? `${formatCount(telemetry.successCount)} succeeded, ${formatCount(telemetry.failureCount)} failed.`
+              : undefined
+          }
+        />
+        <StatBlock
+          label="Cache Hit Rate"
+          value={telemetry ? formatPercent(telemetry.avgCacheHitRate, 1) : "..."}
+          tooltip={
+            telemetry
+              ? `${formatTokens(telemetry.totalCachedInputTokens)} cached input tokens out of ${formatTokens(telemetry.totalTokens)} total tokens.`
+              : undefined
+          }
+        />
+        <StatBlock
+          label="CCR Tokens Saved"
+          value={
+            telemetry
+              ? `${formatTokens(telemetry.totalTokensSavedEst)} (${formatCount(telemetry.totalCompressedCalls)} calls)`
+              : "..."
+          }
+          tooltip={
+            telemetry
+              ? `Estimated tokens saved across ${formatCount(telemetry.totalCompressedCalls)} compressed tool call${telemetry.totalCompressedCalls === 1 ? "" : "s"}.`
+              : undefined
+          }
+        />
+        <StatBlock
+          label="Loop Trips / Safety Blocks"
+          value={
+            telemetry
+              ? `${formatCount(telemetry.loopTrips)} / ${formatCount(telemetry.safetyBlocks)}`
+              : "..."
+          }
+          tone={totalSafeguardEvents > 0 ? "warning" : "default"}
+        />
+      </StatsGrid>
+
+      {rsiError ? (
+        <div className="flex items-start gap-2 border-t border-border/60 px-4 py-3 text-xs text-destructive sm:px-5">
+          <AlertTriangleIcon className="size-3.5 h-lh shrink-0" />
+          <span>{rsiError}</span>
+        </div>
+      ) : null}
+
+      <div className="border-t border-border/60">
+        <div className="px-4 py-2.5 text-xs font-medium text-muted-foreground sm:px-5">
+          Provider Breakdown
+        </div>
+        {telemetry && telemetry.byProvider.length > 0 ? (
+          <DiagnosticsTable
+            headers={["Provider", "Runs", "Failures", "Trips / Blocks", "Cache Hit Rate"]}
+          >
+            {telemetry.byProvider.map((entry) => (
+              <tr key={entry.provider}>
+                <td className="px-4 py-2.5 align-middle text-xs font-medium text-foreground first:sm:pl-5">
+                  {entry.provider}
+                </td>
+                <td className="px-4 py-2.5 align-middle font-mono tabular-nums">
+                  {formatCount(entry.runs)}
+                </td>
+                <td className="px-4 py-2.5 align-middle font-mono tabular-nums">
+                  {formatCount(entry.failures)}
+                </td>
+                <td className="px-4 py-2.5 align-middle font-mono tabular-nums">
+                  {formatCount(entry.loopTrips)} / {formatCount(entry.safetyBlocks)}
+                </td>
+                <td className="px-4 py-2.5 align-middle font-mono tabular-nums last:sm:pr-5">
+                  {formatPercent(entry.avgCacheHitRate, 1)}
+                </td>
+              </tr>
+            ))}
+          </DiagnosticsTable>
+        ) : (
+          <EmptyRows
+            label={
+              isTelemetryInitialLoading
+                ? "Loading RSI & CCR telemetry..."
+                : "No provider runs recorded yet."
+            }
+          />
+        )}
+      </div>
+
+      <div className="border-t border-border/60">
+        <div className="px-4 py-2.5 text-xs font-medium text-muted-foreground sm:px-5">
+          Learned Lessons
+        </div>
+        {lessons.length > 0 ? (
+          <DiagnosticsTable
+            headers={["Lesson", "Scope", "Confidence", "Hits", "Actions"]}
+            minTableWidth="min-w-[760px]"
+          >
+            {lessons.map((lesson) => {
+              const isLessonBusy = pendingLessonId === lesson.id;
+              return (
+                <tr key={lesson.id}>
+                  <td className="max-w-[320px] px-4 py-3 align-top first:sm:pl-5">
+                    <div className="text-xs font-medium text-foreground">{lesson.title}</div>
+                    {lesson.guidance ? (
+                      <div className="mt-1 text-muted-foreground">
+                        <ExpandableText text={lesson.guidance} />
+                      </div>
+                    ) : null}
+                  </td>
+                  <td className="px-4 py-3 align-top">
+                    <Badge variant="outline" size="sm">
+                      {lesson.scope}
+                    </Badge>
+                    {lesson.scope === "glob" && lesson.globs.length > 0 ? (
+                      <div className="mt-1 font-mono text-2xs text-muted-foreground">
+                        {lesson.globs.join(", ")}
+                      </div>
+                    ) : null}
+                  </td>
+                  <td className="px-4 py-3 align-top font-mono tabular-nums">
+                    {formatPercent(lesson.confidence, 0)}
+                  </td>
+                  <td className="px-4 py-3 align-top font-mono tabular-nums">
+                    {formatCount(lesson.hits)}
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-3 align-top last:sm:pr-5">
+                    <div className="flex items-center gap-1.5">
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        disabled={!canDemoteLesson || pendingLessonId !== null || isLessonBusy}
+                        onClick={() => void handleDemoteLesson(lesson.id, lesson.title)}
+                      >
+                        Demote
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="destructive-outline"
+                        disabled={!canDeleteLesson || pendingLessonId !== null || isLessonBusy}
+                        onClick={() => void handleDeleteLesson(lesson.id, lesson.title)}
+                      >
+                        Delete
+                      </Button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </DiagnosticsTable>
+        ) : (
+          <EmptyRows
+            label={
+              isLessonsInitialLoading ? "Loading learned lessons..." : "No learned lessons yet."
+            }
+          />
+        )}
+      </div>
+    </SettingsSection>
+  );
+}
+
 export function DiagnosticsSettingsPanel() {
   const { environment } = useSettingsScope();
   // Signals and pending UI state belong to one environment, so a scope switch starts fresh.
@@ -1325,6 +1592,7 @@ function DiagnosticsSettingsBody() {
           <EmptyRows label={isInitialLoading ? "Loading span names..." : "No spans found."} />
         )}
       </SettingsSection>
+      <RsiObservabilityDiagnostics environmentId={environmentId} />
       {exportFormEnvironmentId === environmentId && <TelemetryExportSettings />}
     </SettingsPageContainer>
   );

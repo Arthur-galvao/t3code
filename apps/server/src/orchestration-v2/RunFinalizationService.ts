@@ -78,24 +78,71 @@ const TOOL_ITEM_TYPES = new Set<string>([
   "dynamic_tool",
 ]);
 
-function countVerificationGateRetriesSincePass(
+const EDIT_TOOL_NAMES = new Set<string>([
+  "write",
+  "edit",
+  "replace",
+  "patch",
+  "multiedit",
+  "write_to_file",
+  "replace_file_content",
+  "multi_replace_file_content",
+  "apply_patch",
+]);
+
+export function countVerificationGateRetriesSincePass(
   items: ReadonlyArray<OrchestrationV2TurnItem>,
 ): number {
   let retries = 0;
   for (const item of items) {
-    if (item.type === "system_notice" && item.message.startsWith("[Verification Gate]")) {
+    if (
+      item.type === "system_notice" &&
+      (item.message.startsWith("[Verification Gate]") || item.message.startsWith("[Auto-Verify]"))
+    ) {
       retries += 1;
       continue;
     }
     if (
       item.type === "command_execution" &&
       item.status === "completed" &&
-      VerificationGate.isVerificationCommand(item.input)
+      VerificationGate.isVerificationCommand(item.input) &&
+      item.outputIndicatesFailure !== true &&
+      (item.exitCode === undefined || item.exitCode === 0)
     ) {
       retries = 0;
     }
   }
   return retries;
+}
+
+function extractEditedSourceFiles(item: OrchestrationV2TurnItem): ReadonlyArray<string> {
+  if (item.status !== "completed") return [];
+  const candidates: Array<string> = [];
+  if (item.type === "file_change") {
+    if (typeof item.fileName === "string" && item.fileName.trim().length > 0) {
+      candidates.push(item.fileName.replace(/\\/g, "/").trim());
+    }
+    if (Array.isArray(item.changes)) {
+      for (const change of item.changes) {
+        if (typeof change.path === "string" && change.path.trim().length > 0) {
+          candidates.push(change.path.replace(/\\/g, "/").trim());
+        }
+      }
+    }
+  } else if (
+    item.type === "dynamic_tool" &&
+    typeof item.toolName === "string" &&
+    EDIT_TOOL_NAMES.has(item.toolName.toLowerCase()) &&
+    item.input !== null &&
+    typeof item.input === "object"
+  ) {
+    const record = item.input as Record<string, unknown>;
+    const candidate = record.path ?? record.filePath ?? record.file_path ?? record.TargetFile;
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      candidates.push(candidate.replace(/\\/g, "/").trim());
+    }
+  }
+  return candidates.filter(VerificationGate.isSourceCodeFile);
 }
 
 function summarizeRunTelemetry(input: {
@@ -119,6 +166,8 @@ function summarizeRunTelemetry(input: {
   let loopTripped = false;
   let lastFailedItem: OrchestrationV2TurnItem | undefined;
   const seenTargets = new Set<string>();
+  const editedFilesSet = new Set<string>();
+  const verifiedCommandsSet = new Set<string>();
 
   for (const item of runItems) {
     if (item.type === "system_notice") {
@@ -142,6 +191,19 @@ function summarizeRunTelemetry(input: {
         wastedReads += 1;
       }
       seenTargets.add(key);
+    }
+    for (const editedFile of extractEditedSourceFiles(item)) {
+      editedFilesSet.add(editedFile);
+    }
+    if (
+      item.type === "command_execution" &&
+      item.status === "completed" &&
+      typeof item.input === "string" &&
+      VerificationGate.isVerificationCommand(item.input) &&
+      item.outputIndicatesFailure !== true &&
+      (item.exitCode === undefined || item.exitCode === 0)
+    ) {
+      verifiedCommandsSet.add(item.input.trim());
     }
   }
 
@@ -175,6 +237,9 @@ function summarizeRunTelemetry(input: {
           }
         : undefined;
 
+  const editedFiles = [...editedFilesSet];
+  const verifiedCommands = [...verifiedCommandsSet];
+
   return {
     threadId: input.threadId,
     runId: input.run.id,
@@ -189,6 +254,8 @@ function summarizeRunTelemetry(input: {
     outcome: input.run.status,
     durationMs,
     ...(failureSignature !== undefined ? { failureSignature } : {}),
+    ...(editedFiles.length > 0 ? { editedFiles } : {}),
+    ...(verifiedCommands.length > 0 ? { verifiedCommands } : {}),
   };
 }
 
@@ -339,12 +406,23 @@ const make = Effect.gen(function* () {
     }
 
     if (Option.isSome(rsiServiceOption)) {
-      const telemetryInput = summarizeRunTelemetry({
+      const appliedLessonIds = yield* Effect.suspend(() =>
+        rsiServiceOption.value.getAppliedLessonIds({
+          threadId: input.threadId,
+          runId: input.runId,
+          provider: run.providerInstanceId,
+        }),
+      ).pipe(Effect.catchCause(() => Effect.succeed([] as ReadonlyArray<string>)));
+      const baseTelemetryInput = summarizeRunTelemetry({
         threadId: input.threadId,
         run,
         providerTurns: records.providerTurns,
         turnItems: records.turnItems,
       });
+      const telemetryInput: RsiService.RsiRunTelemetryInput =
+        appliedLessonIds.length > 0
+          ? { ...baseTelemetryInput, appliedLessonIds }
+          : baseTelemetryInput;
       yield* Effect.suspend(() => rsiServiceOption.value.recordRunTelemetry(telemetryInput)).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("Failed to record RSI telemetry during run finalization", {

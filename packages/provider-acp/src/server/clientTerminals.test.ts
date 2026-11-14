@@ -3,12 +3,14 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Sink from "effect/Sink";
 import * as TestClock from "effect/testing/TestClock";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { createCcrStore } from "@t3tools/provider-core/server/ccrStore";
 
 import {
   makeAcpClientTerminals,
@@ -467,6 +469,159 @@ describe("AcpClientTerminals", () => {
         expect(terminals.readOutputSnapshot("owner-session", created.terminalId)).toBeDefined();
       }),
     ),
+  );
+
+  it.effect(
+    "compresses unbounded large terminal output after exit while keeping streaming raw",
+    () =>
+      Effect.gen(function* () {
+        const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+        const finishChunk = yield* Deferred.make<void>();
+        const logChunk = Array.from({ length: 140 }, (_, index) =>
+          index === 72
+            ? "2026-11-14T18:00:72Z ERROR terminal projection failure"
+            : `2026-11-14T18:00:00Z INFO heartbeat seq=${index + 1} status=healthy`,
+        ).join("\n");
+        const child = ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(1),
+          exitCode: Deferred.await(exited),
+          isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
+          kill: () => Effect.void,
+          stdin: Sink.drain,
+          stdout: Stream.make(new TextEncoder().encode(logChunk)).pipe(
+            Stream.concat(Stream.fromEffectDrain(Deferred.await(finishChunk))),
+          ),
+          stderr: Stream.empty,
+          all: Stream.empty,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+          unref: Effect.succeed(Effect.void),
+        });
+        const store = createCcrStore();
+        const terminals = yield* makeAcpClientTerminals({
+          defaultCwd: process.cwd(),
+          contextCompressionEnabled: true,
+          threadIdForSession: (sessionId) =>
+            sessionId === "session-1" ? "thread-acp-term-1" : undefined,
+          ccrStore: store,
+        }).pipe(
+          Effect.provideService(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() => Effect.succeed(child)),
+          ),
+        );
+        yield* Effect.addFinalizer(() =>
+          Deferred.succeed(finishChunk, undefined).pipe(
+            Effect.andThen(Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0))),
+            Effect.andThen(terminals.disposeAll),
+          ),
+        );
+
+        const created = yield* terminals.create({ sessionId: "session-1", command: "run-logs" });
+        const request = { sessionId: "session-1", terminalId: created.terminalId };
+        // Wait briefly for the initial stdout chunk to flush into the buffer before exiting.
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+
+        const streamingOutput = yield* terminals.output(request);
+        expect(streamingOutput.exitStatus).toBeUndefined();
+        expect(streamingOutput.output).not.toContain("[T3 CCR:");
+        expect(streamingOutput.output).toBe(logChunk);
+
+        yield* Deferred.succeed(finishChunk, undefined);
+        yield* Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0));
+        yield* terminals.waitForExit(request);
+
+        const finalizedOutput = yield* terminals.output(request);
+        expect(finalizedOutput.exitStatus).toEqual({ exitCode: 0, signal: null });
+        expect(finalizedOutput.output).toContain("[T3 CCR:");
+        expect(finalizedOutput.output).toContain("ERROR terminal projection failure");
+        expect(finalizedOutput.output.length).toBeLessThan(logChunk.length);
+
+        const ccrMatch = /\[T3 CCR:(ccr_\d+)/.exec(finalizedOutput.output);
+        expect(ccrMatch).not.toBeNull();
+        const retrieved = store.retrieve({
+          ccrId: ccrMatch![1]!,
+          threadId: "thread-acp-term-1",
+          query: "projection failure",
+        });
+        expect(retrieved.found).toBe(true);
+        expect(retrieved.threadId).toBe("thread-acp-term-1");
+        expect(retrieved.content).toContain("L73:");
+
+        // Repeated calls reuse cached compressed output without creating duplicate CCR entries.
+        const secondRead = yield* terminals.output(request);
+        expect(secondRead.output).toBe(finalizedOutput.output);
+        expect(store.getStats("thread-acp-term-1").entriesCount).toBe(1);
+        expect(terminals.readOutputSnapshot("session-1", created.terminalId)?.output).toBe(
+          logChunk,
+        );
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("skips terminal compression when bounded or disabled", () =>
+    Effect.gen(function* () {
+      const logChunk = Array.from(
+        { length: 140 },
+        (_, index) => `2026-11-14T18:00:00Z INFO line=${index + 1} status=healthy`,
+      ).join("\n");
+      const makeChild = () =>
+        ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(1),
+          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          isRunning: Effect.succeed(false),
+          kill: () => Effect.void,
+          stdin: Sink.drain,
+          stdout: Stream.make(new TextEncoder().encode(logChunk)),
+          stderr: Stream.empty,
+          all: Stream.empty,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+          unref: Effect.succeed(Effect.void),
+        });
+      const store = createCcrStore();
+      const spawnerLayer = Layer.succeed(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => Effect.succeed(makeChild())),
+      );
+
+      const boundedTerminals = yield* makeAcpClientTerminals({
+        defaultCwd: process.cwd(),
+        contextCompressionEnabled: true,
+        ccrStore: store,
+      }).pipe(Effect.provide(spawnerLayer));
+      yield* Effect.addFinalizer(() => boundedTerminals.disposeAll);
+      const bounded = yield* boundedTerminals.create({
+        sessionId: "s",
+        command: "bounded",
+        outputByteLimit: 1024 * 1024,
+      });
+      yield* boundedTerminals.waitForExit({ sessionId: "s", terminalId: bounded.terminalId });
+      const boundedOut = yield* boundedTerminals.output({
+        sessionId: "s",
+        terminalId: bounded.terminalId,
+      });
+      expect(boundedOut.output).toBe(logChunk);
+      expect(boundedOut.output).not.toContain("[T3 CCR:");
+
+      const disabledTerminals = yield* makeAcpClientTerminals({
+        defaultCwd: process.cwd(),
+        contextCompressionEnabled: false,
+        ccrStore: store,
+      }).pipe(Effect.provide(spawnerLayer));
+      yield* Effect.addFinalizer(() => disabledTerminals.disposeAll);
+      const disabled = yield* disabledTerminals.create({
+        sessionId: "s",
+        command: "disabled",
+      });
+      yield* disabledTerminals.waitForExit({ sessionId: "s", terminalId: disabled.terminalId });
+      const disabledOut = yield* disabledTerminals.output({
+        sessionId: "s",
+        terminalId: disabled.terminalId,
+      });
+      expect(disabledOut.output).toBe(logChunk);
+      expect(disabledOut.output).not.toContain("[T3 CCR:");
+    }).pipe(Effect.scoped),
   );
 });
 

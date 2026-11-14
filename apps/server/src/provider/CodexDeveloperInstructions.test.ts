@@ -40,6 +40,17 @@ describe("Codex runtime context", () => {
 
     NodeAssert.match(instructions, /as gpt 5\.3 codex with high effort reasoning effort/);
     NodeAssert.doesNotMatch(instructions, /<runtime_info>[^<]*\n/);
+    NodeAssert.match(instructions, /<output_shaper>/);
+  });
+
+  it("omits output shaper instructions when outputShaperEnabled is false", () => {
+    const instructions = runtimeInstructions({
+      model: "gpt-6.1-sol",
+      outputShaperEnabled: false,
+    });
+
+    NodeAssert.match(instructions, /<runtime_info>/);
+    NodeAssert.doesNotMatch(instructions, /<output_shaper>/);
   });
 });
 

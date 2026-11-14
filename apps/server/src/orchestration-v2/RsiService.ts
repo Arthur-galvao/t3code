@@ -16,6 +16,8 @@ export const MAX_LESSONS = 25;
 const DEFAULT_SESSION_PREFIX_MAX_CHARS = 600;
 const SIMILARITY_MERGE_THRESHOLD = 0.72;
 const TELEMETRY_SUMMARY_RECENT_LIMIT = 20;
+const CONFIDENCE_FLOOR = 0.15;
+const MAX_TRACKED_RUN_LESSONS = 500;
 
 export type RsiLessonScope = "global" | "glob";
 
@@ -89,6 +91,9 @@ export interface RsiRunTelemetryInput {
   readonly tokensSavedEst?: number | undefined;
   readonly compressedCallsCount?: number | undefined;
   readonly failureSignature?: RsiRunFailureSignature | undefined;
+  readonly appliedLessonIds?: ReadonlyArray<string> | undefined;
+  readonly editedFiles?: ReadonlyArray<string> | undefined;
+  readonly verifiedCommands?: ReadonlyArray<string> | undefined;
   readonly timestamp?: string | undefined;
 }
 
@@ -144,11 +149,44 @@ export interface RsiTelemetrySummary {
   readonly recentRuns: ReadonlyArray<RsiRunTelemetryRecord>;
 }
 
+export interface RsiDemoteLessonInput {
+  readonly id: string;
+  readonly delta?: number | undefined;
+}
+
+export interface RsiDemoteLessonResult {
+  readonly demoted: boolean;
+  readonly removed: boolean;
+  readonly lesson: RsiLesson | null;
+}
+
+export interface RsiDeleteLessonInput {
+  readonly id: string;
+}
+
+export interface RsiDeleteLessonResult {
+  readonly deleted: boolean;
+}
+
 export interface RsiFormatSessionPrefixInput {
   readonly cwd?: string | null | undefined;
   readonly activePaths?: ReadonlyArray<string> | undefined;
   readonly provider?: string | undefined;
+  readonly providerInstanceId?: string | undefined;
+  readonly threadId?: string | undefined;
+  readonly runId?: string | undefined;
   readonly maxChars?: number | undefined;
+}
+
+export interface RsiFormattedSessionPrefix {
+  readonly prefix: string;
+  readonly lessonIds: ReadonlyArray<string>;
+}
+
+export interface RsiAppliedLessonsLookupInput {
+  readonly threadId: string;
+  readonly runId?: string | undefined;
+  readonly provider?: string | undefined;
 }
 
 export interface RsiServiceShape {
@@ -157,10 +195,18 @@ export interface RsiServiceShape {
   ) => Effect.Effect<RsiRunTelemetryRecord>;
   readonly queryLessons: (input?: RsiQueryLessonsInput) => Effect.Effect<ReadonlyArray<RsiLesson>>;
   readonly recordLesson: (input: RsiRecordLessonInput) => Effect.Effect<RsiLesson>;
+  readonly demoteLesson: (input: RsiDemoteLessonInput) => Effect.Effect<RsiDemoteLessonResult>;
+  readonly deleteLesson: (input: RsiDeleteLessonInput) => Effect.Effect<RsiDeleteLessonResult>;
   readonly getTelemetrySummary: (
     input?: RsiTelemetrySummaryInput,
   ) => Effect.Effect<RsiTelemetrySummary>;
   readonly formatSessionPrefix: (input: RsiFormatSessionPrefixInput) => Effect.Effect<string>;
+  readonly formatSessionPrefixWithMetadata: (
+    input: RsiFormatSessionPrefixInput,
+  ) => Effect.Effect<RsiFormattedSessionPrefix>;
+  readonly getAppliedLessonIds: (
+    input: RsiAppliedLessonsLookupInput,
+  ) => Effect.Effect<ReadonlyArray<string>>;
 }
 
 function clampConfidence(value: number): number {
@@ -446,6 +492,39 @@ function isFailureOutcome(outcome: string): boolean {
   );
 }
 
+function isSuccessOutcome(outcome: string): boolean {
+  const normalized = outcome.trim().toLowerCase();
+  return normalized === "completed" || normalized === "success";
+}
+
+function roundConfidence(value: number): number {
+  return Math.round(value * 1_000) / 1_000;
+}
+
+function normalizeTrackKey(threadId: string, provider: string | undefined): string {
+  const normalizedProvider = provider?.trim().toLowerCase() ?? "";
+  return `${threadId}::${normalizedProvider}`;
+}
+
+function setBoundedMap<V>(
+  current: ReadonlyMap<string, V>,
+  key: string,
+  value: V,
+  maxEntries: number,
+): ReadonlyMap<string, V> {
+  const next = new Map(current);
+  if (next.has(key)) {
+    next.delete(key);
+  }
+  next.set(key, value);
+  while (next.size > maxEntries) {
+    const oldest = next.keys().next().value;
+    if (oldest === undefined) break;
+    next.delete(oldest);
+  }
+  return next;
+}
+
 interface PersistenceHandles {
   readonly fs: FileSystem.FileSystem;
   readonly path: Path.Path;
@@ -538,10 +617,15 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   readonly persistence?: PersistenceHandles;
   readonly isAutoDistillEnabled?: () => Effect.Effect<boolean>;
   readonly ccrStore?: CcrStore;
+  readonly persistCcr?: boolean;
 }): Effect.fn.Return<RsiServiceShape> {
   const lessonsRef = yield* Ref.make<ReadonlyArray<RsiLesson>>([]);
   const telemetryRef = yield* Ref.make<ReadonlyArray<RsiRunTelemetryRecord>>([]);
   const recurrenceRef = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
+  const injectedByThreadProviderRef = yield* Ref.make<ReadonlyMap<string, ReadonlyArray<string>>>(
+    new Map(),
+  );
+  const injectedByRunRef = yield* Ref.make<ReadonlyMap<string, ReadonlyArray<string>>>(new Map());
   const lastSyncedCcrRef = yield* Ref.make<{
     readonly tokensSavedEst: number;
     readonly compressedCallsCount: number;
@@ -552,6 +636,9 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   const persistence = input?.persistence;
   const isAutoDistillEnabled = input?.isAutoDistillEnabled ?? (() => Effect.succeed(true));
   const ccrStore = input?.ccrStore ?? defaultCcrStore;
+  if (persistence !== undefined && input?.persistCcr === true) {
+    ccrStore.configurePersistence(persistence.path.join(persistence.rsiDir, "ccr-cache.json"));
+  }
 
   const hydrateLocked = Effect.fn("RsiService.hydrateLocked")(function* () {
     if (yield* Ref.get(hydratedRef)) return;
@@ -645,6 +732,162 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     },
   );
 
+  const demoteLessonLocked = Effect.fn("RsiService.demoteLessonLocked")(function* (
+    lessonIds: ReadonlySet<string>,
+    delta: number,
+    nowIso: string,
+  ): Effect.fn.Return<{
+    readonly matched: boolean;
+    readonly removedIds: ReadonlyArray<string>;
+    readonly updatedLesson: RsiLesson | null;
+  }> {
+    const current = yield* Ref.get(lessonsRef);
+    let matched = false;
+    let updatedLesson: RsiLesson | null = null;
+    const removedIds: Array<string> = [];
+    const next: Array<RsiLesson> = [];
+
+    for (const lesson of current) {
+      if (!lessonIds.has(lesson.id) && !lessonIds.has(lesson.key)) {
+        next.push(lesson);
+        continue;
+      }
+      matched = true;
+      const nextConfidence = roundConfidence(lesson.confidence - delta);
+      if (nextConfidence < CONFIDENCE_FLOOR) {
+        removedIds.push(lesson.id);
+        continue;
+      }
+      const nextRecord: RsiLesson = {
+        ...lesson,
+        confidence: Math.min(1, nextConfidence),
+        updatedAt: nowIso,
+      };
+      updatedLesson = nextRecord;
+      next.push(nextRecord);
+    }
+
+    if (!matched) {
+      return { matched: false, removedIds: [], updatedLesson: null };
+    }
+
+    next.sort((a, b) => lessonUtilityScore(b) - lessonUtilityScore(a));
+    yield* Ref.set(lessonsRef, next);
+    yield* persistLessonsLocked(next);
+    return { matched: true, removedIds, updatedLesson };
+  });
+
+  const boostLessonsLocked = Effect.fn("RsiService.boostLessonsLocked")(function* (
+    lessonIds: ReadonlySet<string>,
+    delta: number,
+    nowIso: string,
+  ) {
+    const current = yield* Ref.get(lessonsRef);
+    let changed = false;
+    const next = current.map((lesson) => {
+      if (!lessonIds.has(lesson.id) && !lessonIds.has(lesson.key)) {
+        return lesson;
+      }
+      changed = true;
+      return {
+        ...lesson,
+        confidence: clampConfidence(lesson.confidence + delta),
+        hits: lesson.hits + 1,
+        updatedAt: nowIso,
+      };
+    });
+
+    if (!changed) return;
+    next.sort((a, b) => lessonUtilityScore(b) - lessonUtilityScore(a));
+    yield* Ref.set(lessonsRef, next);
+    yield* persistLessonsLocked(next);
+  });
+
+  const demoteLesson: RsiServiceShape["demoteLesson"] = Effect.fn("RsiService.demoteLesson")(
+    function* (demoteInput) {
+      const nowIso = DateTime.formatIso(yield* DateTime.now);
+      const effectiveDelta =
+        demoteInput.delta !== undefined &&
+        Number.isFinite(demoteInput.delta) &&
+        demoteInput.delta > 0
+          ? demoteInput.delta
+          : 0.15;
+      return yield* mutex.withPermits(1)(
+        Effect.gen(function* () {
+          yield* hydrateLocked();
+          const result = yield* demoteLessonLocked(
+            new Set([demoteInput.id.trim()]),
+            effectiveDelta,
+            nowIso,
+          );
+          if (!result.matched) {
+            return { demoted: false, removed: false, lesson: null };
+          }
+          return {
+            demoted: true,
+            removed: result.removedIds.length > 0 && result.updatedLesson === null,
+            lesson: result.updatedLesson,
+          };
+        }),
+      );
+    },
+  );
+
+  const deleteLesson: RsiServiceShape["deleteLesson"] = Effect.fn("RsiService.deleteLesson")(
+    function* (deleteInput) {
+      const targetId = deleteInput.id.trim();
+      return yield* mutex.withPermits(1)(
+        Effect.gen(function* () {
+          yield* hydrateLocked();
+          const current = yield* Ref.get(lessonsRef);
+          const next = current.filter(
+            (lesson) => lesson.id !== targetId && lesson.key !== targetId,
+          );
+          if (next.length === current.length) {
+            return { deleted: false };
+          }
+          yield* Ref.set(lessonsRef, next);
+          yield* persistLessonsLocked(next);
+          return { deleted: true };
+        }),
+      );
+    },
+  );
+
+  const resolveTrackedLessonIds = Effect.fn("RsiService.resolveTrackedLessonIds")(function* (
+    lookup: {
+      readonly threadId: string;
+      readonly runId?: string | undefined;
+      readonly provider?: string | undefined;
+    },
+    consumeRunId: boolean,
+  ): Effect.fn.Return<ReadonlyArray<string>> {
+    if (lookup.runId !== undefined && lookup.runId.trim() !== "") {
+      const byRun = yield* Ref.get(injectedByRunRef);
+      const matched = byRun.get(lookup.runId);
+      if (matched !== undefined) {
+        if (consumeRunId) {
+          yield* Ref.update(injectedByRunRef, (current) => {
+            const copy = new Map(current);
+            copy.delete(lookup.runId!);
+            return copy;
+          });
+        }
+        return matched;
+      }
+    }
+    const byThreadProvider = yield* Ref.get(injectedByThreadProviderRef);
+    const providerKey = normalizeTrackKey(lookup.threadId, lookup.provider);
+    const matchedByProvider = byThreadProvider.get(providerKey);
+    if (matchedByProvider !== undefined) {
+      return matchedByProvider;
+    }
+    if (lookup.provider === undefined) {
+      return byThreadProvider.get(normalizeTrackKey(lookup.threadId, undefined)) ?? [];
+    }
+    return [];
+  });
+
   const recordRunTelemetry: RsiServiceShape["recordRunTelemetry"] = Effect.fn(
     "RsiService.recordRunTelemetry",
   )(function* (telemetryInput) {
@@ -730,72 +973,199 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         yield* Ref.update(telemetryRef, (rows) => [...rows, record]);
         yield* appendTelemetryLocked(record);
 
+        const resolvedAppliedIds =
+          telemetryInput.appliedLessonIds !== undefined
+            ? telemetryInput.appliedLessonIds
+            : yield* resolveTrackedLessonIds(
+                {
+                  threadId: record.threadId,
+                  runId: record.runId,
+                  provider: record.provider,
+                },
+                true,
+              );
+        const appliedIdSet = new Set(
+          resolvedAppliedIds.map((id) => id.trim()).filter((id) => id !== ""),
+        );
+        const successOutcome = isSuccessOutcome(record.outcome);
+        const failureOutcome = isFailureOutcome(record.outcome);
+        const cleanSuccess =
+          successOutcome &&
+          record.toolErrorCount === 0 &&
+          !record.loopTripped &&
+          record.safetyBlockedCount === 0;
+        const shouldDemoteApplied =
+          failureOutcome || record.loopTripped || record.safetyBlockedCount > 0;
+
+        if (appliedIdSet.size > 0) {
+          if (cleanSuccess) {
+            yield* boostLessonsLocked(appliedIdSet, 0.05, nowIso);
+          } else if (shouldDemoteApplied) {
+            yield* demoteLessonLocked(appliedIdSet, 0.1, nowIso);
+          }
+        }
+
         if (!autoDistill) return record;
         const sig = telemetryInput.failureSignature;
         const hasFailureSignal =
           record.loopTripped ||
           record.safetyBlockedCount > 0 ||
           record.toolErrorCount > 0 ||
-          isFailureOutcome(record.outcome);
-        if (!hasFailureSignal) return record;
+          failureOutcome;
+        let distilledForSignature = false;
 
-        const tool =
-          sig?.tool ??
-          (record.loopTripped
-            ? "circuit_breaker"
-            : record.safetyBlockedCount > 0
-              ? "safety_guard"
-              : "runtime");
-        const errorSignature =
-          sig?.errorSignature ??
-          (record.loopTripped
-            ? `loop_${record.outcome}`
-            : record.safetyBlockedCount > 0
-              ? "safety_block"
-              : `run_${record.outcome}`);
-        const recurrenceKey = buildAutoLessonKey({
-          provider: record.provider,
-          tool,
-          errorSignature,
-        });
-        const nextCount = (yield* Ref.get(recurrenceRef)).get(recurrenceKey) ?? 0;
-        const updatedCount = nextCount + 1;
-        yield* Ref.update(recurrenceRef, (map) => {
-          const copy = new Map(map);
-          copy.set(recurrenceKey, updatedCount);
-          return copy;
-        });
+        if (hasFailureSignal) {
+          const tool =
+            sig?.tool ??
+            (record.loopTripped
+              ? "circuit_breaker"
+              : record.safetyBlockedCount > 0
+                ? "safety_guard"
+                : "runtime");
+          const errorSignature =
+            sig?.errorSignature ??
+            (record.loopTripped
+              ? `loop_${record.outcome}`
+              : record.safetyBlockedCount > 0
+                ? "safety_block"
+                : `run_${record.outcome}`);
+          const recurrenceKey = buildAutoLessonKey({
+            provider: record.provider,
+            tool,
+            errorSignature,
+          });
+          const nextCount = (yield* Ref.get(recurrenceRef)).get(recurrenceKey) ?? 0;
+          const updatedCount = nextCount + 1;
+          yield* Ref.update(recurrenceRef, (map) => {
+            const copy = new Map(map);
+            copy.set(recurrenceKey, updatedCount);
+            return copy;
+          });
 
-        if (record.loopTripped || updatedCount >= 2) {
-          const title =
-            sig?.title ??
-            (record.loopTripped
-              ? `Avoid ${tool} loop (${record.provider})`
-              : `Recurring ${tool} failure (${record.provider})`);
-          const guidance =
-            sig?.guidance ??
-            (record.loopTripped
-              ? `Breaker tripped on ${tool} (${errorSignature}); inspect tool inputs or switch approach before retrying.`
-              : `Repeated ${tool} failures for ${errorSignature}; verify preconditions and paths before re-running.`);
-          yield* recordLessonLocked(
-            {
-              key: recurrenceKey,
-              provider: record.provider,
-              tool,
-              errorSignature,
-              title,
-              guidance,
-              rationaleTrace:
-                sig?.rationaleTrace ??
-                `Auto-distilled from run ${record.runId} (outcome=${record.outcome}, toolErrors=${record.toolErrorCount}, loopTripped=${record.loopTripped}, occurrences=${updatedCount}).`,
-              triggerCondition:
-                sig?.triggerCondition ?? `${record.provider}:${tool}:${errorSignature}`,
-              ...(sig?.scope === undefined ? {} : { scope: sig.scope }),
-              ...(sig?.globs === undefined ? {} : { globs: sig.globs }),
-              confidence: record.loopTripped ? 0.78 : 0.65,
-            },
-            nowIso,
+          if (record.loopTripped || updatedCount >= 2) {
+            distilledForSignature = true;
+            const title =
+              sig?.title ??
+              (record.loopTripped
+                ? `Avoid ${tool} loop (${record.provider})`
+                : `Recurring ${tool} failure (${record.provider})`);
+            const guidance =
+              sig?.guidance ??
+              (record.loopTripped
+                ? `Breaker tripped on ${tool} (${errorSignature}); inspect tool inputs or switch approach before retrying.`
+                : `Repeated ${tool} failures for ${errorSignature}; verify preconditions and paths before re-running.`);
+            yield* recordLessonLocked(
+              {
+                key: recurrenceKey,
+                provider: record.provider,
+                tool,
+                errorSignature,
+                title,
+                guidance,
+                rationaleTrace:
+                  sig?.rationaleTrace ??
+                  `Auto-distilled from run ${record.runId} (outcome=${record.outcome}, toolErrors=${record.toolErrorCount}, loopTripped=${record.loopTripped}, occurrences=${updatedCount}).`,
+                triggerCondition:
+                  sig?.triggerCondition ?? `${record.provider}:${tool}:${errorSignature}`,
+                ...(sig?.scope === undefined ? {} : { scope: sig.scope }),
+                ...(sig?.globs === undefined ? {} : { globs: sig.globs }),
+                confidence: record.loopTripped ? 0.78 : 0.65,
+              },
+              nowIso,
+            );
+          }
+        }
+
+        // Idle / Post-Success Distillation: extract durable workspace checks or recovery habits.
+        if (successOutcome && !record.loopTripped && record.safetyBlockedCount === 0) {
+          const editedFiles = Array.from(
+            new Set(
+              (telemetryInput.editedFiles ?? [])
+                .map((filePath) => filePath.trim())
+                .filter((filePath) => filePath !== ""),
+            ),
           );
+          const verifiedCommands = Array.from(
+            new Set(
+              (telemetryInput.verifiedCommands ?? [])
+                .map((cmd) => cmd.trim())
+                .filter((cmd) => cmd !== ""),
+            ),
+          );
+
+          if (editedFiles.length > 0 && verifiedCommands.length > 0) {
+            const primaryCommand = verifiedCommands[0]!.slice(0, 120);
+            const verifyKey = buildAutoLessonKey({
+              provider: "global",
+              tool: "verify",
+              errorSignature: normalizeSignaturePart(primaryCommand).slice(0, 48) || "verify",
+            });
+            const commandSummary =
+              verifiedCommands.length > 1
+                ? verifiedCommands
+                    .slice(0, 2)
+                    .map((cmd) => `\`${cmd.slice(0, 80)}\``)
+                    .join(" and ")
+                : `\`${primaryCommand}\``;
+            yield* recordLessonLocked(
+              {
+                key: verifyKey,
+                provider: "global",
+                tool: "verify",
+                errorSignature: primaryCommand,
+                title: `Verified workspace check: ${primaryCommand}`,
+                guidance: `Run ${commandSummary} to verify source edits before finishing.`,
+                rationaleTrace: `Post-success distillation from run ${record.runId} after editing ${editedFiles.length} file(s) with passing verification.`,
+                triggerCondition: "After editing workspace source files",
+                scope: "global",
+                confidence: 0.72,
+              },
+              nowIso,
+            );
+          }
+
+          if (
+            record.toolErrorCount > 0 &&
+            !distilledForSignature &&
+            (verifiedCommands.length > 0 || editedFiles.length > 0 || sig !== undefined)
+          ) {
+            const recoveryTool = sig?.tool ?? "recovery";
+            const recoverySig =
+              sig?.errorSignature ??
+              (verifiedCommands.length > 0
+                ? verifiedCommands[0]!.slice(0, 80)
+                : "recovered_after_tool_errors");
+            const recoveryKey = buildAutoLessonKey({
+              provider: record.provider,
+              tool: recoveryTool,
+              errorSignature: recoverySig,
+            });
+            yield* recordLessonLocked(
+              {
+                key: recoveryKey,
+                provider: record.provider,
+                tool: recoveryTool,
+                errorSignature: recoverySig,
+                title: sig?.title
+                  ? `Recovered: ${sig.title}`
+                  : `Verify preconditions before ${recoveryTool} (${record.provider})`,
+                guidance:
+                  verifiedCommands.length > 0
+                    ? `Recovered after ${record.toolErrorCount} tool error(s); verify changes with \`${verifiedCommands[0]!.slice(0, 120)}\`.`
+                    : (sig?.guidance ??
+                      `Recovered after ${record.toolErrorCount} tool error(s); inspect paths and preconditions before editing.`),
+                rationaleTrace:
+                  sig?.rationaleTrace ??
+                  `Post-success recovery distillation from run ${record.runId} (${record.toolErrorCount} tool error(s) resolved).`,
+                triggerCondition:
+                  sig?.triggerCondition ?? `${record.provider}:${recoveryTool}:${recoverySig}`,
+                scope: sig?.scope ?? "global",
+                ...(sig?.globs === undefined ? {} : { globs: sig.globs }),
+                confidence: 0.68,
+              },
+              nowIso,
+            );
+          }
         }
 
         return record;
@@ -983,56 +1353,110 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     };
   });
 
+  const formatSessionPrefixWithMetadata: RsiServiceShape["formatSessionPrefixWithMetadata"] =
+    Effect.fn("RsiService.formatSessionPrefixWithMetadata")(function* (prefixInput) {
+      const maxChars = Math.max(80, prefixInput.maxChars ?? DEFAULT_SESSION_PREFIX_MAX_CHARS);
+      const activePaths = prefixInput.activePaths ?? [];
+      const lessons = yield* queryLessons({
+        ...(prefixInput.cwd === undefined ? {} : { cwd: prefixInput.cwd }),
+        ...(prefixInput.provider === undefined ? {} : { provider: prefixInput.provider }),
+        activePaths,
+        minConfidence: 0.4,
+      });
+      const eligible = lessons.filter(
+        (lesson) =>
+          lesson.scope === "global" ||
+          (activePaths.length > 0 && matchesAnyGlob(lesson.globs, activePaths, prefixInput.cwd)),
+      );
+
+      let prefix = "";
+      const lessonIds: Array<string> = [];
+      if (eligible.length > 0) {
+        const header = "[RSI Lessons]";
+        const lines: Array<string> = [header];
+        let currentLength = header.length;
+
+        for (const lesson of eligible) {
+          const line = `- ${lesson.title}: ${lesson.guidance}`;
+          const nextLength = currentLength + 1 + line.length;
+          if (nextLength <= maxChars) {
+            lines.push(line);
+            lessonIds.push(lesson.id);
+            currentLength = nextLength;
+            continue;
+          }
+          const remaining = maxChars - currentLength - 4;
+          if (remaining > 20 && lines.length === 1) {
+            lines.push(`${line.slice(0, remaining).trimEnd()}...`);
+            lessonIds.push(lesson.id);
+          }
+          break;
+        }
+        prefix = lines.length <= 1 ? "" : lines.join("\n");
+      }
+
+      if (prefixInput.threadId !== undefined && prefixInput.threadId.trim() !== "") {
+        const threadId = prefixInput.threadId.trim();
+        const trackedIds: ReadonlyArray<string> = [...lessonIds];
+        yield* Ref.update(injectedByThreadProviderRef, (map) => {
+          let next = setBoundedMap(
+            map,
+            normalizeTrackKey(threadId, prefixInput.provider),
+            trackedIds,
+            MAX_TRACKED_RUN_LESSONS,
+          );
+          if (
+            prefixInput.providerInstanceId !== undefined &&
+            prefixInput.providerInstanceId.trim() !== ""
+          ) {
+            next = setBoundedMap(
+              next,
+              normalizeTrackKey(threadId, prefixInput.providerInstanceId),
+              trackedIds,
+              MAX_TRACKED_RUN_LESSONS,
+            );
+          }
+          return next;
+        });
+        if (prefixInput.runId !== undefined && prefixInput.runId.trim() !== "") {
+          yield* Ref.update(injectedByRunRef, (map) =>
+            setBoundedMap(map, prefixInput.runId!.trim(), trackedIds, MAX_TRACKED_RUN_LESSONS),
+          );
+        }
+      }
+
+      return { prefix, lessonIds };
+    });
+
   const formatSessionPrefix: RsiServiceShape["formatSessionPrefix"] = Effect.fn(
     "RsiService.formatSessionPrefix",
   )(function* (prefixInput) {
-    const maxChars = Math.max(80, prefixInput.maxChars ?? DEFAULT_SESSION_PREFIX_MAX_CHARS);
-    const activePaths = prefixInput.activePaths ?? [];
-    const lessons = yield* queryLessons({
-      ...(prefixInput.cwd === undefined ? {} : { cwd: prefixInput.cwd }),
-      ...(prefixInput.provider === undefined ? {} : { provider: prefixInput.provider }),
-      activePaths,
-      minConfidence: 0.4,
-    });
-    const eligible = lessons.filter(
-      (lesson) =>
-        lesson.scope === "global" ||
-        (activePaths.length > 0 && matchesAnyGlob(lesson.globs, activePaths, prefixInput.cwd)),
-    );
-    if (eligible.length === 0) return "";
+    const result = yield* formatSessionPrefixWithMetadata(prefixInput);
+    return result.prefix;
+  });
 
-    const header = "[RSI Lessons]";
-    const lines: Array<string> = [header];
-    let currentLength = header.length;
-
-    for (const lesson of eligible) {
-      const line = `- ${lesson.title}: ${lesson.guidance}`;
-      const nextLength = currentLength + 1 + line.length;
-      if (nextLength <= maxChars) {
-        lines.push(line);
-        currentLength = nextLength;
-        continue;
-      }
-      const remaining = maxChars - currentLength - 4;
-      if (remaining > 20 && lines.length === 1) {
-        lines.push(`${line.slice(0, remaining).trimEnd()}...`);
-      }
-      break;
-    }
-
-    return lines.length <= 1 ? "" : lines.join("\n");
+  const getAppliedLessonIds: RsiServiceShape["getAppliedLessonIds"] = Effect.fn(
+    "RsiService.getAppliedLessonIds",
+  )(function* (lookupInput) {
+    return yield* resolveTrackedLessonIds(lookupInput, false);
   });
 
   return {
     recordRunTelemetry,
     queryLessons,
     recordLesson,
+    demoteLesson,
+    deleteLesson,
     getTelemetrySummary,
     formatSessionPrefix,
+    formatSessionPrefixWithMetadata,
+    getAppliedLessonIds,
   } satisfies RsiServiceShape;
 });
 
-const makeLayerEffect = Effect.gen(function* () {
+const makeLayerEffect = Effect.fn("RsiService.makeLayer")(function* (options?: {
+  readonly persistCcr?: boolean;
+}) {
   const configOpt = yield* Effect.serviceOption(ServerConfig.ServerConfig);
   const fsOpt = yield* Effect.serviceOption(FileSystem.FileSystem);
   const pathOpt = yield* Effect.serviceOption(Path.Path);
@@ -1071,13 +1495,17 @@ const makeLayerEffect = Effect.gen(function* () {
   return yield* makeRsiService({
     ...(persistence === undefined ? {} : { persistence }),
     isAutoDistillEnabled,
+    persistCcr: options?.persistCcr ?? true,
   });
 });
 
 export class RsiService extends Context.Service<RsiService, RsiServiceShape>()(
   "t3/orchestration-v2/RsiService",
 ) {
-  static readonly layer: Layer.Layer<RsiService> = Layer.effect(this, makeLayerEffect);
+  static readonly makeLayer = (options?: {
+    readonly persistCcr?: boolean;
+  }): Layer.Layer<RsiService> => Layer.effect(this, makeLayerEffect(options));
+  static readonly layer: Layer.Layer<RsiService> = RsiService.makeLayer();
 }
 
 export const layer: Layer.Layer<RsiService> = RsiService.layer;

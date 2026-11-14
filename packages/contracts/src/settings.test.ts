@@ -541,6 +541,7 @@ describe("workflow safety & fallback settings", () => {
     expect(decoded.outputShaperEnabled).toBe(true);
     expect(decoded.autoFallbackOnUsageLimit).toBe(true);
     expect(decoded.verificationGateMode).toBe("auto");
+    expect(decoded.autoVerifyEnabled).toBe(true);
     expect(DEFAULT_SERVER_SETTINGS).toMatchObject({
       toolSafetyGuardEnabled: true,
       loopCircuitBreakerEnabled: true,
@@ -549,6 +550,7 @@ describe("workflow safety & fallback settings", () => {
       outputShaperEnabled: true,
       autoFallbackOnUsageLimit: true,
       verificationGateMode: "auto",
+      autoVerifyEnabled: true,
     });
   });
 
@@ -561,6 +563,7 @@ describe("workflow safety & fallback settings", () => {
       outputShaperEnabled: false,
       autoFallbackOnUsageLimit: false,
       verificationGateMode: "goal" as const,
+      autoVerifyEnabled: false,
     };
     expect(decodeServerSettingsPatch(patch)).toEqual(patch);
     expect(encodeServerSettingsPatch(patch)).toEqual(patch);

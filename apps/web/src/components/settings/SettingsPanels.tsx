@@ -2114,6 +2114,49 @@ export function ThreadsSettingsPanel() {
             </Select>
           }
         />
+        <SettingsRow
+          serverScoped
+          {...searchableSetting("auto-verify")}
+          description="Automatically run targeted verification checks after file edits finish."
+          settingKeys={["autoVerifyEnabled"]}
+          resetAction={
+            hasServerTargets &&
+            settings.autoVerifyEnabled !== DEFAULT_UNIFIED_SETTINGS.autoVerifyEnabled ? (
+              <SettingResetButton
+                label="auto-verify code edits"
+                onClick={() =>
+                  updateSettings({
+                    autoVerifyEnabled: DEFAULT_UNIFIED_SETTINGS.autoVerifyEnabled,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["autoVerifyEnabled"]}
+              checked={settings.autoVerifyEnabled}
+              onCheckedChange={(checked) => updateSettings({ autoVerifyEnabled: Boolean(checked) })}
+              aria-label="Auto-verify code edits"
+            />
+          }
+        />
+        <SettingsRow
+          id="rsi-ccr-telemetry-link"
+          title="RSI & CCR Telemetry"
+          description="Inspect cache hit rates, CCR token savings, safety blocks, and learned lessons."
+          control={
+            <Button
+              render={
+                <Link to="/settings/diagnostics" search={{ machine: environmentId ?? undefined }} />
+              }
+              size="sm"
+              variant="outline"
+            >
+              RSI &amp; CCR Telemetry
+            </Button>
+          }
+        />
       </SettingsSection>
 
       {hasServerTargets ? (

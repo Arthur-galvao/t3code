@@ -1952,7 +1952,7 @@ effectIt.effect(
   () =>
     Effect.gen(function* () {
       const rsi = yield* RsiService.RsiService;
-      yield* rsi.recordLesson({
+      const recordedLesson = yield* rsi.recordLesson({
         title: "Use Effect.fn for service methods",
         guidance: "Wrap service effects in Effect.fn for telemetry parity.",
         scope: "global",
@@ -2008,6 +2008,13 @@ effectIt.effect(
       expect(recordedPrompts[0]).toContain("[RSI Lessons]");
       expect(recordedPrompts[0]).toContain("Use Effect.fn for service methods");
       expect(recordedPrompts[0]).toContain("Turn one prompt");
+      const turn1Projection = turn1.projection();
+      const trackedIds = yield* rsi.getAppliedLessonIds({
+        threadId: turn1Projection.thread.id,
+        runId: turn1Projection.runs[0]!.id,
+        provider: turn1Projection.runs[0]!.providerInstanceId,
+      });
+      expect(trackedIds).toContain(recordedLesson.id);
 
       // Turn 2: continuing existing native session (nativeThreadRef present + prior providerTurn).
       const turn2 = makeLocalCommandHarness({ text: "Follow up turn" });

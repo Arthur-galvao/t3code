@@ -1034,45 +1034,48 @@ it.layer(
       configs: { ".local/share/vite-plus": "managed", ".config/vite-plus": "system_first" },
       vitePlus: true,
     },
-  ] as const)("updates through vp only for the install the shim runs: $name", (fixture) =>
-    Effect.gen(function* () {
-      const tempDir = yield* makeTempDir("vite-plus-system-first");
-      const vpHome = NodePath.join(tempDir, fixture.vpHome);
-      for (const [dir, shimMode] of Object.entries(fixture.configs)) {
-        NodeFS.mkdirSync(NodePath.join(tempDir, dir), { recursive: true });
-        NodeFS.writeFileSync(
-          NodePath.join(tempDir, dir, "config.json"),
-          JSON.stringify({ shimMode }),
-        );
-      }
-      const shim = NodePath.join(vpHome, "bin", "package-tool");
-      writeExecutable(shim);
-      const otherInstall = linkIntoPackage(NodePath.join(tempDir, "npm"), "package-tool", [
-        "lib",
-        "node_modules",
-        "@example",
-        "package-tool",
-      ]);
+  ] as const)(
+    "updates through vp only for the install the shim runs: $name",
+    (fixture) =>
+      Effect.gen(function* () {
+        const tempDir = yield* makeTempDir("vite-plus-system-first");
+        const vpHome = NodePath.join(tempDir, fixture.vpHome);
+        for (const [dir, shimMode] of Object.entries(fixture.configs)) {
+          NodeFS.mkdirSync(NodePath.join(tempDir, dir), { recursive: true });
+          NodeFS.writeFileSync(
+            NodePath.join(tempDir, dir, "config.json"),
+            JSON.stringify({ shimMode }),
+          );
+        }
+        const shim = NodePath.join(vpHome, "bin", "package-tool");
+        writeExecutable(shim);
+        const otherInstall = linkIntoPackage(NodePath.join(tempDir, "npm"), "package-tool", [
+          "lib",
+          "node_modules",
+          "@example",
+          "package-tool",
+        ]);
 
-      const capabilities = yield* packageToolUpdate
-        .resolve({
-          binaryPath: "package-tool",
-          resolvedCommandPath: shim,
-          realCommandPath: NodePath.join(vpHome, "current", "bin", "vp"),
-          env: {
-            ...(fixture.setVpHome ? { VP_HOME: vpHome } : {}),
-            PATH: [NodePath.dirname(shim), NodePath.dirname(otherInstall)].join(":"),
-          },
-          platform: "linux",
-        })
-        .pipe(
-          Effect.provideService(HostProcess.Platform, "linux"),
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
-          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
-        );
+        const capabilities = yield* packageToolUpdate
+          .resolve({
+            binaryPath: "package-tool",
+            resolvedCommandPath: shim,
+            realCommandPath: NodePath.join(vpHome, "current", "bin", "vp"),
+            env: {
+              ...(fixture.setVpHome ? { VP_HOME: vpHome } : {}),
+              PATH: [NodePath.dirname(shim), NodePath.dirname(otherInstall)].join(":"),
+            },
+            platform: "linux",
+          })
+          .pipe(
+            Effect.provideService(HostProcess.Platform, "linux"),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+            Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+          );
 
-      expect(capabilities.update?.lockKey === "vite-plus-global").toBe(fixture.vitePlus);
-    }),
+        expect(capabilities.update?.lockKey === "vite-plus-global").toBe(fixture.vitePlus);
+      }),
+    { skip: !symlinksSupported },
   );
 
   it.effect("keeps a project folder named vite-plus manual-only", () =>

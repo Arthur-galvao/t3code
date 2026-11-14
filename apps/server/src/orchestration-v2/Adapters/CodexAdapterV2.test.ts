@@ -258,6 +258,21 @@ describe("CodexAdapterV2 runtime policy", () => {
         value: "Filtered to overdue",
       });
       assert.isDefined(withT3.additionalContext?.["t3_code_runtime"]);
+      assert.include(withT3.additionalContext?.["t3_code_runtime"]?.value ?? "", "<output_shaper>");
+
+      const withoutShaper = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId: "native-app-context",
+        codexInput: [{ type: "text", text: "what's on my list?" }],
+        runtimePolicy: policy,
+        modelSelection,
+        hasT3Mcp: true,
+        outputShaperEnabled: false,
+      });
+      assert.isDefined(withoutShaper.additionalContext?.["t3_code_runtime"]);
+      assert.notInclude(
+        withoutShaper.additionalContext?.["t3_code_runtime"]?.value ?? "",
+        "<output_shaper>",
+      );
     }),
   );
 });

@@ -496,6 +496,7 @@ const RsiTelemetrySummaryTool = Tool.make("rsi_telemetry_summary", {
 
 const ContextRetrieveInput = Schema.Struct({
   ccrId: Schema.String,
+  threadId: Schema.optional(Schema.String),
   query: Schema.optional(Schema.String),
   startLine: Schema.optional(Schema.Int),
   endLine: Schema.optional(Schema.Int),
@@ -505,6 +506,7 @@ const ContextRetrieveInput = Schema.Struct({
 const ContextRetrieveResult = Schema.Struct({
   found: Schema.Boolean,
   ccrId: Schema.String,
+  threadId: Schema.optional(Schema.String),
   contentType: Schema.optional(Schema.String),
   sourceLabel: Schema.optional(Schema.String),
   path: Schema.optional(Schema.String),

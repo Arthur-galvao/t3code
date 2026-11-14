@@ -198,6 +198,10 @@
     "./server/usageLimits": {
       "types": "./src/server/usageLimits.ts",
       "import": "./src/server/usageLimits.ts"
+    },
+    "./server/workflowCheckpoint": {
+      "types": "./src/server/workflowCheckpoint.ts",
+      "import": "./src/server/workflowCheckpoint.ts"
     }
   },
   "scripts": {

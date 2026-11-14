@@ -2025,6 +2025,7 @@ function extractClaudePostToolUseText(toolResponse: unknown): string | null {
 function evaluateClaudePostToolUseCompression(input: {
   readonly hookInput: Parameters<HookCallback>[0];
   readonly enabled: boolean;
+  readonly threadId?: string | undefined;
   readonly store?: CcrStore;
 }): SyncHookJSONOutput {
   if (!input.enabled || input.hookInput.hook_event_name !== "PostToolUse") {
@@ -2044,6 +2045,7 @@ function evaluateClaudePostToolUseCompression(input: {
   }
   const result = compressToolOutput({
     text,
+    ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
     contentTypeHint: inferCompressionHint(toolName, input.hookInput.tool_input),
     sourceLabel: toolName,
     path: extractPathFromToolInput(input.hookInput.tool_input),
@@ -11907,9 +11909,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           "ClaudeAdapterV2.postToolUseCompressionHook",
         )(function* (hookInput: Parameters<HookCallback>[0]): Effect.fn.Return<HookJSONOutput> {
           const compressionEnabled = yield* readContextCompressionEnabled();
+          const context = yield* Ref.get(activeTurn);
           return evaluateClaudePostToolUseCompression({
             hookInput,
             enabled: compressionEnabled,
+            threadId: context?.input.threadId ?? input.threadId ?? undefined,
           });
         });
 

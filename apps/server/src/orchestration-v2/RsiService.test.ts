@@ -27,7 +27,7 @@ describe("RsiService", () => {
         const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-persist-" });
 
         const configLayer = ServerConfig.layerTest(tempRoot, tempRoot);
-        const serviceLayer = RsiService.layer.pipe(
+        const serviceLayer = RsiService.makeLayer({ persistCcr: false }).pipe(
           Layer.provide(configLayer),
           Layer.provide(NodeServices.layer),
         );
@@ -402,5 +402,218 @@ describe("RsiService", () => {
         Effect.sync(() => defaultCcrStore.clear()),
       );
     }),
+  );
+
+  it.effect(
+    "demoteLesson and deleteLesson update confidence, enforce floor, and remove entries",
+    () =>
+      Effect.gen(function* () {
+        const rsi = yield* makeRsiService();
+        const first = yield* rsi.recordLesson({
+          key: "manual:demote-target",
+          title: "Demote Target",
+          guidance: "Verify before running.",
+          confidence: 0.35,
+        });
+        const second = yield* rsi.recordLesson({
+          key: "manual:delete-target",
+          title: "Delete Target",
+          guidance: "Obsolete rule.",
+          confidence: 0.8,
+        });
+
+        const missingDemote = yield* rsi.demoteLesson({ id: "nonexistent" });
+        expect(missingDemote).toEqual({ demoted: false, removed: false, lesson: null });
+
+        const stepped = yield* rsi.demoteLesson({ id: first.id, delta: 0.15 });
+        expect(stepped.demoted).toBe(true);
+        expect(stepped.removed).toBe(false);
+        expect(stepped.lesson?.confidence).toBe(0.2);
+
+        const dropped = yield* rsi.demoteLesson({ id: first.id });
+        expect(dropped).toEqual({ demoted: true, removed: true, lesson: null });
+        expect((yield* rsi.queryLessons()).some((lesson) => lesson.id === first.id)).toBe(false);
+
+        const deletedByKey = yield* rsi.deleteLesson({ id: second.key });
+        expect(deletedByKey).toEqual({ deleted: true });
+        expect(yield* rsi.deleteLesson({ id: second.key })).toEqual({ deleted: false });
+        expect(yield* rsi.queryLessons()).toHaveLength(0);
+      }),
+  );
+
+  it.effect(
+    "Evaluate->Retain boosts applied lessons on clean success and demotes/prunes on failures",
+    () =>
+      Effect.gen(function* () {
+        const rsi = yield* makeRsiService();
+        const strong = yield* rsi.recordLesson({
+          key: "manual:strong-lesson",
+          title: "Check workspace types",
+          guidance: "Run typecheck after editing.",
+          confidence: 0.8,
+        });
+        const fragile = yield* rsi.recordLesson({
+          key: "manual:fragile-lesson",
+          title: "Fragile rule",
+          guidance: "Old assumption.",
+          confidence: 0.2,
+        });
+
+        const formatted = yield* rsi.formatSessionPrefixWithMetadata({
+          cwd: "/repo",
+          threadId: "t-eval",
+          runId: "r-eval-1",
+          provider: "codex",
+        });
+        expect(formatted.prefix).toContain("Check workspace types");
+        expect(formatted.lessonIds).toContain(strong.id);
+        expect(formatted.lessonIds).not.toContain(fragile.id);
+
+        // Clean success on r-eval-1 boosts tracked lesson confidence (+0.05) and hits (+1).
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-eval",
+          runId: "r-eval-1",
+          provider: "codex",
+          model: "gpt-5",
+          usedTokens: 1_000,
+          cachedInputTokens: 600,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 500,
+        });
+
+        const boosted = (yield* rsi.queryLessons()).find((lesson) => lesson.id === strong.id);
+        expect(boosted?.confidence).toBe(0.85);
+        expect(boosted?.hits).toBe(2);
+
+        // Failure with explicit appliedLessonIds demotes strong and auto-removes fragile (< 0.15).
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-eval",
+          runId: "r-eval-2",
+          provider: "codex",
+          model: "gpt-5",
+          usedTokens: 900,
+          cachedInputTokens: 100,
+          toolErrorCount: 0,
+          loopTripped: true,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "failed",
+          durationMs: 700,
+          appliedLessonIds: [strong.id, fragile.id],
+        });
+
+        const afterFailure = yield* rsi.queryLessons();
+        expect(afterFailure.find((lesson) => lesson.id === strong.id)?.confidence).toBe(0.75);
+        expect(afterFailure.some((lesson) => lesson.id === fragile.id)).toBe(false);
+      }),
+  );
+
+  it.effect(
+    "distills concise workspace checks & recovery lessons post-success without duplicating",
+    () =>
+      Effect.gen(function* () {
+        const rsi = yield* makeRsiService();
+
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-distill",
+          runId: "r-distill-1",
+          provider: "codex",
+          model: "gpt-5",
+          usedTokens: 1_500,
+          cachedInputTokens: 800,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 1_100,
+          editedFiles: ["apps/server/src/ws.ts"],
+          verifiedCommands: ["pnpm test apps/server/src/ws.test.ts"],
+        });
+
+        // Repeating the same verified command merges instead of creating duplicates.
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-distill",
+          runId: "r-distill-2",
+          provider: "claudeAgent",
+          model: "sonnet",
+          usedTokens: 1_200,
+          cachedInputTokens: 600,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "success",
+          durationMs: 900,
+          editedFiles: ["apps/server/src/auth/RpcAuthorization.ts"],
+          verifiedCommands: ["pnpm test apps/server/src/ws.test.ts"],
+        });
+
+        // Recovery after toolErrorCount > 0 with verified check distills a recovery lesson.
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-distill",
+          runId: "r-distill-3",
+          provider: "codex",
+          model: "gpt-5",
+          usedTokens: 1_300,
+          cachedInputTokens: 500,
+          toolErrorCount: 2,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 1_000,
+          editedFiles: ["apps/server/src/server.ts"],
+          verifiedCommands: ["pnpm typecheck"],
+        });
+
+        const lessons = yield* rsi.queryLessons();
+        const wsVerifyLessons = lessons.filter((lesson) =>
+          lesson.title.includes("pnpm test apps/server/src/ws.test.ts"),
+        );
+        expect(wsVerifyLessons).toHaveLength(1);
+        expect(wsVerifyLessons[0]?.hits).toBeGreaterThanOrEqual(2);
+        expect(lessons.some((lesson) => lesson.key.includes("::recovery::"))).toBe(true);
+      }),
+  );
+
+  it.effect("persists and restores CCR store snapshot when persistCcr is enabled", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-ccr-" });
+      const rsiDir = path.join(tempRoot, "rsi");
+      const persistence = {
+        fs,
+        path,
+        rsiDir,
+        lessonsPath: path.join(rsiDir, "lessons.json"),
+        telemetryPath: path.join(rsiDir, "telemetry.jsonl"),
+      };
+
+      const storeA = createCcrStore();
+      yield* makeRsiService({ persistence, ccrStore: storeA, persistCcr: true });
+      storeA.put({
+        threadId: "t-ccr-persist",
+        content: "line1\nline2\nline3\n",
+        contentType: "command",
+        sourceLabel: "test",
+      });
+      storeA.recordCompression(2_000, 400);
+      storeA.flush();
+
+      const ccrPath = path.join(rsiDir, "ccr-cache.json");
+      expect(yield* fs.exists(ccrPath)).toBe(true);
+
+      const storeB = createCcrStore();
+      const rsiB = yield* makeRsiService({ persistence, ccrStore: storeB, persistCcr: true });
+      const summary = yield* rsiB.getTelemetrySummary();
+      expect(summary.totalTokensSavedEst).toBe(400);
+      expect(summary.totalCompressedCalls).toBe(1);
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

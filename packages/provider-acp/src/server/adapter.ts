@@ -31,6 +31,7 @@ import {
   type RuntimeRequestId,
   type ThreadTokenUsageSnapshot,
   type ThreadId,
+  DEFAULT_SERVER_SETTINGS,
   isRuntimeModeAbove,
   type TurnTokenUsage,
 } from "@t3tools/contracts";
@@ -451,6 +452,7 @@ export interface AcpAdapterV2Flavor {
     readonly readTextFile: (
       request: EffectAcpSchema.ReadTextFileRequest,
       cwd: string | null,
+      threadId?: ThreadId | null,
     ) => Effect.Effect<EffectAcpSchema.ReadTextFileResponse, EffectAcpErrors.AcpError>;
     readonly writeTextFile?: (
       request: EffectAcpSchema.WriteTextFileRequest,
@@ -1857,6 +1859,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 defaultCwd: input.runtimePolicy.cwd ?? process.cwd(),
                 environment: options.clientTerminals.environment,
                 shellCommands: options.clientTerminals.shellCommands,
+                contextCompressionEnabled: () =>
+                  host.settings === undefined
+                    ? Effect.succeed(DEFAULT_SERVER_SETTINGS.contextCompressionEnabled)
+                    : host.settings.get.pipe(
+                        Effect.map((settings) => settings.contextCompressionEnabled),
+                        Effect.orElseSucceed(
+                          () => DEFAULT_SERVER_SETTINGS.contextCompressionEnabled,
+                        ),
+                      ),
+                threadIdForSession: () =>
+                  Ref.get(activeTurn).pipe(
+                    Effect.map((context) => context?.input.threadId ?? input.threadId ?? undefined),
+                  ),
                 environmentForSession: (sessionId) => {
                   const remembered = terminalEnvironmentBySessionId.get(sessionId);
                   if (remembered !== undefined) return remembered;
@@ -6439,6 +6454,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const clientPolicyContext = Effect.map(Ref.get(activeTurn), (context) => ({
           policy: context?.input.runtimePolicy ?? latestRuntimePolicy,
           turnKey: context === null ? null : String(context.providerTurnId),
+          threadId: context?.input.threadId ?? input.threadId,
         }));
 
         const denyClientRequest = (operation: string, disposition: "ask" | "deny") =>
@@ -6545,7 +6561,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (clientFileSystem !== undefined) {
             yield* targetRuntime.handleReadTextFile((request) =>
               clientPolicyContext.pipe(
-                Effect.flatMap(({ policy }) => clientFileSystem.readTextFile(request, policy.cwd)),
+                Effect.flatMap(({ policy, threadId }) =>
+                  clientFileSystem.readTextFile(request, policy.cwd, threadId),
+                ),
               ),
             );
             const writeTextFile = clientFileSystem.writeTextFile;
@@ -8111,6 +8129,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           }
           if (!isNativeSlashCommand) {
             const sessionSetup = yield* Ref.get(activeSessionSetup);
+            const outputShaperEnabled =
+              host.settings === undefined
+                ? DEFAULT_SERVER_SETTINGS.outputShaperEnabled
+                : yield* host.settings.get.pipe(
+                    Effect.map((settings) => settings.outputShaperEnabled),
+                    Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS.outputShaperEnabled),
+                  );
             prompt.push({
               type: "text",
               text: buildRuntimeInstructions({
@@ -8119,6 +8144,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 pullRequestLinking:
                   sessionSetup === null ||
                   flavor.sessionCarriesPullRequestLinking?.(sessionSetup.initializeResult) !== true,
+                outputShaperEnabled,
               }),
             });
           }

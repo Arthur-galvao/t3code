@@ -19,12 +19,14 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
+import { formatCount, formatPercent, formatTokens } from "@t3tools/shared/usageFormat";
 import { isTrailingDoubleClick } from "../Sidebar.logic";
 import { Badge } from "../ui/badge";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
 import { useThreadActionMenu } from "~/hooks/useThreadActionMenu";
 import { readLocalApi } from "~/localApi";
+import { hasNonZeroRsiCcrSavings, useRsiTelemetrySummary } from "../../state/rsi";
 import { threadEnvironment } from "../../state/threads";
 import { canShareWithGuestAtom } from "./guestShareAvailability";
 import { useAtomValue } from "@effect/atom-react";
@@ -42,6 +44,49 @@ import { cn } from "~/lib/utils";
 import { textDirection } from "~/textDirection";
 import { useClientSettings } from "../../hooks/useSettings";
 import { GuestShareIndicator } from "./GuestShareControls";
+
+function ThreadCcrIndicator({
+  environmentId,
+  threadId,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+}) {
+  const { data } = useRsiTelemetrySummary(environmentId, { threadId });
+  if (!data || !hasNonZeroRsiCcrSavings(data)) {
+    return null;
+  }
+
+  const label =
+    data.totalTokensSavedEst > 0
+      ? data.avgCacheHitRate > 0
+        ? `CCR -${formatTokens(data.totalTokensSavedEst)} · ${formatPercent(data.avgCacheHitRate, 0)} cache`
+        : `CCR -${formatTokens(data.totalTokensSavedEst)}`
+      : `${formatPercent(data.avgCacheHitRate, 0)} cache`;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={<Badge variant="outline" size="sm" className="hidden shrink-0 sm:inline-flex" />}
+      >
+        <span className="font-mono tabular-nums">{label}</span>
+      </TooltipTrigger>
+      <TooltipPopup side="bottom" align="end">
+        <div className="space-y-0.5 text-xs">
+          <div>
+            CCR tokens saved: {formatTokens(data.totalTokensSavedEst)} (
+            {formatCount(data.totalCompressedCalls)} compressed call
+            {data.totalCompressedCalls === 1 ? "" : "s"})
+          </div>
+          <div>
+            Cache hit rate: {formatPercent(data.avgCacheHitRate, 1)} (
+            {formatTokens(data.totalCachedInputTokens)} cached tokens)
+          </div>
+        </div>
+      </TooltipPopup>
+    </Tooltip>
+  );
+}
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -393,7 +438,12 @@ export const ChatHeader = memo(function ChatHeader({
           ) : null}
         </WorkspaceBreadcrumbItem>
       </WorkspaceBreadcrumb>
-      {isServerThread ? <GuestShareIndicator threadRef={activeThreadRef} /> : null}
+      {isServerThread ? (
+        <div className="flex shrink-0 items-center gap-1.5">
+          <ThreadCcrIndicator environmentId={activeThreadEnvironmentId} threadId={activeThreadId} />
+          <GuestShareIndicator threadRef={activeThreadRef} />
+        </div>
+      ) : null}
     </div>
   );
 });

@@ -9,6 +9,7 @@ import type { OpencodeClient, ToolPart } from "@opencode-ai/sdk/v2";
 import { toolOutputImages } from "@t3tools/shared/toolOutput";
 import {
   CheckpointId,
+  DEFAULT_SERVER_SETTINGS,
   NodeId,
   ProjectId,
   ProviderInstanceId,
@@ -2236,10 +2237,53 @@ describe("OpenCodeAdapterV2", () => {
       assert.equal(start?.agent, "plan");
       assert.equal(start?.variant, "high");
       assert.include(start?.system ?? "", "OpenCode");
+      assert.include(start?.system ?? "", "<output_shaper>");
       assert.deepEqual(
         { agent: steer?.agent, variant: steer?.variant, system: steer?.system },
         { agent: start?.agent, variant: start?.variant, system: start?.system },
       );
+    }).pipe(
+      Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
+      Effect.scoped,
+    ),
+  );
+
+  it.effect("omits output shaper instructions when host settings disable outputShaperEnabled", () =>
+    Effect.gen(function* () {
+      const nativeEvents = asyncEventStream();
+      const promptInputs: Array<{ system?: string }> = [];
+      const harness = yield* makeOpenCodeRuntimeHarness(
+        "output-shaper-disabled",
+        "root",
+        {
+          event: { subscribe: async () => ({ stream: nativeEvents.stream }) },
+          session: {
+            create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+            get: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+            messages: async () => ({ data: [] }),
+            promptAsync: async (input: { system?: string }) => {
+              promptInputs.push(input);
+              return { data: true };
+            },
+            abort: async () => ({ data: true }),
+            children: async () => ({ data: [] }),
+          },
+        },
+        {
+          settings: {
+            get: Effect.succeed({
+              ...DEFAULT_SERVER_SETTINGS,
+              outputShaperEnabled: false,
+            }),
+            withSnapshot: () => Effect.die("unused"),
+            changes: Stream.empty,
+            subscribe: Effect.succeed(Stream.empty),
+          },
+        },
+      );
+      yield* harness.startTurn();
+      assert.include(promptInputs[0]?.system ?? "", "OpenCode");
+      assert.notInclude(promptInputs[0]?.system ?? "", "<output_shaper>");
     }).pipe(
       Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
       Effect.scoped,

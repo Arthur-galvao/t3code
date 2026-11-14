@@ -594,6 +594,8 @@ it.effect(
       assert.strictEqual(result.telemetryInputs[0]?.cachedInputTokens, 900);
       assert.strictEqual(result.telemetryInputs[0]?.durationMs, 2000);
       assert.strictEqual(result.telemetryInputs[0]?.outcome, "completed");
+      assert.deepStrictEqual(result.telemetryInputs[0]?.editedFiles, ["apps/server/src/app.ts"]);
+      assert.strictEqual(result.telemetryInputs[0]?.verifiedCommands, undefined);
 
       const gateEvent = result.writtenEvents.find(
         (event) =>
@@ -656,6 +658,12 @@ it.effect(
         ],
       });
       assert.strictEqual(verifiedResult.writtenEvents.length, 0);
+      assert.deepStrictEqual(verifiedResult.telemetryInputs[0]?.editedFiles, [
+        "apps/server/src/app.ts",
+      ]);
+      assert.deepStrictEqual(verifiedResult.telemetryInputs[0]?.verifiedCommands, [
+        "vp.cmd test run src/app.test.ts",
+      ]);
 
       const cappedThreadId = ThreadId.make("thread_gate_capped");
       const cappedRunId = RunId.make("run_gate_capped");

@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import { assert, describe, it } from "@effect/vitest";
 
 import { createCcrStore } from "./ccrStore.ts";
@@ -108,5 +112,97 @@ describe("createCcrStore", () => {
     assert.equal(stats.totalCompressedChars, 1500);
     assert.equal(stats.totalSavedChars, 4500);
     assert.equal(stats.tokensSavedEst, 1125);
+  });
+
+  it("scopes per-thread eviction and stats while keeping global fallback and id-safe retrieval", () => {
+    const store = createCcrStore({ maxEntries: 10, maxEntriesPerThread: 2 });
+
+    const globalEntry = store.put({ content: "global-1", contentType: "text" });
+    const t1First = store.put({ content: "t1-1", contentType: "text", threadId: "thread-1" });
+    const t1Second = store.put({ content: "t1-2", contentType: "text", threadId: "thread-1" });
+    const t2First = store.put({ content: "t2-1", contentType: "text", threadId: "thread-2" });
+    const t1Third = store.put({ content: "t1-3", contentType: "text", threadId: "thread-1" });
+
+    assert.equal(globalEntry.threadId, "__global__");
+    assert.isUndefined(store.get(t1First.ccrId));
+    assert.isDefined(store.get(t1Second.ccrId));
+    assert.isDefined(store.get(t1Third.ccrId));
+    assert.isDefined(store.get(t2First.ccrId));
+    assert.isDefined(store.get(globalEntry.ccrId));
+
+    // Explicit ccrId retrieval works both with matching threadId and fallback when threadId differs.
+    assert.equal(store.retrieve({ ccrId: t2First.ccrId, threadId: "thread-2" }).found, true);
+    assert.equal(store.retrieve({ ccrId: t2First.ccrId, threadId: "thread-1" }).found, true);
+
+    store.recordCompression(1_000, 200, "thread-1");
+    store.recordCompression(800, 300, "thread-2");
+    store.recordCompression(400, 100);
+
+    const t1Stats = store.getStats("thread-1");
+    assert.equal(t1Stats.entriesCount, 2);
+    assert.equal(t1Stats.compressedCallsCount, 1);
+    assert.equal(t1Stats.totalSavedChars, 800);
+
+    const t2Stats = store.getStats("thread-2");
+    assert.equal(t2Stats.entriesCount, 1);
+    assert.equal(t2Stats.compressedCallsCount, 1);
+    assert.equal(t2Stats.totalSavedChars, 500);
+
+    const globalOnlyStats = store.getStats("__global__");
+    assert.equal(globalOnlyStats.entriesCount, 1);
+    assert.equal(globalOnlyStats.totalSavedChars, 300);
+
+    const allStats = store.getStats();
+    assert.equal(allStats.entriesCount, 4);
+    assert.equal(allStats.compressedCallsCount, 3);
+    assert.equal(allStats.totalSavedChars, 1_600);
+  });
+
+  it("persists to disk, hydrates synchronously on configure, and prunes expired TTL entries", () => {
+    const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-ccr-store-"));
+    try {
+      const persistPath = NodePath.join(tempDir, "nested", "ccr-cache.json");
+      let clockMs = 1_000_000;
+      const ttlMs = 5_000;
+
+      const writer = createCcrStore({
+        persistPath,
+        ttlMs,
+        debounceMs: 50,
+        now: () => clockMs,
+      });
+
+      const early = writer.put({
+        content: "early-line-1\nearly-line-2",
+        contentType: "text",
+        threadId: "thread-a",
+      });
+      clockMs += 3_000;
+      const late = writer.put({
+        content: "late-line-1",
+        contentType: "text",
+        threadId: "thread-b",
+      });
+      writer.recordCompression(2_000, 500, "thread-a");
+      writer.flush();
+
+      assert.equal(NodeFS.existsSync(persistPath), true);
+
+      // Advance clock so `early` is expired (age 6000 >= 5000) while `late` is still valid (age 3000 < 5000).
+      clockMs += 3_000;
+      const reader = createCcrStore({ now: () => clockMs });
+      reader.configurePersistence(persistPath, { ttlMs, debounceMs: 0 });
+
+      assert.isUndefined(reader.get(early.ccrId));
+      assert.equal(reader.retrieve({ ccrId: early.ccrId }).found, false);
+      assert.equal(reader.retrieve({ ccrId: late.ccrId }).content, "L1: late-line-1");
+      assert.equal(reader.getStats().entriesCount, 1);
+      assert.equal(reader.getStats("thread-a").tokensSavedEst, 375);
+
+      const next = reader.put({ content: "after-hydrate", contentType: "text" });
+      assert.equal(next.ccrId, "ccr_0003");
+    } finally {
+      NodeFS.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

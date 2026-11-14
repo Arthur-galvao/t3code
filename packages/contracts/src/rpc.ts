@@ -548,6 +548,12 @@ export const WS_METHODS = {
   serverGetUsageSummary: "server.getUsageSummary",
   serverRefreshUsageRates: "server.refreshUsageRates",
 
+  rsiGetTelemetrySummary: "rsi.getTelemetrySummary",
+  rsiQueryLessons: "rsi.queryLessons",
+  rsiRecordLesson: "rsi.recordLesson",
+  rsiDemoteLesson: "rsi.demoteLesson",
+  rsiDeleteLesson: "rsi.deleteLesson",
+
   scheduledTasksSubscribe: "scheduledTasks.subscribe",
   scheduledTasksUpsert: "scheduledTasks.upsert",
   scheduledTasksSetEnabled: "scheduledTasks.setEnabled",
@@ -2076,6 +2082,163 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
   stream: true,
 });
 
+export const RsiLessonScope = Schema.Literals(["global", "glob"]);
+export type RsiLessonScope = typeof RsiLessonScope.Type;
+
+export const RsiLesson = Schema.Struct({
+  id: Schema.String,
+  key: Schema.String,
+  title: Schema.String,
+  guidance: Schema.String,
+  rationaleTrace: Schema.String,
+  triggerCondition: Schema.String,
+  scope: RsiLessonScope,
+  globs: Schema.Array(Schema.String),
+  confidence: Schema.Number,
+  hits: Schema.Number,
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+});
+export type RsiLesson = typeof RsiLesson.Type;
+
+export const RsiRunTelemetryRecord = Schema.Struct({
+  threadId: Schema.String,
+  runId: Schema.String,
+  provider: Schema.String,
+  model: Schema.String,
+  usedTokens: Schema.Number,
+  cachedInputTokens: Schema.Number,
+  cacheHitRate: Schema.Number,
+  toolErrorCount: Schema.Number,
+  loopTripped: Schema.Boolean,
+  safetyBlockedCount: Schema.Number,
+  wastedReads: Schema.Number,
+  outcome: Schema.String,
+  durationMs: Schema.Number,
+  tokensSavedEst: Schema.optional(Schema.Number),
+  compressedCallsCount: Schema.optional(Schema.Number),
+  timestamp: Schema.String,
+});
+export type RsiRunTelemetryRecord = typeof RsiRunTelemetryRecord.Type;
+
+export const RsiProviderTelemetryBreakdown = Schema.Struct({
+  provider: Schema.String,
+  runs: Schema.Number,
+  failures: Schema.Number,
+  loopTrips: Schema.Number,
+  safetyBlocks: Schema.Number,
+  avgCacheHitRate: Schema.Number,
+});
+export type RsiProviderTelemetryBreakdown = typeof RsiProviderTelemetryBreakdown.Type;
+
+export const RsiTelemetrySummary = Schema.Struct({
+  totalRuns: Schema.Number,
+  successCount: Schema.Number,
+  failureCount: Schema.Number,
+  loopTrips: Schema.Number,
+  safetyBlocks: Schema.Number,
+  totalToolErrors: Schema.Number,
+  totalWastedReads: Schema.Number,
+  totalTokens: Schema.Number,
+  totalCachedInputTokens: Schema.Number,
+  totalTokensSavedEst: Schema.Number,
+  totalCompressedCalls: Schema.Number,
+  avgCacheHitRate: Schema.Number,
+  avgDurationMs: Schema.Number,
+  byProvider: Schema.Array(RsiProviderTelemetryBreakdown),
+  recentRuns: Schema.Array(RsiRunTelemetryRecord),
+});
+export type RsiTelemetrySummary = typeof RsiTelemetrySummary.Type;
+
+export const RsiGetTelemetrySummaryInput = Schema.Struct({
+  threadId: Schema.optional(Schema.String),
+  provider: Schema.optional(Schema.String),
+  limit: Schema.optional(Schema.Number),
+});
+export type RsiGetTelemetrySummaryInput = typeof RsiGetTelemetrySummaryInput.Type;
+
+export const RsiQueryLessonsInput = Schema.Struct({
+  scope: Schema.optional(RsiLessonScope),
+  provider: Schema.optional(Schema.String),
+  tool: Schema.optional(Schema.String),
+  cwd: Schema.optional(Schema.NullOr(Schema.String)),
+  activePaths: Schema.optional(Schema.Array(Schema.String)),
+  query: Schema.optional(Schema.String),
+  minConfidence: Schema.optional(Schema.Number),
+  limit: Schema.optional(Schema.Number),
+});
+export type RsiQueryLessonsInput = typeof RsiQueryLessonsInput.Type;
+
+export const RsiRecordLessonInput = Schema.Struct({
+  id: Schema.optional(Schema.String),
+  key: Schema.optional(Schema.String),
+  provider: Schema.optional(Schema.String),
+  tool: Schema.optional(Schema.String),
+  errorSignature: Schema.optional(Schema.String),
+  title: TrimmedNonEmptyString,
+  guidance: TrimmedNonEmptyString,
+  rationaleTrace: Schema.optional(Schema.String),
+  triggerCondition: Schema.optional(Schema.String),
+  scope: Schema.optional(RsiLessonScope),
+  globs: Schema.optional(Schema.Array(Schema.String)),
+  confidence: Schema.optional(Schema.Number),
+  hits: Schema.optional(Schema.Number),
+});
+export type RsiRecordLessonInput = typeof RsiRecordLessonInput.Type;
+
+export const RsiDemoteLessonInput = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  delta: Schema.optional(Schema.Number),
+});
+export type RsiDemoteLessonInput = typeof RsiDemoteLessonInput.Type;
+
+export const RsiDemoteLessonResult = Schema.Struct({
+  demoted: Schema.Boolean,
+  removed: Schema.Boolean,
+  lesson: Schema.NullOr(RsiLesson),
+});
+export type RsiDemoteLessonResult = typeof RsiDemoteLessonResult.Type;
+
+export const RsiDeleteLessonInput = Schema.Struct({
+  id: TrimmedNonEmptyString,
+});
+export type RsiDeleteLessonInput = typeof RsiDeleteLessonInput.Type;
+
+export const RsiDeleteLessonResult = Schema.Struct({
+  deleted: Schema.Boolean,
+});
+export type RsiDeleteLessonResult = typeof RsiDeleteLessonResult.Type;
+
+const WsRsiGetTelemetrySummaryRpc = Rpc.make(WS_METHODS.rsiGetTelemetrySummary, {
+  payload: RsiGetTelemetrySummaryInput,
+  success: RsiTelemetrySummary,
+  error: EnvironmentAuthorizationError,
+});
+
+const WsRsiQueryLessonsRpc = Rpc.make(WS_METHODS.rsiQueryLessons, {
+  payload: RsiQueryLessonsInput,
+  success: Schema.Array(RsiLesson),
+  error: EnvironmentAuthorizationError,
+});
+
+const WsRsiRecordLessonRpc = Rpc.make(WS_METHODS.rsiRecordLesson, {
+  payload: RsiRecordLessonInput,
+  success: RsiLesson,
+  error: EnvironmentAuthorizationError,
+});
+
+const WsRsiDemoteLessonRpc = Rpc.make(WS_METHODS.rsiDemoteLesson, {
+  payload: RsiDemoteLessonInput,
+  success: RsiDemoteLessonResult,
+  error: EnvironmentAuthorizationError,
+});
+
+const WsRsiDeleteLessonRpc = Rpc.make(WS_METHODS.rsiDeleteLesson, {
+  payload: RsiDeleteLessonInput,
+  success: RsiDeleteLessonResult,
+  error: EnvironmentAuthorizationError,
+});
+
 export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthorization>()(
   "t3/contracts/RpcScopeAuthorization",
   { error: EnvironmentAuthorizationError },
@@ -2300,4 +2463,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeThreadRpc,
   WsOrchestrationV2SubscribeCommandOutputRpc,
   WsOrchestrationV2SubscribePromptSuggestionRpc,
+  WsRsiGetTelemetrySummaryRpc,
+  WsRsiQueryLessonsRpc,
+  WsRsiRecordLessonRpc,
+  WsRsiDemoteLessonRpc,
+  WsRsiDeleteLessonRpc,
 ).middleware(RpcScopeAuthorization);

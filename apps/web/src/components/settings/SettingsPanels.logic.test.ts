@@ -1,6 +1,7 @@
 import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
 import { describe, expect, it } from "vite-plus/test";
+import { searchSettings } from "./settingsSearch";
 import {
   backgroundActivitySharedPolicySettings,
   getChangedBrowserSettingLabels,
@@ -86,5 +87,23 @@ describe("getChangedBrowserSettingLabels", () => {
         browserCustomSearchUrl: "https://search.example/?q=%s",
       }),
     ).toEqual(["Search engine"]);
+  });
+});
+
+describe("workflow safeguards & RSI settings search", () => {
+  it("defaults autoVerifyEnabled to true", () => {
+    expect(DEFAULT_UNIFIED_SETTINGS.autoVerifyEnabled).toBe(true);
+  });
+
+  it("indexes auto-verify and RSI & CCR observability in settings search", () => {
+    const autoVerifyMatches = searchSettings("Auto-verify code edits");
+    expect(autoVerifyMatches[0]?.id).toBe("auto-verify");
+    expect(autoVerifyMatches[0]?.to).toBe("/settings/threads");
+    expect(autoVerifyMatches[0]?.targetId).toBe("auto-verify");
+
+    const rsiMatches = searchSettings("RSI & CCR");
+    expect(rsiMatches[0]?.id).toBe("rsi-ccr-observability");
+    expect(rsiMatches[0]?.to).toBe("/settings/diagnostics");
+    expect(rsiMatches[0]?.targetId).toBe("rsi-ccr-observability");
   });
 });

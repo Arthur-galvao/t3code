@@ -4,6 +4,7 @@ export type CompressionContentType = "json" | "logs" | "diff" | "code" | "text";
 
 export interface CompressToolOutputInput {
   readonly text: string;
+  readonly threadId?: string | undefined;
   readonly path?: string | undefined;
   readonly sourceLabel?: string | undefined;
   readonly contentTypeHint?: CompressionContentType | undefined;
@@ -832,6 +833,7 @@ export function compressToolOutput(input: CompressToolOutputInput): CompressTool
   const entry = store.put({
     content: input.text,
     contentType,
+    ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
     ...(input.sourceLabel !== undefined ? { sourceLabel: input.sourceLabel } : {}),
     ...(input.path !== undefined ? { path: input.path } : {}),
   });
@@ -856,7 +858,7 @@ export function compressToolOutput(input: CompressToolOutputInput): CompressTool
   }
 
   const actualCompressedChars = finalText.length;
-  store.recordCompression(originalChars, actualCompressedChars);
+  store.recordCompression(originalChars, actualCompressedChars, input.threadId);
   const savedChars = originalChars - actualCompressedChars;
 
   return {

@@ -13,6 +13,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import {
+  DEFAULT_SERVER_SETTINGS,
   defaultInstanceIdForDriver,
   type ModelSelection,
   type OrchestrationV2AppThread,
@@ -2979,7 +2980,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
 
         // OpenCode runs each step with the agent and system prompt of the latest
         // user message, so every prompt in a turn, steers included, repeats them.
-        const turnPromptOptions = (turn: ActiveOpenCodeTurn) => {
+        const turnPromptOptions = (turn: ActiveOpenCodeTurn, outputShaperEnabled: boolean) => {
           const agent =
             getModelSelectionStringOptionValue(turn.modelSelection, "agent") ??
             (turn.runtimePolicy.interactionMode === "plan" ? "plan" : undefined);
@@ -2989,7 +2990,11 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             ...(variant === undefined ? {} : { variant }),
             system: [
               orchestrationSystemPrompt,
-              buildRuntimeInstructions({ harness: "OpenCode", model: turn.modelSelection.model }),
+              buildRuntimeInstructions({
+                harness: "OpenCode",
+                model: turn.modelSelection.model,
+                outputShaperEnabled,
+              }),
             ]
               .filter(Boolean)
               .join("\n\n"),
@@ -3336,6 +3341,12 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 );
                 return;
               }
+              const serverSettings =
+                host.settings === undefined
+                  ? DEFAULT_SERVER_SETTINGS
+                  : yield* host.settings.get.pipe(
+                      Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
+                    );
               yield* submitPrompt(
                 state,
                 turn,
@@ -3343,7 +3354,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   sessionID: sessionId,
                   messageID: turn.admissionMessageId!,
                   model: parsedModel,
-                  ...turnPromptOptions(turn),
+                  ...turnPromptOptions(turn, serverSettings.outputShaperEnabled),
                   parts,
                 },
                 admissionAbortController!,
@@ -3459,6 +3470,12 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 turn.usage.promptMessageIds.add(turn.admissionMessageId);
               const admissionSettled = turn.admissionSettled;
               const admissionAbortController = turn.admissionAbortController;
+              const serverSettings =
+                host.settings === undefined
+                  ? DEFAULT_SERVER_SETTINGS
+                  : yield* host.settings.get.pipe(
+                      Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
+                    );
               yield* submitPrompt(
                 state,
                 turn,
@@ -3466,7 +3483,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   sessionID: sessionId,
                   messageID: turn.admissionMessageId,
                   model: parsedModel,
-                  ...turnPromptOptions(turn),
+                  ...turnPromptOptions(turn, serverSettings.outputShaperEnabled),
                   parts,
                 },
                 admissionAbortController!,

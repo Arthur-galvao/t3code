@@ -4,6 +4,7 @@ import {
   ProviderInstanceId,
   type OrchestrationV2ProviderCapabilities,
   type ProviderSetupError,
+  type ThreadId,
 } from "@t3tools/contracts";
 import type { SelfInvocation } from "@t3tools/shared/nodeRuntime";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -335,7 +336,7 @@ export function makeAntigravityAcpAdapterFlavor(
       return acpPermissionDisposition(policy, request);
     },
     clientFileSystem: {
-      readTextFile: (request, cwd) => {
+      readTextFile: (request, cwd, threadId?: ThreadId | null) => {
         const safety = evaluateToolSafety({
           toolName: "Read",
           rawInput: { file_path: request.path },
@@ -369,6 +370,7 @@ export function makeAntigravityAcpAdapterFlavor(
             }
             const result = compressToolOutput({
               text: response.content,
+              ...(threadId == null ? {} : { threadId }),
               path: request.path,
               sourceLabel: "readTextFile",
               minChars,

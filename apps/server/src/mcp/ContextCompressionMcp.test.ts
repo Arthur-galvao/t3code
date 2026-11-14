@@ -82,12 +82,22 @@ describe("context_retrieve MCP tool", () => {
       });
       const compressed = compressToolOutput({
         text: logLines.join("\n"),
+        threadId: scope.thread!.threadId,
         sourceLabel: "Bash",
         store: defaultCcrStore,
       });
       assert.isTrue(compressed.compressed);
       assert.isDefined(compressed.ccrId);
       const ccrId = compressed.ccrId!;
+
+      const otherThreadCompressed = compressToolOutput({
+        text: logLines.join("\n"),
+        threadId: "thread:ccr-other-thread",
+        sourceLabel: "Bash",
+        store: defaultCcrStore,
+      });
+      assert.isTrue(otherThreadCompressed.compressed);
+      assert.isDefined(otherThreadCompressed.ccrId);
 
       const toolkit = yield* OrchestratorToolkit;
 
@@ -105,9 +115,28 @@ describe("context_retrieve MCP tool", () => {
       assert.isTrue("found" in sliceResult);
       if (!("found" in sliceResult)) return;
       assert.isTrue(sliceResult.found);
+      assert.equal(sliceResult.threadId, scope.thread!.threadId);
       assert.equal(sliceResult.totalLines, 120);
       assert.equal(sliceResult.matchedLines, 3);
       assert.include(sliceResult.content, "L47: 2026-11-13T01:00:47Z ERROR database migration");
+
+      const explicitThreadOpt = yield* Stream.runHead(
+        yield* toolkit.handle("context_retrieve", {
+          ccrId: otherThreadCompressed.ccrId!,
+          threadId: "thread:ccr-other-thread",
+          startLine: 83,
+          endLine: 83,
+        }),
+      );
+      assert.isTrue(Option.isSome(explicitThreadOpt));
+      if (Option.isNone(explicitThreadOpt)) return;
+      assert.isFalse(explicitThreadOpt.value.isFailure);
+      const explicitThreadResult = explicitThreadOpt.value.result;
+      assert.isTrue("found" in explicitThreadResult);
+      if (!("found" in explicitThreadResult)) return;
+      assert.isTrue(explicitThreadResult.found);
+      assert.equal(explicitThreadResult.threadId, "thread:ccr-other-thread");
+      assert.include(explicitThreadResult.content, "L83:");
 
       const queryOpt = yield* Stream.runHead(
         yield* toolkit.handle("context_retrieve", {

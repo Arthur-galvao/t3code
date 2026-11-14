@@ -4777,3 +4777,148 @@ describe("subagent continued by a later turn", () => {
     ]);
   });
 });
+
+describe("read-only tool call sequence collapsing", () => {
+  const runId = RunId.make("read-only-seq-run");
+  const at = (second: number) => `2026-11-14T00:00:${String(second).padStart(2, "0")}Z`;
+
+  const makeWorkEntry = (
+    id: string,
+    second: number,
+    overrides: Partial<Extract<TimelineEntry, { kind: "work" }>["entry"]>,
+  ): TimelineEntry => ({
+    id,
+    kind: "work",
+    createdAt: at(second),
+    entry: {
+      id,
+      createdAt: at(second),
+      runId,
+      label: id,
+      tone: "tool",
+      toolLifecycleStatus: "completed",
+      ...overrides,
+    },
+  });
+
+  it("groups consecutive read-only calls separately from adjacent edits and commands", () => {
+    const timelineEntries: TimelineEntry[] = [
+      makeWorkEntry("read-1", 1, {
+        label: "Read src/a.ts",
+        toolTitle: "Read",
+        requestKind: "file-read",
+        detail: "src/a.ts",
+      }),
+      makeWorkEntry("grep-1", 2, {
+        label: "Searched code",
+        itemType: "file_search",
+        toolTitle: "Grep",
+        detail: "pattern",
+      }),
+      makeWorkEntry("web-1", 3, {
+        label: "Web search",
+        itemType: "web_search",
+        toolTitle: "WebSearch",
+        detail: "docs",
+      }),
+      makeWorkEntry("edit-1", 4, {
+        label: "Edited src/a.ts",
+        itemType: "file_change",
+        changedFiles: ["src/a.ts"],
+      }),
+      makeWorkEntry("read-2", 5, {
+        label: "Read src/b.ts",
+        toolTitle: "Read",
+        requestKind: "file-read",
+        detail: "src/b.ts",
+      }),
+      makeWorkEntry("read-3", 6, {
+        label: "Read src/c.ts",
+        toolTitle: "Read",
+        requestKind: "file-read",
+        detail: "src/c.ts",
+      }),
+      makeWorkEntry("cmd-1", 7, {
+        label: "Ran pnpm test",
+        itemType: "command_execution",
+        command: "pnpm test",
+      }),
+    ];
+
+    const collapsedRows = deriveMessagesTimelineRows({
+      timelineEntries,
+      expandedRunIds: new Set([runId]),
+      isWorking: false,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+
+    expect(collapsedRows.map((row) => row.kind)).toEqual([
+      "turn-fold",
+      "work-toggle",
+      "work",
+      "work-toggle",
+      "work",
+    ]);
+
+    const firstToggle = collapsedRows[1]!;
+    expect(firstToggle.kind).toBe("work-toggle");
+    if (firstToggle.kind === "work-toggle") {
+      expect(firstToggle.hiddenCount).toBe(3);
+      expect(firstToggle.expanded).toBe(false);
+      expect(firstToggle.summary).toContain("Read 1 file");
+    }
+
+    const editRow = collapsedRows[2]!;
+    expect(editRow.kind).toBe("work");
+    if (editRow.kind === "work") {
+      expect(editRow.groupedEntries.map((entry) => entry.id)).toEqual(["edit-1"]);
+      expect(editRow.displayLabel).toBe("Changed 1 file");
+    }
+
+    const secondToggle = collapsedRows[3]!;
+    expect(secondToggle.kind).toBe("work-toggle");
+    if (secondToggle.kind === "work-toggle") {
+      expect(secondToggle.hiddenCount).toBe(2);
+      expect(secondToggle.summary).toBe("Read 2 files");
+    }
+
+    const cmdRow = collapsedRows[4]!;
+    expect(cmdRow.kind).toBe("work");
+    if (cmdRow.kind === "work") {
+      expect(cmdRow.groupedEntries.map((entry) => entry.id)).toEqual(["cmd-1"]);
+    }
+
+    const expandedGroupId = firstToggle.kind === "work-toggle" ? firstToggle.groupId : "";
+    const expandedRows = deriveMessagesTimelineRows({
+      timelineEntries,
+      expandedRunIds: new Set([runId]),
+      expandedWorkGroupIds: new Set([expandedGroupId]),
+      isWorking: false,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+
+    expect(expandedRows.map((row) => row.kind)).toEqual([
+      "turn-fold",
+      "work-toggle",
+      "work",
+      "work",
+      "work-toggle",
+      "work",
+    ]);
+    const expandedToggle = expandedRows[1]!;
+    if (expandedToggle.kind === "work-toggle") {
+      expect(expandedToggle.expanded).toBe(true);
+    }
+    const expandedGroup = expandedRows[2]!;
+    if (expandedGroup.kind === "work") {
+      expect(expandedGroup.isExpandedToolGroup).toBe(true);
+      expect(expandedGroup.groupedEntries.map((entry) => entry.id)).toEqual([
+        "read-1",
+        "grep-1",
+        "web-1",
+      ]);
+    }
+  });
+});

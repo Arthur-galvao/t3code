@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   ChatFileAttachment,
+  DEFAULT_SERVER_SETTINGS,
   MessageId,
   NodeId,
   ProjectId,
@@ -13,6 +14,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
+import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
@@ -482,20 +484,22 @@ describe("AntigravityAdapterV2 client file system", () => {
         context("fs/read_text_file"),
       ).pipe(Effect.exit);
       assert.isTrue(Exit.isFailure(outsideRead));
-      const linkPath = path.join(workspace, "linked-secret.txt");
-      yield* fileSystem.symlink(outsideFile, linkPath);
-      const linkedRead = yield* readTextFile(
-        { sessionId: "mock-session-1", path: linkPath },
-        context("fs/read_text_file"),
-      ).pipe(Effect.exit);
-      assert.isTrue(Exit.isFailure(linkedRead), "a read through an escaping symlink is denied");
-      const insideLink = path.join(workspace, "inside-link.ts");
-      yield* fileSystem.symlink(insidePath, insideLink);
-      const viaInsideLink = yield* readTextFile(
-        { sessionId: "mock-session-1", path: insideLink },
-        context("fs/read_text_file"),
-      );
-      assert.equal(viaInsideLink.content, "inside");
+      if (symlinksSupported) {
+        const linkPath = path.join(workspace, "linked-secret.txt");
+        yield* fileSystem.symlink(outsideFile, linkPath);
+        const linkedRead = yield* readTextFile(
+          { sessionId: "mock-session-1", path: linkPath },
+          context("fs/read_text_file"),
+        ).pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(linkedRead), "a read through an escaping symlink is denied");
+        const insideLink = path.join(workspace, "inside-link.ts");
+        yield* fileSystem.symlink(insidePath, insideLink);
+        const viaInsideLink = yield* readTextFile(
+          { sessionId: "mock-session-1", path: insideLink },
+          context("fs/read_text_file"),
+        );
+        assert.equal(viaInsideLink.content, "inside");
+      }
     }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 
@@ -691,8 +695,13 @@ describe("AntigravityAdapterV2 client file system", () => {
         assert.isBelow(unboundedLog.content.length, largeLogContent.length);
         const ccrMatch = /\[T3 CCR:(ccr_\d+)/.exec(unboundedLog.content);
         assert.isNotNull(ccrMatch);
-        const retrieved = defaultCcrStore.retrieve({ ccrId: ccrMatch![1]!, query: "projection" });
+        const retrieved = defaultCcrStore.retrieve({
+          ccrId: ccrMatch![1]!,
+          threadId,
+          query: "projection",
+        });
         assert.isTrue(retrieved.found);
+        assert.equal(retrieved.threadId, threadId);
         assert.include(retrieved.content, "L73:");
 
         const boundedLog = yield* readTextFile(
@@ -1658,6 +1667,137 @@ describe("AntigravityAdapterV2 session system prompt", () => {
           assert.notInclude(append, "systemPrompt");
           assert.include(sent, "<pull_request_linking>");
         }
+        assert.include(sent, "<output_shaper>");
       }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.live("omits output shaper instructions when host settings disable outputShaperEnabled", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const crypto = yield* SecureRandom.SecureRandom;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-log-" });
+      const requestLog = path.join(logs, "requests.ndjson");
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      const promptReceived = yield* Deferred.make<Parameters<RuntimeService["prompt"]>[0]>();
+      const instanceId = ProviderInstanceId.make("antigravity-no-shaper");
+      const adapter = yield* makeAntigravityAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        makeRuntime: (input) =>
+          makeAntigravityAcpRuntime({
+            ...input,
+            childProcessSpawner,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: input.cwd,
+              env: {
+                T3_ACP_ANTIGRAVITY: "1",
+                T3_ACP_AGENT_VERSION: "1.4.5",
+                T3_ACP_REQUEST_LOG_PATH: requestLog,
+                T3_ACP_HANG_PROMPT_FOREVER: "1",
+              },
+            },
+          }).pipe(
+            Effect.provideService(SecureRandom.SecureRandom, crypto),
+            Effect.map((runtime): RuntimeService => ({
+              ...runtime,
+              prompt: (request) =>
+                Deferred.succeed(promptReceived, request).pipe(
+                  Effect.andThen(runtime.prompt(request)),
+                ),
+            })),
+          ),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.undefined,
+      });
+      const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-ns-" });
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: workspace,
+      });
+      const threadId = ThreadId.make("thread-antigravity-no-shaper");
+      const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-antigravity-no-shaper"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const now = yield* DateTime.now;
+      yield* session
+        .startTurn({
+          appThread: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project-antigravity-no-shaper"),
+            title: "Antigravity no shaper",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          threadId,
+          runId: RunId.make("run-antigravity-no-shaper"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("attempt-antigravity-no-shaper"),
+          rootNodeId: NodeId.make("node-antigravity-no-shaper"),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-antigravity-no-shaper"),
+            text: "open a PR",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        })
+        .pipe(Effect.forkScoped);
+      const sent = JSON.stringify((yield* Deferred.await(promptReceived)).prompt);
+      assert.include(sent, "through the Antigravity harness, as gemini-test-low");
+      assert.notInclude(sent, "<output_shaper>");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          TestProviderHost.layer({
+            settings: {
+              ...DEFAULT_SERVER_SETTINGS,
+              outputShaperEnabled: false,
+            },
+          }).pipe(Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+        ),
+      ),
+      Effect.scoped,
+    ),
   );
 });

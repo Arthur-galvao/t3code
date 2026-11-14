@@ -2732,6 +2732,7 @@ describe("ClaudeAdapterV2 native fork", () => {
         const providerSessionId = ProviderSessionId.make("provider-session-claude-fork");
         const sourceThreadId = ThreadId.make("thread-claude-fork-source");
         const targetThreadId = ThreadId.make("thread-claude-fork-target");
+        const workspace = NodePath.resolve("/workspace");
         const runtime = yield* adapter.openSession({
           threadId: sourceThreadId,
           providerSessionId,
@@ -2742,7 +2743,7 @@ describe("ClaudeAdapterV2 native fork", () => {
           runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
             runtimeMode: "full-access",
             interactionMode: "default",
-            cwd: "/workspace",
+            cwd: workspace,
           }),
         });
         const sourceProviderThread = yield* runtime.ensureThread({
@@ -2754,7 +2755,7 @@ describe("ClaudeAdapterV2 native fork", () => {
           runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
             runtimeMode: "full-access",
             interactionMode: "default",
-            cwd: "/workspace",
+            cwd: workspace,
           }),
         });
         const now = yield* DateTime.now;
@@ -2855,13 +2856,13 @@ describe("ClaudeAdapterV2 native fork", () => {
           runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
             runtimeMode: "full-access",
             interactionMode: "default",
-            cwd: "/workspace",
+            cwd: workspace,
           }),
         });
 
         assert.equal(openedQueries[0]?.options.resume, forkedSessionId);
         assert.equal(openedQueries[0]?.options.sessionId, undefined);
-        assert.equal(openedQueries[0]?.options.cwd, NodePath.resolve("/workspace"));
+        assert.equal(openedQueries[0]?.options.cwd, workspace);
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
@@ -5406,8 +5407,13 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.include(updated as string, "ERROR worker failed on shard 7");
           const ccrMatch = /\[T3 CCR:(ccr_\d+)/.exec(updated as string);
           assert.isNotNull(ccrMatch);
-          const retrieved = defaultCcrStore.retrieve({ ccrId: ccrMatch![1]!, query: "shard 7" });
+          const retrieved = defaultCcrStore.retrieve({
+            ccrId: ccrMatch![1]!,
+            threadId: harness.threadId,
+            query: "shard 7",
+          });
           assert.isTrue(retrieved.found);
+          assert.equal(retrieved.threadId, harness.threadId);
           assert.include(retrieved.content, "L56: 2026-11-13T01:00:55Z ERROR worker failed");
 
           const skippedRetrieve = yield* Effect.promise(() =>

@@ -1521,6 +1521,16 @@ function deriveTimelineTurnFolds(
   });
 }
 
+const READ_ONLY_TOOL_ACTIONS: ReadonlySet<ReturnType<typeof toolGroupAction>> = new Set([
+  "read",
+  "code-search",
+  "search",
+]);
+
+function isReadOnlyWorkEntry(entry: WorkLogEntry): boolean {
+  return READ_ONLY_TOOL_ACTIONS.has(toolGroupAction(entry));
+}
+
 export function deriveMessagesTimelineRows(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   pendingApprovalRequestIds?: ReadonlySet<RuntimeRequestId>;
@@ -1975,6 +1985,7 @@ export function deriveMessagesTimelineRows(input: {
         continue;
       }
       const groupedEntries = [timelineEntry.entry];
+      const firstIsReadOnly = isReadOnlyWorkEntry(timelineEntry.entry);
       let cursor = index + 1;
       while (cursor < timelineEntries.length) {
         const nextEntry = timelineEntries[cursor];
@@ -1997,7 +2008,8 @@ export function deriveMessagesTimelineRows(input: {
           foldsByAnchorEntryId.has(nextEntry.id) ||
           supersededFoldsByAnchorEntryId.has(nextEntry.id) ||
           (nextEntry.entry.runId ?? null) !== (timelineEntry.entry.runId ?? null) ||
-          nextEntry.attempt?.id !== timelineEntry.attempt?.id
+          nextEntry.attempt?.id !== timelineEntry.attempt?.id ||
+          isReadOnlyWorkEntry(nextEntry.entry) !== firstIsReadOnly
         ) {
           break;
         }

@@ -3393,11 +3393,15 @@ const make = Effect.gen(function* () {
         return yield* rsi.getTelemetrySummary(input);
       },
     ),
-    contextRetrieve: Effect.fn("OrchestratorMcpService.contextRetrieve")(function* (_scope, input) {
+    contextRetrieve: Effect.fn("OrchestratorMcpService.contextRetrieve")(function* (scope, input) {
       if (input.ccrId.trim() === "") {
         return yield* failure("invalid_request", "CCR ID must be non-empty.");
       }
-      return defaultCcrStore.retrieve(input);
+      const threadId = input.threadId ?? scope.thread?.threadId;
+      return defaultCcrStore.retrieve({
+        ...input,
+        ...(threadId === undefined ? {} : { threadId }),
+      });
     }),
   });
 });

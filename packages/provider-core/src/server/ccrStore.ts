@@ -1,5 +1,10 @@
+// @effect-diagnostics nodeBuiltinImport:off globalDate:off globalTimers:off
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+
 export interface CcrEntry {
   readonly ccrId: string;
+  readonly threadId?: string | undefined;
   readonly content: string;
   readonly contentType: string;
   readonly sourceLabel?: string | undefined;
@@ -7,17 +12,20 @@ export interface CcrEntry {
   readonly charCount: number;
   readonly byteCount: number;
   readonly totalLines: number;
+  readonly createdAtMs?: number | undefined;
 }
 
 export interface CcrPutInput {
   readonly content: string;
   readonly contentType: string;
+  readonly threadId?: string | undefined;
   readonly sourceLabel?: string | undefined;
   readonly path?: string | undefined;
 }
 
 export interface CcrRetrieveInput {
   readonly ccrId: string;
+  readonly threadId?: string | undefined;
   readonly query?: string | undefined;
   readonly startLine?: number | undefined;
   readonly endLine?: number | undefined;
@@ -27,6 +35,7 @@ export interface CcrRetrieveInput {
 export interface CcrRetrieveResult {
   readonly found: boolean;
   readonly ccrId: string;
+  readonly threadId?: string | undefined;
   readonly contentType?: string | undefined;
   readonly sourceLabel?: string | undefined;
   readonly path?: string | undefined;
@@ -48,23 +57,83 @@ export interface CcrStats {
   readonly tokensSavedEst: number;
 }
 
+export interface CcrStorePersistenceOptions {
+  readonly ttlMs?: number | undefined;
+  readonly debounceMs?: number | undefined;
+}
+
 export interface CcrStoreOptions {
   readonly maxEntries?: number | undefined;
   readonly maxBytes?: number | undefined;
+  readonly maxEntriesPerThread?: number | undefined;
+  readonly ttlMs?: number | undefined;
+  readonly persistPath?: string | undefined;
+  readonly debounceMs?: number | undefined;
+  readonly now?: (() => number) | undefined;
 }
 
 export interface CcrStore {
   readonly put: (input: CcrPutInput) => CcrEntry;
-  readonly get: (ccrId: string) => CcrEntry | undefined;
+  readonly get: (ccrId: string, threadId?: string) => CcrEntry | undefined;
   readonly retrieve: (input: CcrRetrieveInput) => CcrRetrieveResult;
-  readonly recordCompression: (originalChars: number, compressedChars: number) => void;
-  readonly getStats: () => CcrStats;
+  readonly recordCompression: (
+    originalChars: number,
+    compressedChars: number,
+    threadId?: string,
+  ) => void;
+  readonly getStats: (threadId?: string) => CcrStats;
+  readonly configurePersistence: (
+    persistPath: string,
+    options?: CcrStorePersistenceOptions,
+  ) => void;
+  readonly hydrate: () => void;
+  readonly flush: () => void;
   readonly clear: () => void;
 }
 
 const DEFAULT_MAX_ENTRIES = 200;
 const DEFAULT_MAX_BYTES = 20_000_000;
+const DEFAULT_MAX_ENTRIES_PER_THREAD = 100;
+const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+const DEFAULT_PERSIST_DEBOUNCE_MS = 250;
 const DEFAULT_RETRIEVE_MAX_CHARS = 12_000;
+const GLOBAL_THREAD_ID = "__global__";
+
+interface CompressionCounters {
+  compressedCallsCount: number;
+  totalOriginalChars: number;
+  totalCompressedChars: number;
+  totalSavedChars: number;
+}
+
+interface PersistedCcrSnapshot {
+  readonly version: 1;
+  readonly nextSeq: number;
+  readonly entries: ReadonlyArray<CcrEntry>;
+  readonly globalCompression?: CompressionCounters | undefined;
+  readonly threadCompression?: Readonly<Record<string, CompressionCounters>> | undefined;
+}
+
+function createEmptyCounters(): CompressionCounters {
+  return {
+    compressedCallsCount: 0,
+    totalOriginalChars: 0,
+    totalCompressedChars: 0,
+    totalSavedChars: 0,
+  };
+}
+
+function normalizeThreadId(threadId: string | undefined): string {
+  const trimmed = threadId?.trim();
+  return trimmed !== undefined && trimmed.length > 0 ? trimmed : GLOBAL_THREAD_ID;
+}
+
+function parseCcrSeq(ccrId: string): number {
+  const match = /^ccr_(\d+)$/.exec(ccrId);
+  if (match === null) return 0;
+  const parsed = Number.parseInt(match[1] ?? "0", 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 
 function splitLines(content: string): ReadonlyArray<string> {
   if (content === "") return [];
@@ -96,36 +165,280 @@ function buildLineMatcher(query: string): (line: string) => boolean {
   }
 }
 
+function sanitizeCounters(raw: unknown): CompressionCounters | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const record = raw as Partial<CompressionCounters>;
+  const toNonNegInt = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+  return {
+    compressedCallsCount: toNonNegInt(record.compressedCallsCount),
+    totalOriginalChars: toNonNegInt(record.totalOriginalChars),
+    totalCompressedChars: toNonNegInt(record.totalCompressedChars),
+    totalSavedChars: toNonNegInt(record.totalSavedChars),
+  };
+}
+
 export function createCcrStore(options?: CcrStoreOptions): CcrStore {
   const maxEntries = Math.max(1, options?.maxEntries ?? DEFAULT_MAX_ENTRIES);
   const maxBytes = Math.max(1, options?.maxBytes ?? DEFAULT_MAX_BYTES);
+  const maxEntriesPerThread = Math.max(
+    1,
+    options?.maxEntriesPerThread ?? DEFAULT_MAX_ENTRIES_PER_THREAD,
+  );
+  const now = options?.now ?? (() => Date.now());
+
+  let ttlMs = options?.ttlMs ?? DEFAULT_TTL_MS;
+  let persistPath = options?.persistPath;
+  let debounceMs = options?.debounceMs ?? DEFAULT_PERSIST_DEBOUNCE_MS;
+  let persistTimer: ReturnType<typeof setTimeout> | undefined;
+  let tempWriteSeq = 0;
 
   const entries = new Map<string, CcrEntry>();
   const linesCache = new Map<string, ReadonlyArray<string>>();
+  const threadCompression = new Map<string, CompressionCounters>();
+  let globalCompression = createEmptyCounters();
   let nextSeq = 1;
   let currentBytes = 0;
-  let compressedCallsCount = 0;
-  let totalOriginalChars = 0;
-  let totalCompressedChars = 0;
-  let totalSavedChars = 0;
+
+  const deleteEntry = (ccrId: string) => {
+    const existing = entries.get(ccrId);
+    entries.delete(ccrId);
+    linesCache.delete(ccrId);
+    if (existing !== undefined) {
+      currentBytes = Math.max(0, currentBytes - existing.byteCount);
+    }
+  };
+
+  const isExpired = (entry: CcrEntry, nowMs: number): boolean => {
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) return false;
+    if (entry.createdAtMs === undefined || !Number.isFinite(entry.createdAtMs)) return false;
+    return nowMs - entry.createdAtMs >= ttlMs;
+  };
+
+  const pruneExpired = (nowMs: number): boolean => {
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) return false;
+    let removed = false;
+    for (const [ccrId, entry] of entries) {
+      if (isExpired(entry, nowMs)) {
+        deleteEntry(ccrId);
+        removed = true;
+      }
+    }
+    return removed;
+  };
+
+  const evictOldestForThreadIfNeeded = (threadId: string) => {
+    const threadKeys: Array<string> = [];
+    for (const [ccrId, entry] of entries) {
+      if (normalizeThreadId(entry.threadId) === threadId) {
+        threadKeys.push(ccrId);
+      }
+    }
+    while (threadKeys.length >= maxEntriesPerThread) {
+      const oldestThreadKey = threadKeys.shift();
+      if (oldestThreadKey === undefined) break;
+      deleteEntry(oldestThreadKey);
+    }
+  };
 
   const evictOldestIfNeeded = (incomingBytes: number) => {
-    while (
-      entries.size > 0 &&
-      (entries.size >= maxEntries || currentBytes + incomingBytes > maxBytes)
-    ) {
+    while (entries.size > 0) {
+      if (entries.size < maxEntries && currentBytes + incomingBytes <= maxBytes) {
+        break;
+      }
       const oldestKey = entries.keys().next().value;
       if (oldestKey === undefined) break;
-      const oldest = entries.get(oldestKey);
-      entries.delete(oldestKey);
-      linesCache.delete(oldestKey);
-      if (oldest !== undefined) {
-        currentBytes = Math.max(0, currentBytes - oldest.byteCount);
+      deleteEntry(oldestKey);
+    }
+  };
+
+  const writeSnapshotSync = () => {
+    if (persistPath === undefined) return;
+    pruneExpired(now());
+    const threadRecord: Record<string, CompressionCounters> = {};
+    for (const [tid, counters] of threadCompression) {
+      threadRecord[tid] = { ...counters };
+    }
+    const snapshot: PersistedCcrSnapshot = {
+      version: 1,
+      nextSeq,
+      entries: [...entries.values()],
+      globalCompression: { ...globalCompression },
+      threadCompression: threadRecord,
+    };
+    const targetPath = persistPath;
+    tempWriteSeq += 1;
+    const tempPath = `${targetPath}.${tempWriteSeq}.tmp`;
+    try {
+      NodeFS.mkdirSync(NodePath.dirname(targetPath), { recursive: true });
+      NodeFS.writeFileSync(tempPath, JSON.stringify(snapshot), "utf8");
+      NodeFS.renameSync(tempPath, targetPath);
+    } catch {
+      try {
+        if (NodeFS.existsSync(tempPath)) {
+          NodeFS.rmSync(tempPath, { force: true });
+        }
+      } catch {
+        // Ignore cleanup errors during best-effort persistence.
       }
     }
   };
 
+  const cancelPendingPersist = () => {
+    if (persistTimer !== undefined) {
+      clearTimeout(persistTimer);
+      persistTimer = undefined;
+    }
+  };
+
+  const schedulePersist = () => {
+    if (persistPath === undefined) return;
+    cancelPendingPersist();
+    if (debounceMs <= 0) {
+      writeSnapshotSync();
+      return;
+    }
+    persistTimer = setTimeout(() => {
+      persistTimer = undefined;
+      writeSnapshotSync();
+    }, debounceMs);
+    persistTimer.unref?.();
+  };
+
+  const findEntry = (ccrId: string, threadId?: string): CcrEntry | undefined => {
+    pruneExpired(now());
+    if (threadId !== undefined) {
+      const preferredThread = normalizeThreadId(threadId);
+      const direct = entries.get(ccrId);
+      if (direct !== undefined && normalizeThreadId(direct.threadId) === preferredThread) {
+        return direct;
+      }
+      for (const entry of entries.values()) {
+        if (entry.ccrId === ccrId && normalizeThreadId(entry.threadId) === preferredThread) {
+          return entry;
+        }
+      }
+    }
+    return entries.get(ccrId);
+  };
+
+  const hydrate = () => {
+    if (persistPath === undefined) return;
+    let raw: string;
+    try {
+      raw = NodeFS.readFileSync(persistPath, "utf8");
+    } catch {
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      (parsed as Partial<PersistedCcrSnapshot>).version !== 1 ||
+      !Array.isArray((parsed as Partial<PersistedCcrSnapshot>).entries)
+    ) {
+      return;
+    }
+
+    const snapshot = parsed as PersistedCcrSnapshot;
+    const nowMs = now();
+    let maxParsedSeq = 0;
+
+    for (const candidate of snapshot.entries) {
+      if (
+        candidate === null ||
+        typeof candidate !== "object" ||
+        typeof candidate.ccrId !== "string" ||
+        typeof candidate.content !== "string" ||
+        typeof candidate.contentType !== "string"
+      ) {
+        continue;
+      }
+      const seqNum = parseCcrSeq(candidate.ccrId);
+      if (seqNum > maxParsedSeq) maxParsedSeq = seqNum;
+      if (isExpired(candidate, nowMs)) continue;
+      if (entries.has(candidate.ccrId)) continue;
+
+      const lines = splitLines(candidate.content);
+      const byteCount = Buffer.byteLength(candidate.content, "utf8");
+      const entryThreadId = normalizeThreadId(candidate.threadId);
+      const hydratedEntry: CcrEntry = {
+        ccrId: candidate.ccrId,
+        threadId: entryThreadId,
+        content: candidate.content,
+        contentType: candidate.contentType,
+        ...(candidate.sourceLabel !== undefined ? { sourceLabel: candidate.sourceLabel } : {}),
+        ...(candidate.path !== undefined ? { path: candidate.path } : {}),
+        charCount: candidate.content.length,
+        byteCount,
+        totalLines: lines.length,
+        ...(candidate.createdAtMs !== undefined ? { createdAtMs: candidate.createdAtMs } : {}),
+      };
+
+      evictOldestForThreadIfNeeded(entryThreadId);
+      evictOldestIfNeeded(byteCount);
+      entries.set(hydratedEntry.ccrId, hydratedEntry);
+      linesCache.set(hydratedEntry.ccrId, lines);
+      currentBytes += byteCount;
+    }
+
+    const snapshotNextSeq =
+      typeof snapshot.nextSeq === "number" && Number.isFinite(snapshot.nextSeq)
+        ? Math.floor(snapshot.nextSeq)
+        : 1;
+    nextSeq = Math.max(nextSeq, snapshotNextSeq, maxParsedSeq + 1);
+
+    if (globalCompression.compressedCallsCount === 0 && snapshot.globalCompression !== undefined) {
+      const sanitizedGlobal = sanitizeCounters(snapshot.globalCompression);
+      if (sanitizedGlobal !== undefined) {
+        globalCompression = sanitizedGlobal;
+      }
+    }
+    if (
+      threadCompression.size === 0 &&
+      snapshot.threadCompression !== undefined &&
+      typeof snapshot.threadCompression === "object"
+    ) {
+      for (const [tid, counters] of Object.entries(snapshot.threadCompression)) {
+        const sanitized = sanitizeCounters(counters);
+        if (sanitized !== undefined) {
+          threadCompression.set(normalizeThreadId(tid), sanitized);
+        }
+      }
+    }
+  };
+
+  const configurePersistence = (
+    nextPersistPath: string,
+    persistenceOptions?: CcrStorePersistenceOptions,
+  ) => {
+    persistPath = nextPersistPath;
+    if (persistenceOptions?.ttlMs !== undefined) {
+      ttlMs = persistenceOptions.ttlMs;
+    }
+    if (persistenceOptions?.debounceMs !== undefined) {
+      debounceMs = persistenceOptions.debounceMs;
+    }
+    hydrate();
+  };
+
+  const flush = () => {
+    cancelPendingPersist();
+    writeSnapshotSync();
+  };
+
   const put = (input: CcrPutInput): CcrEntry => {
+    const nowMs = now();
+    pruneExpired(nowMs);
+
+    const threadId = normalizeThreadId(input.threadId);
     const ccrId = `ccr_${String(nextSeq).padStart(4, "0")}`;
     nextSeq += 1;
 
@@ -133,6 +446,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
     const byteCount = Buffer.byteLength(input.content, "utf8");
     const entry: CcrEntry = {
       ccrId,
+      threadId,
       content: input.content,
       contentType: input.contentType,
       ...(input.sourceLabel !== undefined ? { sourceLabel: input.sourceLabel } : {}),
@@ -140,19 +454,23 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
       charCount: input.content.length,
       byteCount,
       totalLines: lines.length,
+      createdAtMs: nowMs,
     };
 
+    evictOldestForThreadIfNeeded(threadId);
     evictOldestIfNeeded(byteCount);
     entries.set(ccrId, entry);
     linesCache.set(ccrId, lines);
     currentBytes += byteCount;
+    schedulePersist();
     return entry;
   };
 
-  const get = (ccrId: string): CcrEntry | undefined => entries.get(ccrId);
+  const get = (ccrId: string, threadId?: string): CcrEntry | undefined =>
+    findEntry(ccrId, threadId);
 
   const retrieve = (input: CcrRetrieveInput): CcrRetrieveResult => {
-    const entry = entries.get(input.ccrId);
+    const entry = findEntry(input.ccrId, input.threadId);
     if (entry === undefined) {
       return {
         found: false,
@@ -164,7 +482,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
       };
     }
 
-    const lines = linesCache.get(input.ccrId) ?? splitLines(entry.content);
+    const lines = linesCache.get(entry.ccrId) ?? splitLines(entry.content);
     const totalLines = lines.length;
     const maxChars = Math.max(1, Math.floor(input.maxChars ?? DEFAULT_RETRIEVE_MAX_CHARS));
 
@@ -172,6 +490,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
       return {
         found: true,
         ccrId: entry.ccrId,
+        ...(entry.threadId !== undefined ? { threadId: entry.threadId } : {}),
         contentType: entry.contentType,
         ...(entry.sourceLabel !== undefined ? { sourceLabel: entry.sourceLabel } : {}),
         ...(entry.path !== undefined ? { path: entry.path } : {}),
@@ -191,6 +510,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
       return {
         found: true,
         ccrId: entry.ccrId,
+        ...(entry.threadId !== undefined ? { threadId: entry.threadId } : {}),
         contentType: entry.contentType,
         ...(entry.sourceLabel !== undefined ? { sourceLabel: entry.sourceLabel } : {}),
         ...(entry.path !== undefined ? { path: entry.path } : {}),
@@ -219,6 +539,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
       return {
         found: true,
         ccrId: entry.ccrId,
+        ...(entry.threadId !== undefined ? { threadId: entry.threadId } : {}),
         contentType: entry.contentType,
         ...(entry.sourceLabel !== undefined ? { sourceLabel: entry.sourceLabel } : {}),
         ...(entry.path !== undefined ? { path: entry.path } : {}),
@@ -256,6 +577,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
     return {
       found: true,
       ccrId: entry.ccrId,
+      ...(entry.threadId !== undefined ? { threadId: entry.threadId } : {}),
       contentType: entry.contentType,
       ...(entry.sourceLabel !== undefined ? { sourceLabel: entry.sourceLabel } : {}),
       ...(entry.path !== undefined ? { path: entry.path } : {}),
@@ -268,35 +590,76 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
     };
   };
 
-  const recordCompression = (originalChars: number, compressedChars: number) => {
+  const recordCompression = (originalChars: number, compressedChars: number, threadId?: string) => {
     const safeOrig = Math.max(0, Math.floor(originalChars));
     const safeComp = Math.max(0, Math.min(safeOrig, Math.floor(compressedChars)));
-    compressedCallsCount += 1;
-    totalOriginalChars += safeOrig;
-    totalCompressedChars += safeComp;
-    totalSavedChars += safeOrig - safeComp;
+    const saved = safeOrig - safeComp;
+    const tid = normalizeThreadId(threadId);
+
+    globalCompression.compressedCallsCount += 1;
+    globalCompression.totalOriginalChars += safeOrig;
+    globalCompression.totalCompressedChars += safeComp;
+    globalCompression.totalSavedChars += saved;
+
+    const existingThread = threadCompression.get(tid) ?? createEmptyCounters();
+    existingThread.compressedCallsCount += 1;
+    existingThread.totalOriginalChars += safeOrig;
+    existingThread.totalCompressedChars += safeComp;
+    existingThread.totalSavedChars += saved;
+    threadCompression.set(tid, existingThread);
+
+    schedulePersist();
   };
 
-  const getStats = (): CcrStats => ({
-    entriesCount: entries.size,
-    currentBytes,
-    compressedCallsCount,
-    totalOriginalChars,
-    totalCompressedChars,
-    totalSavedChars,
-    tokensSavedEst: Math.round(totalSavedChars / 4),
-  });
+  const getStats = (threadId?: string): CcrStats => {
+    pruneExpired(now());
+    if (threadId === undefined) {
+      return {
+        entriesCount: entries.size,
+        currentBytes,
+        compressedCallsCount: globalCompression.compressedCallsCount,
+        totalOriginalChars: globalCompression.totalOriginalChars,
+        totalCompressedChars: globalCompression.totalCompressedChars,
+        totalSavedChars: globalCompression.totalSavedChars,
+        tokensSavedEst: Math.round(globalCompression.totalSavedChars / 4),
+      };
+    }
+
+    const tid = normalizeThreadId(threadId);
+    let threadEntriesCount = 0;
+    let threadBytes = 0;
+    for (const entry of entries.values()) {
+      if (normalizeThreadId(entry.threadId) === tid) {
+        threadEntriesCount += 1;
+        threadBytes += entry.byteCount;
+      }
+    }
+    const counters = threadCompression.get(tid) ?? createEmptyCounters();
+    return {
+      entriesCount: threadEntriesCount,
+      currentBytes: threadBytes,
+      compressedCallsCount: counters.compressedCallsCount,
+      totalOriginalChars: counters.totalOriginalChars,
+      totalCompressedChars: counters.totalCompressedChars,
+      totalSavedChars: counters.totalSavedChars,
+      tokensSavedEst: Math.round(counters.totalSavedChars / 4),
+    };
+  };
 
   const clear = () => {
+    cancelPendingPersist();
     entries.clear();
     linesCache.clear();
+    threadCompression.clear();
+    globalCompression = createEmptyCounters();
     currentBytes = 0;
-    compressedCallsCount = 0;
-    totalOriginalChars = 0;
-    totalCompressedChars = 0;
-    totalSavedChars = 0;
     nextSeq = 1;
+    schedulePersist();
   };
+
+  if (persistPath !== undefined) {
+    hydrate();
+  }
 
   return {
     put,
@@ -304,6 +667,9 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
     retrieve,
     recordCompression,
     getStats,
+    configurePersistence,
+    hydrate,
+    flush,
     clear,
   };
 }

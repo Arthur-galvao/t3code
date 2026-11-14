@@ -1453,6 +1453,7 @@ export const ServerSettings = Schema.Struct({
   verificationGateMode: VerificationGateMode.pipe(
     Schema.withDecodingDefault(Effect.succeed("auto" as const)),
   ),
+  autoVerifyEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   snoozePresets: SnoozePresetSettings.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_SNOOZE_PRESETS)),
   ),
@@ -1900,6 +1901,7 @@ export const ServerSettingsPatch = Schema.Struct({
   contextCompressionEnabled: Schema.optionalKey(Schema.Boolean),
   outputShaperEnabled: Schema.optionalKey(Schema.Boolean),
   verificationGateMode: Schema.optionalKey(VerificationGateMode),
+  autoVerifyEnabled: Schema.optionalKey(Schema.Boolean),
   snoozePresets: Schema.optionalKey(SnoozePresetSettings),
   hiddenThreadTags: Schema.optionalKey(Schema.Array(Schema.String)),
   hideTaggedThreads: Schema.optionalKey(Schema.Boolean),
