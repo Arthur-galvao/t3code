@@ -458,7 +458,7 @@ const RsiTelemetrySummaryResult = Schema.Struct({
 });
 
 const RsiQueryLessonsTool = Tool.make("rsi_query_lessons", {
-  description: "Query curated RSI lessons filtered by scope, provider, paths, or search text.",
+  description: "Query RSI lessons by scope, provider, paths, or text.",
   parameters: RsiQueryLessonsInput,
   success: RsiQueryLessonsResult,
   failure: OrchestratorMcpFailure,
@@ -471,7 +471,7 @@ const RsiQueryLessonsTool = Tool.make("rsi_query_lessons", {
   .annotate(Tool.Idempotent, true);
 
 const RsiRecordLessonTool = Tool.make("rsi_record_lesson", {
-  description: "Record or reinforce an RSI lesson into the ACE-curated lesson store.",
+  description: "Record or reinforce a curated RSI lesson.",
   parameters: RsiRecordLessonInput,
   success: RsiRecordLessonResult,
   failure: OrchestratorMcpFailure,
@@ -482,7 +482,7 @@ const RsiRecordLessonTool = Tool.make("rsi_record_lesson", {
   .annotate(Tool.Destructive, false);
 
 const RsiTelemetrySummaryTool = Tool.make("rsi_telemetry_summary", {
-  description: "Summarize recent RSI run telemetry, cache hit rates, loop trips, and blocks.",
+  description: "Summarize RSI run telemetry, cache hits, loops, and blocks.",
   parameters: RsiTelemetrySummaryInput,
   success: RsiTelemetrySummaryResult,
   failure: OrchestratorMcpFailure,
@@ -519,8 +519,7 @@ const ContextRetrieveResult = Schema.Struct({
 });
 
 const ContextRetrieveTool = Tool.make("context_retrieve", {
-  description:
-    "Retrieve exact line slices or regex/substring matches from a compressed `[T3 CCR:ccr_XXXX]` output.",
+  description: "Retrieve line ranges or matches from a [T3 CCR:ccr_XXXX] block.",
   parameters: ContextRetrieveInput,
   success: ContextRetrieveResult,
   failure: OrchestratorMcpFailure,

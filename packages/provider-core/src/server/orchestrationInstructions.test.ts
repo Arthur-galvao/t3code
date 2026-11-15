@@ -5,6 +5,7 @@ import {
   T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH,
   T3_CODE_ORCHESTRATION_INSTRUCTIONS,
   T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS,
+  distillTechnicalPromptSpec,
   t3AcpPromptWithInstructions,
   t3OrchestrationPrompt,
   t3OrchestrationSystemPrompt,
@@ -157,5 +158,24 @@ describe("T3 device instructions", () => {
     assert.include(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS, "<output_shaper>");
     assert.include(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS, "context_retrieve");
     assert.isBelow(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS.length, 400);
+  });
+
+  it("distills non-English and underspecified prompts into a terse Technical English Auto-Spec hint", () => {
+    const ptBroad = distillTechnicalPromptSpec(
+      "melhorar o sistema de tela e criar um botão novo com economia de token",
+    );
+    assert.isTrue(ptBroad.isNonEnglish);
+    assert.isTrue(ptBroad.needsClarification);
+    assert.include(ptBroad.domains, "ui-frontend");
+    assert.include(ptBroad.domains, "token-economy");
+    assert.include(ptBroad.specHint ?? "", "[Auto-Spec]");
+    assert.include(ptBroad.specHint ?? "", "ask 1-3 brief clarifying questions");
+
+    const concreteEnglish = distillTechnicalPromptSpec(
+      "Fix the failing parser in apps/server/src/parser.ts",
+    );
+    assert.isFalse(concreteEnglish.isNonEnglish);
+    assert.isFalse(concreteEnglish.needsClarification);
+    assert.isUndefined(concreteEnglish.specHint);
   });
 });

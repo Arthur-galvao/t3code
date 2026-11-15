@@ -9,6 +9,7 @@ Follow these six phases for multi-file features, orchestration changes, provider
 
 ## 1. Explore
 
+- Automatic zero-command pipeline: `<output_shaper>` + `distillTechnicalPromptSpec` automatically convert non-English or broad requests into a concise internal Technical English spec and inject `[Auto-Spec]` at session start (asking 1-3 brief clarifying questions only when critical context is missing), so the user never needs manual slash commands.
 - Read `AGENTS.md` and relevant `docs/internals/` pages (`overview.md`, `effect-services.md`, `testing.md`, `web-ui.md`).
 - Inspect the owning layers before editing:
   - Wire contracts & defaults: `packages/contracts/src/` (`orchestrationV2.ts`, `settings.ts`, `providerPolicy.ts`, `rpc.ts`)
@@ -59,10 +60,11 @@ Follow these six phases for multi-file features, orchestration changes, provider
 ## 5. Verify
 
 - Run the **verify-t3** skill (`.\node_modules\.bin\vp.cmd` scoped `typecheck`, `test run`, `lint`, `check:changed`).
+- Ensure any context handoff across providers (`ContextHandoffService.ts`) reports pending verification files accurately in `## Verification State` and `## Open Next Steps`.
 - Do not report checks as passing unless observed with zero failures after the final edit.
 
 ## 6. Learn
 
-- Apply **`obsidian-brain`** + **`egm-review`** after complex fixes:
-  - Record an ACE-curated lesson via the `rsi_record_lesson` MCP tool (when `RsiService` is enabled) so future sessions inherit it in `[RSI Lessons]` and mirror it into Obsidian (`T3-Brain/00-MOC-Memory.md` and `T3-Brain/Lessons/`).
+- Apply **`obsidian-brain`** + **`egm-review`** automatically after complex fixes:
+  - Record an ACE-curated lesson via `rsi_record_lesson` (repeated tool failures, loop trips, and `wastedReads >= 3` are also auto-distilled by `RsiService`) so future sessions inherit it in `[RSI Lessons]` and sync bidirectionally with Obsidian (`T3-Brain/00-MOC-Memory.md` and `T3-Brain/Lessons/`).
   - Update `docs/internals/` only if an architectural boundary or hidden constraint changed across modules.

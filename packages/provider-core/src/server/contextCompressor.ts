@@ -30,7 +30,7 @@ export interface DetectContentTypeOptions {
   readonly contentTypeHint?: CompressionContentType | undefined;
 }
 
-const DEFAULT_MIN_CHARS = 3_000;
+const DEFAULT_MIN_CHARS = 2_200;
 const MIN_REDUCTION_RATIO = 0.85;
 
 const CRITICAL_JSON_RE =
@@ -232,8 +232,8 @@ function collectObjectSchemaKeys(items: ReadonlyArray<unknown>): ReadonlyArray<s
 function truncateLongStringsInValue(value: unknown, depth = 0): unknown {
   if (depth > 4) return value;
   if (typeof value === "string") {
-    if (value.length > 600 && !CRITICAL_JSON_RE.test(value)) {
-      return `${value.slice(0, 240)} [... ${value.length - 360} chars omitted ...] ${value.slice(-120)}`;
+    if (value.length > 450 && !CRITICAL_JSON_RE.test(value)) {
+      return `${value.slice(0, 200)} [... ${value.length - 300} chars omitted ...] ${value.slice(-100)}`;
     }
     return value;
   }

@@ -1,0 +1,68 @@
+name: Nightly Upstream Sync
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync_upstream_and_release:
+    name: Sync upstream pingdotgg/t3code and trigger Windows build
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Fetch upstream pingdotgg/t3code
+        id: check
+        shell: bash
+        run: |
+          git remote add upstream https://github.com/pingdotgg/t3code.git || git remote set-url upstream https://github.com/pingdotgg/t3code.git
+          git fetch upstream main
+          AHEAD_COUNT="$(git rev-list --count HEAD..upstream/main)"
+          echo "ahead=$AHEAD_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream main into fork main
+        if: steps.check.outputs.ahead != '0'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit upstream/main
+
+      - name: Setup Vite+ for release metadata
+        if: steps.check.outputs.ahead != '0'
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Resolve Nightly version tag and trigger Windows release
+        if: steps.check.outputs.ahead != '0'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $date = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
+          $sha = (& git rev-parse HEAD).Trim()
+          $meta = & node scripts/resolve-nightly-release.ts --date $date --run-number "${{ github.run_number }}" --sha $sha --channel nightly
+          $tagLine = $meta | Where-Object { $_ -like "tag=*" } | Select-Object -First 1
+          $tag = $tagLine.Substring(4)
+          & git tag -f $tag
+          & git push origin main
+          & git push origin $tag --force
+          & gh workflow run fork-windows-release.yml -f tag="$tag" -f prerelease=true

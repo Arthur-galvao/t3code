@@ -11,6 +11,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { type CcrStore, defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
+import { distillTechnicalPromptSpec } from "@t3tools/provider-core/server/orchestrationInstructions";
 
 export const MAX_LESSONS = 25;
 const DEFAULT_SESSION_PREFIX_MAX_CHARS = 600;
@@ -113,6 +114,7 @@ export interface RsiRunTelemetryRecord {
   readonly durationMs: number;
   readonly tokensSavedEst?: number | undefined;
   readonly compressedCallsCount?: number | undefined;
+  readonly failureKey?: string | undefined;
   readonly timestamp: string;
 }
 
@@ -175,6 +177,7 @@ export interface RsiFormatSessionPrefixInput {
   readonly providerInstanceId?: string | undefined;
   readonly threadId?: string | undefined;
   readonly runId?: string | undefined;
+  readonly userPrompt?: string | undefined;
   readonly maxChars?: number | undefined;
 }
 
@@ -721,6 +724,180 @@ function formatObsidianMocMarkdown(lessons: ReadonlyArray<RsiLesson>, updatedAt:
   return lines.join("\n");
 }
 
+function parseFrontmatterScalar(rawValue: string): string {
+  const trimmed = rawValue.trim();
+  if (trimmed === "") return "";
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    if (trimmed.startsWith('"')) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        return typeof parsed === "string" ? parsed : trimmed.slice(1, -1);
+      } catch {
+        return trimmed.slice(1, -1);
+      }
+    }
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function parseFrontmatterArray(rawValue: string): ReadonlyArray<string> {
+  const trimmed = rawValue.trim();
+  if (trimmed === "" || trimmed === "[]") return [];
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item): item is string => typeof item === "string");
+    }
+  } catch {
+    // Support unquoted YAML flow sequences such as [apps/server/**/*.ts]
+  }
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    return trimmed
+      .slice(1, -1)
+      .split(",")
+      .map((part) => parseFrontmatterScalar(part))
+      .filter((part) => part !== "");
+  }
+  return [parseFrontmatterScalar(trimmed)].filter((part) => part !== "");
+}
+
+function parseObsidianLessonMarkdown(
+  raw: string,
+  fileName: string,
+  fallbackNowIso: string,
+): RsiLesson | null {
+  const stem = fileName.replace(/\.md$/i, "").trim();
+  if (stem === "" || stem.startsWith("00-MOC")) return null;
+
+  let body = raw;
+  const meta = new Map<string, string>();
+  const fmMatch = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(raw.trimStart());
+  if (fmMatch !== null) {
+    const fmBlock = fmMatch[1] ?? "";
+    body = fmMatch[2] ?? "";
+    for (const line of fmBlock.split(/\r?\n/)) {
+      const colonIdx = line.indexOf(":");
+      if (colonIdx <= 0) continue;
+      const key = line.slice(0, colonIdx).trim();
+      const val = line.slice(colonIdx + 1).trim();
+      if (key !== "") {
+        meta.set(key, val);
+      }
+    }
+  }
+
+  let headingTitle = "";
+  let currentSection: "guidance" | "trigger" | "rationale" | "other" = "other";
+  const guidanceLines: Array<string> = [];
+  const triggerLines: Array<string> = [];
+  const rationaleLines: Array<string> = [];
+  const fallbackLines: Array<string> = [];
+
+  for (const line of body.split(/\r?\n/)) {
+    const h1Match = /^#\s+(.+)$/.exec(line);
+    if (h1Match !== null && headingTitle === "") {
+      headingTitle = h1Match[1]!.trim();
+      continue;
+    }
+    const h2Match = /^##\s+(.+)$/.exec(line);
+    if (h2Match !== null) {
+      const sectionName = h2Match[1]!.trim().toLowerCase();
+      if (sectionName === "guidance") currentSection = "guidance";
+      else if (sectionName === "trigger condition") currentSection = "trigger";
+      else if (sectionName === "rationale trace") currentSection = "rationale";
+      else currentSection = "other";
+      continue;
+    }
+    if (/^>\s*\*\*(?:Scope|Index):\*\*/i.test(line)) {
+      continue;
+    }
+    if (currentSection === "guidance") guidanceLines.push(line);
+    else if (currentSection === "trigger") triggerLines.push(line);
+    else if (currentSection === "rationale") rationaleLines.push(line);
+    else fallbackLines.push(line);
+  }
+
+  const title = parseFrontmatterScalar(meta.get("title") ?? "") || headingTitle || stem;
+  const guidance = guidanceLines.join("\n").trim() || fallbackLines.join("\n").trim();
+  if (title === "" || guidance === "") return null;
+
+  const globs = normalizeGlobs(parseFrontmatterArray(meta.get("globs") ?? ""));
+  const rawScope = parseFrontmatterScalar(meta.get("scope") ?? "").toLowerCase();
+  const scope: RsiLessonScope =
+    rawScope === "glob" && globs.length > 0
+      ? "glob"
+      : rawScope === "global"
+        ? "global"
+        : globs.length > 0
+          ? "glob"
+          : "global";
+
+  const id =
+    parseFrontmatterScalar(meta.get("id") ?? "") || `obsidian_${normalizeSignaturePart(stem)}`;
+  const key =
+    parseFrontmatterScalar(meta.get("key") ?? "") || `obsidian::${normalizeSignaturePart(title)}`;
+
+  const parsedConfidence = Number(parseFrontmatterScalar(meta.get("confidence") ?? ""));
+  const confidence = clampConfidence(
+    Number.isFinite(parsedConfidence) && parsedConfidence > 0 ? parsedConfidence : 0.75,
+  );
+  const parsedHits = Number.parseInt(parseFrontmatterScalar(meta.get("hits") ?? ""), 10);
+  const hits = Number.isFinite(parsedHits) && parsedHits > 0 ? parsedHits : 1;
+  const createdAt = parseFrontmatterScalar(meta.get("createdAt") ?? "") || fallbackNowIso;
+  const updatedAt = parseFrontmatterScalar(meta.get("updatedAt") ?? "") || fallbackNowIso;
+
+  return {
+    id,
+    key,
+    title,
+    guidance,
+    rationaleTrace: rationaleLines.join("\n").trim(),
+    triggerCondition: triggerLines.join("\n").trim(),
+    scope,
+    globs,
+    confidence,
+    hits,
+    createdAt,
+    updatedAt,
+  };
+}
+
+function buildRecurrenceCountsFromTelemetry(
+  rows: ReadonlyArray<RsiRunTelemetryRecord>,
+): ReadonlyMap<string, number> {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const fallbackKey =
+      row.failureKey ??
+      (row.loopTripped ||
+      row.safetyBlockedCount > 0 ||
+      row.toolErrorCount > 0 ||
+      isFailureOutcome(row.outcome)
+        ? buildAutoLessonKey({
+            provider: row.provider,
+            tool: row.loopTripped
+              ? "circuit_breaker"
+              : row.safetyBlockedCount > 0
+                ? "safety_guard"
+                : "runtime",
+            errorSignature: row.loopTripped
+              ? `loop_${row.outcome}`
+              : row.safetyBlockedCount > 0
+                ? "safety_block"
+                : `run_${row.outcome}`,
+          })
+        : undefined);
+    if (fallbackKey !== undefined) {
+      counts.set(fallbackKey, (counts.get(fallbackKey) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
 export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   readonly persistence?: PersistenceHandles;
   readonly isAutoDistillEnabled?: () => Effect.Effect<boolean>;
@@ -791,24 +968,113 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     );
   });
 
+  const importObsidianLessonsLocked = Effect.fn("RsiService.importObsidianLessonsLocked")(
+    function* (currentLessons: ReadonlyArray<RsiLesson>, nowIso: string) {
+      if (persistence?.resolveObsidianBrainDir === undefined) {
+        return { lessons: currentLessons, changed: false };
+      }
+      const brainDir = yield* persistence.resolveObsidianBrainDir();
+      if (brainDir === null || brainDir.trim() === "") {
+        return { lessons: currentLessons, changed: false };
+      }
+
+      const lessonsDir = persistence.path.join(brainDir, "Lessons");
+      const entries = yield* persistence.fs
+        .readDirectory(lessonsDir)
+        .pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<string>));
+      const markdownEntries = entries.filter((entry) => entry.endsWith(".md"));
+      if (markdownEntries.length === 0) {
+        return { lessons: currentLessons, changed: false };
+      }
+
+      let next = [...currentLessons];
+      let changed = false;
+      for (const fileName of markdownEntries) {
+        const raw = yield* persistence.fs
+          .readFileString(persistence.path.join(lessonsDir, fileName))
+          .pipe(Effect.orElseSucceed(() => ""));
+        if (raw.trim() === "") continue;
+        const parsed = parseObsidianLessonMarkdown(raw, fileName, nowIso);
+        if (parsed === null) continue;
+
+        const existingIdx = next.findIndex(
+          (lesson) => lesson.id === parsed.id || lesson.key === parsed.key,
+        );
+        if (existingIdx < 0) {
+          const curated = curateLessonStore(next, parsed);
+          next = [...curated.lessons];
+          changed = true;
+          continue;
+        }
+
+        const existing = next[existingIdx]!;
+        const globsEqual =
+          existing.globs.length === parsed.globs.length &&
+          existing.globs.every((g, idx) => g === parsed.globs[idx]);
+        const confidenceChanged = Math.abs(parsed.confidence - existing.confidence) >= 0.02;
+        const editedInObsidian =
+          parsed.title !== existing.title ||
+          parsed.guidance !== existing.guidance ||
+          parsed.triggerCondition !== existing.triggerCondition ||
+          parsed.rationaleTrace !== existing.rationaleTrace ||
+          parsed.scope !== existing.scope ||
+          !globsEqual ||
+          confidenceChanged ||
+          parsed.hits > existing.hits ||
+          parsed.updatedAt > existing.updatedAt;
+
+        const strictlyOlder =
+          parsed.updatedAt !== "" &&
+          existing.updatedAt !== "" &&
+          parsed.updatedAt < existing.updatedAt;
+        if (!strictlyOlder && editedInObsidian) {
+          next[existingIdx] = {
+            ...existing,
+            title: parsed.title,
+            guidance: parsed.guidance,
+            triggerCondition: parsed.triggerCondition,
+            rationaleTrace: parsed.rationaleTrace,
+            scope: parsed.scope,
+            globs: parsed.globs,
+            confidence: confidenceChanged ? parsed.confidence : existing.confidence,
+            hits: Math.max(existing.hits, parsed.hits),
+            updatedAt: parsed.updatedAt > existing.updatedAt ? parsed.updatedAt : nowIso,
+          };
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        next.sort((a, b) => lessonUtilityScore(b) - lessonUtilityScore(a));
+      }
+      return { lessons: next, changed };
+    },
+  );
+
   const hydrateLocked = Effect.fn("RsiService.hydrateLocked")(function* () {
     if (yield* Ref.get(hydratedRef)) return;
     if (persistence !== undefined) {
+      const nowIso = DateTime.formatIso(yield* DateTime.now);
       const lessonsRaw = yield* persistence.fs
         .readFileString(persistence.lessonsPath)
         .pipe(Effect.orElseSucceed(() => ""));
-      if (lessonsRaw.trim() !== "") {
-        const loadedLessons = parseLessonsFile(lessonsRaw);
+      let loadedLessons = lessonsRaw.trim() !== "" ? parseLessonsFile(lessonsRaw) : [];
+      const imported = yield* importObsidianLessonsLocked(loadedLessons, nowIso);
+      if (imported.changed) {
+        loadedLessons = imported.lessons;
         yield* Ref.set(lessonsRef, loadedLessons);
-        if (loadedLessons.length > 0) {
-          yield* syncObsidianBrainLocked(loadedLessons);
-        }
+        yield* persistLessonsLocked(loadedLessons);
+      } else if (loadedLessons.length > 0) {
+        yield* Ref.set(lessonsRef, loadedLessons);
+        yield* syncObsidianBrainLocked(loadedLessons);
       }
       const telemetryRaw = yield* persistence.fs
         .readFileString(persistence.telemetryPath)
         .pipe(Effect.orElseSucceed(() => ""));
       if (telemetryRaw.trim() !== "") {
-        yield* Ref.set(telemetryRef, parseTelemetryJsonl(telemetryRaw));
+        const telemetryRows = parseTelemetryJsonl(telemetryRaw);
+        yield* Ref.set(telemetryRef, telemetryRows);
+        yield* Ref.set(recurrenceRef, buildRecurrenceCountsFromTelemetry(telemetryRows));
       }
     }
     yield* Ref.set(hydratedRef, true);
@@ -1103,6 +1369,41 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           });
         }
 
+        const sig = telemetryInput.failureSignature;
+        const normalizedSafetyBlocks = Math.floor(
+          clampNonNegativeNumber(telemetryInput.safetyBlockedCount),
+        );
+        const normalizedToolErrors = Math.floor(
+          clampNonNegativeNumber(telemetryInput.toolErrorCount),
+        );
+        const failureOutcome = isFailureOutcome(telemetryInput.outcome);
+        const hasFailureSignal =
+          telemetryInput.loopTripped ||
+          normalizedSafetyBlocks > 0 ||
+          normalizedToolErrors > 0 ||
+          failureOutcome;
+        const failureTool =
+          sig?.tool ??
+          (telemetryInput.loopTripped
+            ? "circuit_breaker"
+            : normalizedSafetyBlocks > 0
+              ? "safety_guard"
+              : "runtime");
+        const failureErrorSignature =
+          sig?.errorSignature ??
+          (telemetryInput.loopTripped
+            ? `loop_${telemetryInput.outcome}`
+            : normalizedSafetyBlocks > 0
+              ? "safety_block"
+              : `run_${telemetryInput.outcome}`);
+        const recurrenceKey = hasFailureSignal
+          ? buildAutoLessonKey({
+              provider: telemetryInput.provider,
+              tool: failureTool,
+              errorSignature: failureErrorSignature,
+            })
+          : undefined;
+
         const record: RsiRunTelemetryRecord = {
           threadId: telemetryInput.threadId,
           runId: telemetryInput.runId,
@@ -1123,6 +1424,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           ...(resolvedCompressedCallsCount !== undefined
             ? { compressedCallsCount: resolvedCompressedCallsCount }
             : {}),
+          ...(recurrenceKey !== undefined ? { failureKey: recurrenceKey } : {}),
           timestamp: nowIso,
         };
 
@@ -1144,7 +1446,6 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           resolvedAppliedIds.map((id) => id.trim()).filter((id) => id !== ""),
         );
         const successOutcome = isSuccessOutcome(record.outcome);
-        const failureOutcome = isFailureOutcome(record.outcome);
         const cleanSuccess =
           successOutcome &&
           record.toolErrorCount === 0 &&
@@ -1162,34 +1463,9 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         }
 
         if (!autoDistill) return record;
-        const sig = telemetryInput.failureSignature;
-        const hasFailureSignal =
-          record.loopTripped ||
-          record.safetyBlockedCount > 0 ||
-          record.toolErrorCount > 0 ||
-          failureOutcome;
         let distilledForSignature = false;
 
-        if (hasFailureSignal) {
-          const tool =
-            sig?.tool ??
-            (record.loopTripped
-              ? "circuit_breaker"
-              : record.safetyBlockedCount > 0
-                ? "safety_guard"
-                : "runtime");
-          const errorSignature =
-            sig?.errorSignature ??
-            (record.loopTripped
-              ? `loop_${record.outcome}`
-              : record.safetyBlockedCount > 0
-                ? "safety_block"
-                : `run_${record.outcome}`);
-          const recurrenceKey = buildAutoLessonKey({
-            provider: record.provider,
-            tool,
-            errorSignature,
-          });
+        if (hasFailureSignal && recurrenceKey !== undefined) {
           const nextCount = (yield* Ref.get(recurrenceRef)).get(recurrenceKey) ?? 0;
           const updatedCount = nextCount + 1;
           yield* Ref.update(recurrenceRef, (map) => {
@@ -1203,26 +1479,27 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
             const title =
               sig?.title ??
               (record.loopTripped
-                ? `Avoid ${tool} loop (${record.provider})`
-                : `Recurring ${tool} failure (${record.provider})`);
+                ? `Avoid ${failureTool} loop (${record.provider})`
+                : `Recurring ${failureTool} failure (${record.provider})`);
             const guidance =
               sig?.guidance ??
               (record.loopTripped
-                ? `Breaker tripped on ${tool} (${errorSignature}); inspect tool inputs or switch approach before retrying.`
-                : `Repeated ${tool} failures for ${errorSignature}; verify preconditions and paths before re-running.`);
+                ? `Breaker tripped on ${failureTool} (${failureErrorSignature}); inspect tool inputs or switch approach before retrying.`
+                : `Repeated ${failureTool} failures for ${failureErrorSignature}; verify preconditions and paths before re-running.`);
             yield* recordLessonLocked(
               {
                 key: recurrenceKey,
                 provider: record.provider,
-                tool,
-                errorSignature,
+                tool: failureTool,
+                errorSignature: failureErrorSignature,
                 title,
                 guidance,
                 rationaleTrace:
                   sig?.rationaleTrace ??
                   `Auto-distilled from run ${record.runId} (outcome=${record.outcome}, toolErrors=${record.toolErrorCount}, loopTripped=${record.loopTripped}, occurrences=${updatedCount}).`,
                 triggerCondition:
-                  sig?.triggerCondition ?? `${record.provider}:${tool}:${errorSignature}`,
+                  sig?.triggerCondition ??
+                  `${record.provider}:${failureTool}:${failureErrorSignature}`,
                 ...(sig?.scope === undefined ? {} : { scope: sig.scope }),
                 ...(sig?.globs === undefined ? {} : { globs: sig.globs }),
                 confidence: record.loopTripped ? 0.78 : 0.65,
@@ -1230,6 +1507,29 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
               nowIso,
             );
           }
+        }
+
+        if (record.wastedReads >= 3) {
+          yield* recordLessonLocked(
+            {
+              key: buildAutoLessonKey({
+                provider: record.provider,
+                tool: "read_file",
+                errorSignature: "wasted_reads",
+              }),
+              provider: record.provider,
+              tool: "read_file",
+              errorSignature: "wasted_reads",
+              title: `Avoid repeated full-file reads (${record.provider})`,
+              guidance:
+                "Locate symbols first, read bounded line ranges, and use context_retrieve for [T3 CCR:...] blocks instead of re-reading unchanged files.",
+              rationaleTrace: `Auto-distilled token-economy rule from run ${record.runId} (wastedReads=${record.wastedReads}).`,
+              triggerCondition: "Before opening files in repeated search/read cycles",
+              scope: "global",
+              confidence: 0.72,
+            },
+            nowIso,
+          );
         }
 
         // Idle / Post-Success Distillation: extract durable workspace checks or recovery habits.
@@ -1331,10 +1631,17 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
 
   const queryLessons: RsiServiceShape["queryLessons"] = Effect.fn("RsiService.queryLessons")(
     function* (queryInput) {
+      const nowIso = DateTime.formatIso(yield* DateTime.now);
       const lessons = yield* mutex.withPermits(1)(
         Effect.gen(function* () {
           yield* hydrateLocked();
-          return yield* Ref.get(lessonsRef);
+          const current = yield* Ref.get(lessonsRef);
+          const synced = yield* importObsidianLessonsLocked(current, nowIso);
+          if (synced.changed) {
+            yield* Ref.set(lessonsRef, synced.lessons);
+            yield* persistLessonsLocked(synced.lessons);
+          }
+          return synced.lessons;
         }),
       );
       const minConfidence = queryInput?.minConfidence ?? 0;
@@ -1513,6 +1820,10 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     Effect.fn("RsiService.formatSessionPrefixWithMetadata")(function* (prefixInput) {
       const maxChars = Math.max(80, prefixInput.maxChars ?? DEFAULT_SESSION_PREFIX_MAX_CHARS);
       const activePaths = prefixInput.activePaths ?? [];
+      const specHint =
+        prefixInput.userPrompt !== undefined
+          ? distillTechnicalPromptSpec(prefixInput.userPrompt).specHint
+          : undefined;
       const lessons = yield* queryLessons({
         ...(prefixInput.cwd === undefined ? {} : { cwd: prefixInput.cwd }),
         ...(prefixInput.provider === undefined ? {} : { provider: prefixInput.provider }),
@@ -1527,6 +1838,10 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
 
       let prefix = "";
       const lessonIds: Array<string> = [];
+      const reservedSpecChars =
+        specHint !== undefined && maxChars >= specHint.length + 140 ? specHint.length + 1 : 0;
+      const lessonBudget = maxChars - reservedSpecChars;
+
       if (eligible.length > 0) {
         const header = "[RSI Lessons]";
         const lines: Array<string> = [header];
@@ -1535,20 +1850,30 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         for (const lesson of eligible) {
           const line = `- ${lesson.title}: ${lesson.guidance}`;
           const nextLength = currentLength + 1 + line.length;
-          if (nextLength <= maxChars) {
+          if (nextLength <= lessonBudget) {
             lines.push(line);
             lessonIds.push(lesson.id);
             currentLength = nextLength;
             continue;
           }
-          const remaining = maxChars - currentLength - 4;
+          const remaining = lessonBudget - currentLength - 4;
           if (remaining > 20 && lines.length === 1) {
             lines.push(`${line.slice(0, remaining).trimEnd()}...`);
             lessonIds.push(lesson.id);
+            currentLength = lines.join("\n").length;
           }
           break;
         }
-        prefix = lines.length <= 1 ? "" : lines.join("\n");
+        if (lines.length > 1) {
+          if (specHint !== undefined && currentLength + 1 + specHint.length <= maxChars) {
+            lines.push(specHint);
+          }
+          prefix = lines.join("\n");
+        }
+      }
+
+      if (prefix === "" && specHint !== undefined) {
+        prefix = specHint.length <= maxChars ? specHint : specHint.slice(0, maxChars);
       }
 
       if (prefixInput.threadId !== undefined && prefixInput.threadId.trim() !== "") {

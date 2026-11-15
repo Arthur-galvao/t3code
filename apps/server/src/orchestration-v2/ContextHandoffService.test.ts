@@ -618,4 +618,66 @@ it.layer(layerTest)("ContextHandoffService structured cross-provider synthesis",
         assert.notInclude(sideChat, "[T3 CCR:");
       }),
   );
+
+  it("flags unverified source file edits in verification state and open next steps", () => {
+    const now = DateTime.makeUnsafe("2026-11-14T12:00:00.000Z");
+    const threadId = ThreadId.make("thread:unverified-handoff");
+    const summary = ContextHandoffService.buildStructuredHandoffSummary([
+      {
+        id: TurnItemId.make("item:u1"),
+        threadId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "user_message",
+        messageId: MessageId.make("msg:u1"),
+        createdBy: "user",
+        creationSource: "web",
+        inputIntent: "turn_start",
+        attachments: [],
+        text: "Refactor ContextHandoffService verification gate summary.",
+      },
+      {
+        id: TurnItemId.make("item:f1"),
+        threadId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 2,
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "file_change",
+        fileName: "apps/server/src/orchestration-v2/ContextHandoffService.ts",
+        changes: [
+          {
+            operation: "update",
+            path: "apps/server/src/orchestration-v2/ContextHandoffService.ts",
+          },
+        ],
+      },
+    ]);
+    assert.include(
+      summary,
+      "Unverified source edits (apps/server/src/orchestration-v2/ContextHandoffService.ts)",
+    );
+    assert.include(
+      summary,
+      "Verify modified source files (apps/server/src/orchestration-v2/ContextHandoffService.ts) with scoped tests/typecheck",
+    );
+  });
 });

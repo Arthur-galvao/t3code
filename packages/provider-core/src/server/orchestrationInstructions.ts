@@ -55,10 +55,76 @@ export const T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH = deviceToolInstr
   ` Load them with ToolSearch \`select:${T3_CODE_DEVICE_TOOLS.map((tool) => `mcp__t3-code__${tool}`).join(",")}\`.`,
 );
 
-/** Session-invariant terseness instruction appended when output shaper is enabled. */
+/** Session-invariant terseness + automatic prompt-distillation instructions when output shaper is enabled. */
 export const T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS = `<output_shaper>
-Be concise: lead with the answer or diff, skip filler or prompt restatements, and use terse bullets or exact file:line links. Call \`context_retrieve\` only when omitted lines or matches from a \`[T3 CCR:...]\` block are needed.
+Lead with answer/diff; no filler; terse bullets + file:line links. Silently spec non-English/vague prompts in English (reply in user's language); ask <=3 short Qs if unclear. Call \`context_retrieve\` for \`[T3 CCR:...]\`.
 </output_shaper>`;
+
+export interface TechnicalPromptSpec {
+  readonly isNonEnglish: boolean;
+  readonly needsClarification: boolean;
+  readonly domains: ReadonlyArray<string>;
+  readonly specHint: string | undefined;
+}
+
+const NON_ENGLISH_DIACRITICS_RE = /[àáâãçéêíóôõúüñ]/i;
+const PORTUGUESE_SIGNAL_RE =
+  /\b(?:você|voce|para|como|fazer|crie|criar|ajustar|ajuste|melhorar|melhora|corrigir|sistema|arquivo|código|codigo|tela|botão|botao|quero|preciso|olhada|pode|tudo|ainda|sobre|usando|sem)\b/i;
+const BROAD_DESIGN_ACTION_RE =
+  /\b(?:create|build|implement|refactor|optimize|redesign|crie|criar|implementar|refatorar|melhorar|otimizar|sistema|arquitetura)\b/i;
+const CONCRETE_TARGET_RE =
+  /(?:[a-z0-9_-]+\.[a-z0-9]{1,8}|`[^`]+`|(?:apps|packages|src|scripts)\/[a-z0-9_./-]+)/i;
+
+const PROMPT_DOMAIN_MATCHERS: ReadonlyArray<readonly [string, RegExp]> = [
+  [
+    "ui-frontend",
+    /\b(?:ui|frontend|react|css|tailwind|component|modal|button|screen|layout|tela|botão|botao|página|pagina|interface)\b/i,
+  ],
+  [
+    "backend-service",
+    /\b(?:api|server|database|sql|sqlite|service|endpoint|rpc|websocket|servidor|banco|serviço|servico)\b/i,
+  ],
+  [
+    "orchestration-mcp",
+    /\b(?:mcp|agent|subagent|workflow|skill|orchestr|obsidian|rsi|swarm|hook|orquestr|agente|habilidade)\b/i,
+  ],
+  ["token-economy", /\b(?:token|cache|ccr|compress|context|prompt|budget|quota|custo|economia)\b/i],
+  [
+    "build-release",
+    /\b(?:build|release|exe|installer|desktop|github|tag|ci|action|compil|instalador)\b/i,
+  ],
+  ["test-verify", /\b(?:test|vitest|lint|typecheck|oxlint|knip|verify|verifica|teste)\b/i],
+  ["bugfix-debug", /\b(?:fix|bug|error|fail|crash|debug|corrig|erro|falha|quebr)\b/i],
+];
+
+/** Detect non-English or underspecified requests for zero-command Technical English refinement. */
+export function distillTechnicalPromptSpec(prompt: string): TechnicalPromptSpec {
+  const trimmed = prompt.trim();
+  if (trimmed === "" || trimmed.startsWith("/")) {
+    return { isNonEnglish: false, needsClarification: false, domains: [], specHint: undefined };
+  }
+  const isNonEnglish =
+    NON_ENGLISH_DIACRITICS_RE.test(trimmed) || PORTUGUESE_SIGNAL_RE.test(trimmed);
+  const needsClarification =
+    trimmed.length >= 15 &&
+    trimmed.length <= 240 &&
+    BROAD_DESIGN_ACTION_RE.test(trimmed) &&
+    !CONCRETE_TARGET_RE.test(trimmed);
+  const domains = PROMPT_DOMAIN_MATCHERS.flatMap(([tag, re]) => (re.test(trimmed) ? [tag] : []));
+  if (!isNonEnglish && !needsClarification) {
+    return { isNonEnglish, needsClarification, domains, specHint: undefined };
+  }
+  const domainPart = domains.length > 0 ? ` (${domains.slice(0, 4).join(",")})` : "";
+  const clarifyPart = needsClarification
+    ? "; ask 1-3 brief clarifying questions if scope/constraints are ambiguous before editing"
+    : "";
+  return {
+    isNonEnglish,
+    needsClarification,
+    domains,
+    specHint: `[Auto-Spec] Formulate a terse Technical English spec internally${domainPart}${clarifyPart}; reply in user's language.`,
+  };
+}
 
 // ACP only: some ACP agents accept the injected MCP server but never expose
 // its tools, so they need the terminal transport other harnesses never use.

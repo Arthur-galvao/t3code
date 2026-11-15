@@ -728,4 +728,150 @@ describe("RsiService", () => {
         expect(yield* fs.exists(path.join(disabledVaultRoot, "T3-Brain"))).toBe(false);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect(
+    "imports user-created and user-edited Obsidian Lessons notes bidirectionally into lessons.json",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-bidi-" });
+        const customVaultRoot = path.join(tempRoot, "vault");
+        const brainLessonsDir = path.join(customVaultRoot, "T3-Brain", "Lessons");
+        const stateDir = path.join(tempRoot, "state");
+
+        yield* fs.makeDirectory(brainLessonsDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(brainLessonsDir, "custom-obsidian-rule.md"),
+          [
+            "---",
+            'id: "obsidian_custom_rule"',
+            'key: "obsidian::custom_rule"',
+            'title: "Prefer bounded line reads"',
+            "scope: glob",
+            "confidence: 0.88",
+            "hits: 2",
+            'globs: ["apps/server/src/**/*.ts"]',
+            'createdAt: "2026-11-14T10:00:00.000Z"',
+            'updatedAt: "2026-11-14T10:00:00.000Z"',
+            "---",
+            "",
+            "# Prefer bounded line reads",
+            "",
+            "## Guidance",
+            "",
+            "Search symbols first and read bounded StartLine/EndLine slices.",
+            "",
+            "## Trigger Condition",
+            "",
+            "Reading large TypeScript server modules",
+            "",
+          ].join("\n"),
+        );
+
+        const configLayer = ServerConfig.layerTest(stateDir, stateDir);
+        const settingsLayer = Layer.succeed(ServerSettings.ServerSettingsService, {
+          getSettings: Effect.succeed({
+            rsiAutoDistillEnabled: true,
+            obsidianMemorySyncEnabled: true,
+            obsidianVaultPath: customVaultRoot,
+          } as unknown as Effect.Success<
+            ServerSettings.ServerSettingsService["Service"]["getSettings"]
+          >),
+        } as unknown as ServerSettings.ServerSettingsService["Service"]);
+
+        const serviceLayer = RsiService.makeLayer({ persistCcr: false }).pipe(
+          Layer.provide(configLayer),
+          Layer.provide(settingsLayer),
+          Layer.provide(NodeServices.layer),
+        );
+
+        yield* Effect.gen(function* () {
+          const rsi = yield* RsiService;
+          const initialLessons = yield* rsi.queryLessons();
+          expect(initialLessons).toHaveLength(1);
+          expect(initialLessons[0]?.title).toBe("Prefer bounded line reads");
+          expect(initialLessons[0]?.scope).toBe("glob");
+
+          // Edit the canonical mirrored markdown note in Obsidian with a new guidance + later timestamp.
+          yield* fs.writeFileString(
+            path.join(brainLessonsDir, "obsidian_custom_rule.md"),
+            [
+              "---",
+              'id: "obsidian_custom_rule"',
+              'key: "obsidian::custom_rule"',
+              'title: "Prefer bounded line reads"',
+              "scope: glob",
+              "confidence: 0.92",
+              "hits: 3",
+              'globs: ["apps/server/src/**/*.ts"]',
+              'createdAt: "2026-11-14T10:00:00.000Z"',
+              'updatedAt: "2026-11-14T12:00:00.000Z"',
+              "---",
+              "",
+              "## Guidance",
+              "",
+              "Use PowerShell Select-String first and read under 150 lines per call.",
+              "",
+            ].join("\n"),
+          );
+
+          const updatedLessons = yield* rsi.queryLessons();
+          expect(updatedLessons[0]?.guidance).toBe(
+            "Use PowerShell Select-String first and read under 150 lines per call.",
+          );
+          expect(updatedLessons[0]?.confidence).toBe(0.92);
+        }).pipe(Effect.provide(serviceLayer));
+
+        const resolvedStateDir = yield* Effect.gen(function* () {
+          const cfg = yield* ServerConfig.ServerConfig;
+          return cfg.stateDir;
+        }).pipe(Effect.provide(configLayer));
+        const lessonsJson = yield* fs.readFileString(
+          path.join(resolvedStateDir, "rsi", "lessons.json"),
+        );
+        expect(lessonsJson).toContain(
+          "Use PowerShell Select-String first and read under 150 lines per call.",
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "auto-distills token-economy lesson when wastedReads >= 3 and injects Auto-Spec for Portuguese/broad userPrompt",
+    () =>
+      Effect.gen(function* () {
+        const rsi = yield* makeRsiService();
+
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-token",
+          runId: "r-token-1",
+          provider: "claudeAgent",
+          model: "sonnet",
+          usedTokens: 4_000,
+          cachedInputTokens: 2_000,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 4,
+          outcome: "completed",
+          durationMs: 1_500,
+        });
+
+        const lessons = yield* rsi.queryLessons();
+        expect(lessons.some((l) => l.key === "auto::claudeagent::read_file::wasted_reads")).toBe(
+          true,
+        );
+
+        const formatted = yield* rsi.formatSessionPrefixWithMetadata({
+          cwd: "/repo",
+          provider: "claudeAgent",
+          userPrompt: "melhorar a economia de token e criar novo painel na tela",
+          maxChars: 800,
+        });
+        expect(formatted.prefix).toContain("[RSI Lessons]");
+        expect(formatted.prefix).toContain("Avoid repeated full-file reads");
+        expect(formatted.prefix).toContain("[Auto-Spec]");
+        expect(formatted.prefix).toContain("ask 1-3 brief clarifying questions");
+      }),
+  );
 });

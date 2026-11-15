@@ -34,13 +34,13 @@ Generated structure:
   - Backlink header `[[00-MOC-Memory]]`.
   - Structured sections: `## Guidance`, `## Trigger Condition`, and `## Rationale Trace`.
 
-## 3. Synchronization Triggers & Fault Tolerance
+## 3. Bidirectional Synchronization & Fault Tolerance
 
-`RsiService` updates `T3-Brain/` automatically during:
+`RsiService` keeps `lessons.json` and Obsidian `T3-Brain/` synchronized bidirectionally without manual commands:
 
-1. Initial layer hydration (`hydrateLocked`) when existing `lessons.json` entries exist.
-2. Any playbook mutation (`recordLesson`, `demoteLesson`, `boostLessonsLocked`, `deleteLesson`, and post-run auto-distillation in `recordRunTelemetry`).
-3. Pruned/deleted lessons are automatically removed from `Lessons/*.md` so the graph stays free of stale notes.
+1. **Hydration & Live Query Ingestion (`hydrateLocked` & `queryLessons`)**: Scans `<vaultRoot>/T3-Brain/Lessons/*.md` for manually authored or user-edited Markdown notes (YAML frontmatter + `## Guidance` / `## Trigger Condition` / `## Rationale Trace`), merges new/updated rules into `lessons.json`, and refreshes `00-MOC-Memory.md`.
+2. **Outgoing Mutations (`recordLesson`, `demoteLesson`, `boostLessonsLocked`, `deleteLesson`, and auto-distillation in `recordRunTelemetry`)**: Mirrors updates (including token-economy rules when `wastedReads >= 3`) to `Lessons/*.md` and regenerates `00-MOC-Memory.md`.
+3. Pruned/deleted lessons are automatically removed from `Lessons/*.md` so the graph stays free of stale notes and deleted items are not re-imported.
 4. Filesystem sync errors log a warning and never block orchestration turns or corrupt `lessons.json`.
 
 ## 4. Agent Usage Rules

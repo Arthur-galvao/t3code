@@ -1738,7 +1738,8 @@ export const layer: Layer.Layer<
                 providerInstanceId: run.providerInstanceId,
                 threadId: projection.thread.id,
                 runId: run.id,
-                maxChars: 600,
+                userPrompt: userText,
+                maxChars: 800,
               })
               .pipe(
                 Effect.map((result) => result.prefix),

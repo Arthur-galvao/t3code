@@ -28,6 +28,7 @@ import {
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { createOrchestrationV2TurnItemVisibility } from "@t3tools/shared/orchestrationV2Timeline";
 import type { ProjectionStoreV2Shape } from "./ProjectionStore.ts";
+import { collectVerificationStateFromTurnItems } from "./VerificationGate.ts";
 
 export class ContextHandoffPrepareError extends Schema.TaggedError<ContextHandoffPrepareError>()(
   "ContextHandoffPrepareError",
@@ -458,6 +459,21 @@ export function buildStructuredHandoffSummary(
     decisionLines.length === 0
       ? ["- No key decisions recorded."]
       : decisionLines.slice(-6).map((line) => (line.startsWith("- ") ? line : `- ${line}`));
+
+  const verificationState = collectVerificationStateFromTurnItems(items);
+  if (
+    verificationState.editsSinceLastVerify > 0 &&
+    !verificationState.lastVerifyPassed &&
+    verificationState.modifiedFiles.length > 0
+  ) {
+    verificationByCmd.set(
+      "__unverified_edits__",
+      `Unverified source edits (${verificationState.modifiedFiles.slice(0, 6).join(", ")}): verification required before completion`,
+    );
+    openSteps.unshift(
+      `Verify modified source files (${verificationState.modifiedFiles.slice(0, 5).join(", ")}) with scoped tests/typecheck`,
+    );
+  }
 
   const fileEntries = Array.from(filesByPath.values());
   const fileBullets =
