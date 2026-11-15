@@ -15,6 +15,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FiberMap from "effect/FiberMap";
+import * as FiberSet from "effect/FiberSet";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -434,6 +435,7 @@ const make = Effect.gen(function* () {
       );
     }
   });
+  const refreshes = yield* FiberSet.make<void>();
 
   const finalize: RunFinalizationService["Service"]["finalize"] = Effect.fn(
     "RunFinalizationService.finalize",
@@ -454,7 +456,8 @@ const make = Effect.gen(function* () {
       );
     const cwd = projection.checkpointScopes.find((scope) => scope.id === input.scopeId)?.cwd;
     if (cwd !== undefined) {
-      // Retrying a display refresh after the checkpoint is durable blocks the next turn.
+      // The refresh only updates the display, so the thread's next turn must not wait for it.
+      // Never replaced by a newer one: back-to-back turns would interrupt each before it publishes.
       yield* observer.refresh({ cwd, threadId: input.threadId, runId: input.runId }).pipe(
         Effect.catchTags({
           RunFinalizationRefreshError: (cause) =>
@@ -463,6 +466,7 @@ const make = Effect.gen(function* () {
               cause,
             }),
         }),
+        FiberSet.run(refreshes),
       );
     }
     yield* evaluateVerificationAndTelemetry({

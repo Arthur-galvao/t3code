@@ -49,5 +49,6 @@ node_modules/
 
 # pnpm content-addressable store; never belongs in the repo.
 .pnpm-store/
+/packages/ssh/.ssh-launcher-test-*/
 Abrir-T3Code*.bat
 Gerar-Instalador-T3Code.bat

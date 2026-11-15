@@ -296,7 +296,7 @@ describe("AntigravityAdapterV2 compaction", () => {
         assert.isUndefined(session.compactThread);
         assert.equal(session.providerSession.capabilities.turns.supportsNativeGoals, nativeGoals);
         assert.equal((yield* adapter.getCapabilities()).turns.supportsNativeGoals, nativeGoals);
-      }).pipe(Effect.provide(layerSession), Effect.scoped),
+      }).pipe(Effect.provide(layerSession)),
   );
 });
 
@@ -352,7 +352,7 @@ describe("AntigravityAdapterV2 session open", () => {
         error._tag === "ProviderAdapterOpenSessionError" && error.requiresSignIn,
         requiresSignIn,
       );
-    }).pipe(Effect.provide(layerSession), Effect.scoped),
+    }).pipe(Effect.provide(layerSession)),
   );
 });
 
@@ -500,7 +500,7 @@ describe("AntigravityAdapterV2 client file system", () => {
         );
         assert.equal(viaInsideLink.content, "inside");
       }
-    }).pipe(Effect.provide(layerSession), Effect.scoped),
+    }).pipe(Effect.provide(layerSession)),
   );
 
   it.effect("blocks secret file reads while allowing .env.example via client file system", () =>
@@ -579,7 +579,7 @@ describe("AntigravityAdapterV2 client file system", () => {
         context("fs/read_text_file"),
       );
       assert.equal(envExampleAllowed.content, "API_KEY=\n");
-    }).pipe(Effect.provide(layerSession), Effect.scoped),
+    }).pipe(Effect.provide(layerSession)),
   );
 
   it.effect(
@@ -982,7 +982,7 @@ describe("AntigravityAdapterV2 workspace changes", () => {
         context,
       ).pipe(Effect.exit);
       assert.isTrue(Exit.isFailure(fromA), "the previous workspace is no longer readable");
-    }).pipe(Effect.provide(layerSession), Effect.scoped),
+    }).pipe(Effect.provide(layerSession)),
   );
 });
 
@@ -1262,7 +1262,7 @@ describe("AntigravityAdapterV2 html_render pages", () => {
       assert.strictEqual(yield* mcpSessions.takeHtmlRender(threadId, report), undefined);
       assert.strictEqual(yield* mcpSessions.takeHtmlRender(threadId, failed), undefined);
       assert.strictEqual(yield* mcpSessions.takeHtmlRender(threadId, errored), undefined);
-    }).pipe(Effect.provide(layerSession), Effect.scoped),
+    }).pipe(Effect.provide(layerSession)),
   );
 });
 
@@ -1470,7 +1470,7 @@ describe("AntigravityAdapterV2 subagent reads", () => {
       assert.deepEqual(read("call_missing"), failed);
       assert.deepEqual(read("call_denied"), failed);
       assert.deepEqual(read("call_unseen"), failed);
-    }).pipe(Effect.provide(layerSession), Effect.scoped),
+    }).pipe(Effect.provide(layerSession)),
   );
 });
 
@@ -1668,7 +1668,7 @@ describe("AntigravityAdapterV2 session system prompt", () => {
           assert.include(sent, "<pull_request_linking>");
         }
         assert.include(sent, "<output_shaper>");
-      }).pipe(Effect.provide(layerSession), Effect.scoped),
+      }).pipe(Effect.provide(layerSession)),
   );
 
   it.live("omits output shaper instructions when host settings disable outputShaperEnabled", () =>

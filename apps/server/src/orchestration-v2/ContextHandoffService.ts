@@ -547,7 +547,7 @@ function summarizeDeltaItem(item: OrchestrationV2TurnItem): string | null {
         : `- Command (${outcome}): ${command}`;
     }
     case "file_change":
-      return `- File change: ${compactText(item.changes?.map((change) => change.path).join(", ") ?? item.fileName, 400)}`;
+      return `- File change: ${compactText(item.changes?.length ? item.changes.map((change) => change.path).join(", ") : item.fileName, 400)}`;
     case "checkpoint":
       return `- Checkpoint: ${item.files.length} files`;
     case "proposed_plan":

@@ -10,12 +10,12 @@ on:
         description: "Release tag to publish (for manual runs)"
         type: string
         required: true
-        default: "v0.1.9-custom.1"
+        default: "v0.1.10-nightly.20261114.4709"
       prerelease:
         description: "Mark GitHub Release as prerelease"
         type: boolean
         required: false
-        default: false
+        default: true
 
 permissions:
   contents: write
