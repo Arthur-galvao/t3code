@@ -116,9 +116,11 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
      docked sheets, then the floating preview player (47–49, see
      previewMiniPlayerLayout.ts), then dialogs and popovers (50 and up). */
   --z-sheet: 46;
-  --glass-blur: 12px;
-  --glass-opacity: 80%;
-  --glass-saturation: 1.14;
+  --in-oklab: ;
+  --in-oklch: ;
+  --glass-blur: 20px;
+  --glass-opacity: 68%;
+  --glass-saturation: 1.85;
   --desktop-window-right-resize-inset: 0px;
   --workspace-topbar-height: 52px;
   --workspace-controls-top: 0px;
@@ -146,8 +148,9 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
     --appearance-contrast-target: white;
     --app-scrollbar-thumb: rgb(255 255 255 / 8%);
     --app-scrollbar-thumb-hover: rgb(255 255 255 / 12%);
-    --glass-blur: 16px;
-    --glass-saturation: 1.08;
+    --glass-blur: 22px;
+    --glass-opacity: 62%;
+    --glass-saturation: 1.95;
   }
 }
 
@@ -2639,4 +2642,119 @@ code {
 
 .messages-timeline-scroll:focus-visible {
   outline: none;
+}
+
+@supports (background: linear-gradient(in oklab, white, black)) {
+  :root {
+    --in-oklab: in oklab;
+    --in-oklch: in oklch;
+  }
+}
+
+/* Liquid Glass / Glassmorphism + Animated ASCII Backdrop shell overrides */
+[data-slot="sidebar-wrapper"] {
+  position: relative;
+  isolation: isolate;
+  background: transparent !important;
+}
+
+.liquid-glass-ambient-glow {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 16% 18%, rgb(56 189 248 / 14%), transparent 46%),
+    radial-gradient(circle at 84% 16%, rgb(168 85 247 / 13%), transparent 48%),
+    radial-gradient(circle at 52% 84%, rgb(16 185 129 / 10%), transparent 52%);
+  pointer-events: none;
+}
+
+.liquid-glass-specular-sheen {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    135deg var(--in-oklab),
+    rgb(255 255 255 / 12%) 0%,
+    rgb(255 255 255 / 2%) 45%,
+    rgb(56 189 248 / 8%) 100%
+  );
+  mix-blend-mode: soft-light;
+  pointer-events: none;
+}
+
+[data-app-sidebar] [data-slot="sidebar-inner"],
+[data-slot="sidebar-inset"],
+[data-chat-header] {
+  isolation: isolate;
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+}
+
+[data-app-sidebar] [data-slot="sidebar-inner"] {
+  background-color: color-mix(in oklab, var(--sidebar) 62%, transparent) !important;
+  background-image: linear-gradient(
+    145deg var(--in-oklab),
+    rgb(255 255 255 / 9%) 0%,
+    rgb(255 255 255 / 2%) 48%,
+    rgb(56 189 248 / 5%) 100%
+  );
+  border-inline-end: 1px solid rgb(255 255 255 / 14%);
+  box-shadow:
+    0 16px 40px -16px rgb(0 0 0 / 42%),
+    inset 0 1px 1px rgb(255 255 255 / 20%),
+    inset -1px 0 1px rgb(168 85 247 / 12%);
+}
+
+[data-slot="sidebar-inset"] {
+  position: relative;
+  z-index: 1;
+  background-color: color-mix(in oklab, var(--background) 64%, transparent) !important;
+  box-shadow:
+    inset 0 1px 1px rgb(255 255 255 / 16%),
+    inset 1px 0 1px rgb(56 189 248 / 10%);
+}
+
+[data-chat-header] {
+  background-color: color-mix(in oklab, var(--background) 56%, transparent) !important;
+  border-bottom: 1px solid rgb(255 255 255 / 12%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 16%);
+}
+
+[data-slot="card"],
+.chat-composer-shell {
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  background-color: color-mix(in oklab, var(--card) 68%, transparent) !important;
+  box-shadow:
+    0 12px 32px -12px rgb(0 0 0 / 32%),
+    inset 0 1px 1px rgb(255 255 255 / 22%),
+    inset 0 -1px 1px rgb(168 85 247 / 12%);
+}
+
+.liquid-glass-hud-pill {
+  isolation: isolate;
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  background-color: color-mix(in oklab, var(--popover) 66%, transparent);
+  border: 1px solid rgb(255 255 255 / 18%);
+  box-shadow:
+    0 10px 28px -8px rgb(0 0 0 / 45%),
+    inset 0 1px 1px rgb(255 255 255 / 24%),
+    inset 0 -1px 1px rgb(56 189 248 / 14%);
+}
+
+.liquid-glass-hud-btn {
+  color: var(--muted-foreground);
+  border: 1px solid transparent;
+}
+
+.liquid-glass-hud-btn:hover {
+  color: var(--foreground);
+  background-color: rgb(255 255 255 / 10%);
+}
+
+.liquid-glass-hud-btn[data-active="true"] {
+  color: var(--foreground);
+  background-color: color-mix(in oklab, var(--primary) 24%, transparent);
+  border-color: rgb(56 189 248 / 38%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 22%);
 }
