@@ -4267,8 +4267,16 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           yield* Effect.sleep(MCP_TOOL_RELOAD_SETTLE);
         }
       }
+      const pythonReplMode = yield* host.settings.get.pipe(
+        Effect.map((settings) => settings.pythonReplMode),
+        Effect.orElseSucceed(() => false),
+      );
       const instructions = [
-        buildRuntimeInstructions({ harness: "OpenCode", model: turnInput.modelSelection.model }),
+        buildRuntimeInstructions({
+          harness: "OpenCode",
+          model: turnInput.modelSelection.model,
+          ...(mcpAvailable && pythonReplMode ? { pythonRepl: "alongside" as const } : {}),
+        }),
         t3OrchestrationSystemPrompt(mcpAvailable, mcpSession?.capabilities?.has("device") === true),
         mcpAvailable
           ? "To wait for a background shell you started (tests, a build), call `t3_background_wait` with its shell ID before you end your turn. Do not mark work you leave running, or PRs."

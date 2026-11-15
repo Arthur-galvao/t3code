@@ -3462,7 +3462,11 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
 
         // OpenCode runs each step with the agent and system prompt of the latest
         // user message, so every prompt in a turn, steers included, repeats them.
-        const turnPromptOptions = (turn: ActiveOpenCodeTurn, outputShaperEnabled: boolean) => {
+        const turnPromptOptions = (
+          turn: ActiveOpenCodeTurn,
+          outputShaperEnabled: boolean,
+          pythonRepl: boolean,
+        ) => {
           const agent =
             getModelSelectionStringOptionValue(turn.modelSelection, "agent") ??
             (turn.runtimePolicy.interactionMode === "plan" ? "plan" : undefined);
@@ -3476,6 +3480,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 harness: "OpenCode",
                 model: turn.modelSelection.model,
                 outputShaperEnabled,
+                ...(pythonRepl ? { pythonRepl: "alongside" as const } : {}),
               }),
             ]
               .filter(Boolean)
@@ -3927,7 +3932,12 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   sessionID: sessionId,
                   messageID: turn.admissionMessageId!,
                   model: parsedModel,
-                  ...turnPromptOptions(turn, serverSettings.outputShaperEnabled),
+                  ...turnPromptOptions(
+                    turn,
+                    serverSettings.outputShaperEnabled,
+                    serverSettings.pythonReplMode &&
+                      (yield* mcpSessions.read(turn.threadId)) !== undefined,
+                  ),
                   parts,
                 },
                 admissionAbortController!,
@@ -4078,7 +4088,12 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   sessionID: sessionId,
                   messageID: turn.admissionMessageId,
                   model: parsedModel,
-                  ...turnPromptOptions(turn, serverSettings.outputShaperEnabled),
+                  ...turnPromptOptions(
+                    turn,
+                    serverSettings.outputShaperEnabled,
+                    serverSettings.pythonReplMode &&
+                      (yield* mcpSessions.read(turn.threadId)) !== undefined,
+                  ),
                   parts,
                 },
                 admissionAbortController!,

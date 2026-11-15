@@ -569,6 +569,25 @@
       "supportsTranslation": false
     },
     {
+      "id": "TalkMate/fluid-speech-mini-gguf",
+      "revision": "58fcb842258638a313aa619f1e5d547bb811b193",
+      "name": "Fluid Speech Mini",
+      "description": "English dictation that ignores other voices in the room",
+      "filename": "fluid-speech-mini-q4k.gguf",
+      "size": 506663584,
+      "sha256": "0bff22e9947f79cd1fe0d1a5f3a95fcca07ecf90a7e9cb56a09bc923b1d15297",
+      "license": "cc-by-4.0",
+      "languages": ["en"],
+      "benchmark": {
+        "accuracy": { "en": { "grade": "A-", "errorPercent": 4.53 } },
+        "secondsPer30s": { "cpu": null, "accelerated": null }
+      },
+      "recommended": false,
+      "supportsStreaming": false,
+      "supportsLanguageDetection": false,
+      "supportsTranslation": false
+    },
+    {
       "id": "handy-computer/Qwen3-ASR-0.6B-gguf",
       "revision": "e4e16599b900eb0cb36e524514756bb92eb092b7",
       "name": "Qwen3-ASR 0.6B",

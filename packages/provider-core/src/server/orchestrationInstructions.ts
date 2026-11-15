@@ -22,6 +22,17 @@ Ordinary coding tasks need no T3 tools.
 
 - Answer data with a trend or comparison with a chart and show any visual the user asks for here: pass an HTML file path or inline HTML to \`html_preview\`, then \`html_render\`. A screenshot on disk or a text description doesn't show it. Never start a server for it. Page tools write only on user request. Never use them to show results. Asked for an image to post, send or use elsewhere: a \`.png\` file and its path, never \`html_render\`.
 - Never use \`preview_*\` unasked to verify or show your own edit. Use them when the current request asks for browser work, including recording edits, or names a page or tab. Don't repeat preview calls from an earlier turn. Public pages: web fetch or search unless browser work was asked; then preview tools only, no web fetch. Close a tab you opened before you reply, unless the user asked for it or uses it.`,
+  `### Model routing and advisor
+
+Subscription quota is the budget. Give each subtask to the cheapest model that can do it well; a model the user names always wins. Do a task yourself when it takes only a few tool calls, because a delegate starts cold.
+
+- Search, inventory, reading logs or files, classification, mechanical edits: Claude Haiku 5.5 (\`high\`), or an OpenCode free model when quality matters little.
+- Implementation from a clear spec, tests, routine fixes, scripts: Gemini 4 Hydrogen (\`medium\`; its quota is separate from Claude's), else Claude Sonnet 5.5.
+- UI and visual work, or very large inputs: Gemini 4 Argon (\`high\`).
+- Cross-cutting design, hard debugging, running a long multi-agent job: Claude Opus 5.5 (\`medium\`; \`high\` only once stuck).
+- Advisor: Claude Fable 5.2 (\`medium\`). Unless you are Fable or a delegated child, consult it at three moments only: before committing to a plan that spans several files or is hard to undo, after two failed attempts at the same problem, and before handing back a non-trivial change. Use your native advisor tool when you have one; otherwise one \`delegate_task\` with \`role:"review"\` whose brief gives the goal, what you did or plan, the exact doubt and the relevant paths, and asks for a verdict under 200 words. It advises; it never implements. Trivial tasks get no advisor. Fable unavailable: Claude Opus 5.5 (\`xhigh\`), the one switch you may make unasked.
+
+Write each delegate brief so it stands alone: goal, what done looks like, constraints, paths, and the shape of the report you want back.`,
 ];
 
 export const T3_CODE_ORCHESTRATION_INSTRUCTIONS = `

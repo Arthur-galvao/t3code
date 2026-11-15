@@ -26,7 +26,7 @@ export const SPEECH_MODELS: readonly SpeechModel[] = catalog.models.map((model) 
   speed: 0,
 }));
 
-export const DEFAULT_SPEECH_MODEL_ID = "handy-computer/parakeet-unified-en-0.6b-gguf";
+export const DEFAULT_SPEECH_MODEL_ID = "handy-computer/parakeet-ultra-gguf";
 export const getSpeechModel = (modelId: string): SpeechModel | undefined =>
   SPEECH_MODELS.find((model) => model.id === modelId);
 

@@ -21,6 +21,7 @@ const ALL_MCP_CAPABILITIES = [
   "worktree",
   "device",
   "pull-requests",
+  "python",
 ] as const;
 export type McpCapability = (typeof ALL_MCP_CAPABILITIES)[number];
 
@@ -178,6 +179,13 @@ export const hiddenFromSubagents = (): boolean => {
   const fiber = Fiber.getCurrent();
   const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
   return scope?.thread?.subagent !== true;
+};
+
+/** `McpSchema.EnabledWhen` for `python`, listed to thread callers while Python REPL mode is on. */
+export const pythonReplEnabled = (): boolean => {
+  const fiber = Fiber.getCurrent();
+  const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
+  return scope?.capabilities.has("python") === true;
 };
 
 /** `McpSchema.EnabledWhen` for tools that only serve links, hidden while the beta is off. */

@@ -8,6 +8,7 @@ import type {
   ThreadLinkedPullRequest,
   ThreadPullRequestLink,
 } from "@t3tools/contracts";
+import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { lazy, Suspense } from "react";
 import SideChatPane from "./SideChatPane";
@@ -31,6 +32,9 @@ const PreviewPanel = lazy(() =>
 const DiffPanel = lazy(() => import("../DiffPanel"));
 const DevicePanel = lazy(() =>
   import("../device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
+);
+const UsagePanel = lazy(() =>
+  import("../usage/UsagePanel").then((module) => ({ default: module.UsagePanel })),
 );
 const FilePreviewPanel = lazy(() => import("../files/FilePreviewPanel"));
 
@@ -79,6 +83,7 @@ export function RightPanelSurfaceContent(props: {
   readonly pullRequest: RightPanelPullRequestProps;
   readonly files: RightPanelFileProps;
   readonly sideChatParentPanel: SideChatParentPanel;
+  readonly contextWindow: ContextWindowSnapshot | null;
 }) {
   const { surface, threadRef, visible, onCloseSurface } = props;
   if (surface === null) return null;
@@ -114,6 +119,16 @@ export function RightPanelSurfaceContent(props: {
             composerDraftTarget={props.composerDraftTarget}
             workspaceMutationId={props.workspaceMutationId}
             visible={visible}
+          />
+        </Suspense>
+      );
+    case "usage":
+      return (
+        <Suspense fallback={null}>
+          <UsagePanel
+            environmentId={props.environmentId}
+            threadId={threadRef.threadId}
+            contextWindow={props.contextWindow}
           />
         </Suspense>
       );

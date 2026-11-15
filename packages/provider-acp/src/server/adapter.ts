@@ -8336,13 +8336,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               : { previousState: previousInstructionState }),
           });
           const sessionSetup = yield* Ref.get(activeSessionSetup);
-          const outputShaperEnabled =
+          const serverSettings =
             host.settings === undefined
-              ? DEFAULT_SERVER_SETTINGS.outputShaperEnabled
-              : yield* host.settings.get.pipe(
-                  Effect.map((settings) => settings.outputShaperEnabled),
-                  Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS.outputShaperEnabled),
-                );
+              ? DEFAULT_SERVER_SETTINGS
+              : yield* host.settings.get.pipe(Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS));
+          const { outputShaperEnabled } = serverSettings;
           const runtimeInstructions = buildRuntimeInstructions({
             harness: flavor.runtimeHarness ?? driver,
             model: turnInput.modelSelection.model,
@@ -8350,6 +8348,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               sessionSetup === null ||
               flavor.sessionCarriesPullRequestLinking?.(sessionSetup.initializeResult) !== true,
             outputShaperEnabled,
+            ...(serverSettings.pythonReplMode && mcpSession !== undefined
+              ? { pythonRepl: "alongside" as const }
+              : {}),
           });
           // The agent keeps its own history, so resend only after compaction or when the text changes.
           const sendRuntimeInstructions =

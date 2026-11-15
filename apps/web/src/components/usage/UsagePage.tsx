@@ -11,10 +11,6 @@ import {
 } from "@t3tools/contracts";
 import { CircleAlertIcon, ChevronDownIcon, InfoIcon, SlidersHorizontalIcon } from "lucide-react";
 import { useEffect, useEffectEvent, useRef, useState } from "react";
-import { settlePromise } from "@t3tools/client-runtime/state/runtime";
-import * as AsyncResult from "effect/reactivity/AsyncResult";
-import * as Cause from "effect/Cause";
-import { refreshUsageLimits } from "@t3tools/client-runtime/state/usage";
 import {
   updatingProvidersLabel,
   usageEnvironmentProgress,
@@ -34,12 +30,11 @@ import { usePrimarySettings } from "../../hooks/useSettings";
 import { resolveHour12 } from "../../timestampFormat";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { environmentPresentations } from "../../state/presentation";
-import { primaryServerKeybindingsAtom, serverEnvironment } from "../../state/server";
+import { primaryServerKeybindingsAtom } from "../../state/server";
 import { isCommandPaletteOpen } from "../../commandPaletteBus";
 import { isModelPickerOpen } from "../../modelPickerVisibility";
 import { shortcutLabelForCommand } from "../../keybindings";
 import { useUsage, type EnvironmentUsageStatus } from "../../state/usage";
-import { useAtomCommand } from "../../state/use-atom-command";
 import {
   enumerateDays,
   enumerateHourStarts,
@@ -78,6 +73,7 @@ import {
 } from "../WorkspaceBreadcrumb";
 import { WorkspacePageContainer } from "../WorkspacePageContainer";
 import { UsageLimitsSection } from "./UsageLimits";
+import { useRefreshUsageLimits } from "./useRefreshUsageLimits";
 import { UsagePriceOverrides } from "./UsagePriceOverrides";
 import { UsageProviderChart } from "./UsageProviderChart";
 import { SpeedPremium, UsageModelDialog } from "./UsageModelDialog";
@@ -218,14 +214,9 @@ export function UsagePage() {
   const shownHourly = shownWindow.resolution === "hour";
   const refreshingUsage = isRefreshing && !showingLimits;
   const showingKept = shown !== null && shown.window !== window;
-  const presentations = useAtomValue(environmentPresentations.presentationsAtom);
   const presentationsWithProviders = useAtomValue(
     environmentPresentations.presentationsWithProvidersAtom,
   );
-  const refreshProviders = useAtomCommand(serverEnvironment.refreshProviders, {
-    reportFailure: false,
-  });
-
   const canReadDiagnostics = selectedEnvironments.some(
     (environment) => environment.canReadDiagnostics,
   );
@@ -247,25 +238,8 @@ export function UsagePage() {
     if (nextMetric === "limits") setLimitsNow(Date.now());
     updatePreferences({ metric: nextMetric });
   };
-  const refreshLimits = (automatic = false) =>
-    // Settled so the timestamp still advances when a refresh throws.
-    settlePromise(() =>
-      Promise.all(
-        Array.from(presentations, ([environmentId, presentation]) => {
-          if (selectedEnvironmentIds !== null && !selectedEnvironmentIds.has(environmentId)) return;
-          if (presentation.connection.phase === "connected" && presentation.serverConfig !== null) {
-            return refreshUsageLimits(
-              environmentId,
-              () => refreshProviders({ environmentId, input: {} }),
-              automatic,
-            );
-          }
-        }),
-      ),
-    ).then((result) => {
-      setLimitsNow(Date.now());
-      if (!AsyncResult.isSuccess(result)) throw Cause.squash(result.cause);
-    });
+  const refreshSelectedLimits = useRefreshUsageLimits(selectedEnvironmentIds, showingLimits);
+  const refreshLimits = () => refreshSelectedLimits().finally(() => setLimitsNow(Date.now()));
   const onUsageKeyDown = useEffectEvent((event: KeyboardEvent) => {
     if (
       event.defaultPrevented ||
@@ -321,24 +295,6 @@ export function UsagePage() {
       setIsRefreshing(false);
     });
   };
-  const connectedLimitsEnvironments = [...presentations]
-    .filter(
-      ([environmentId, presentation]) =>
-        presentation.connection.phase === "connected" &&
-        presentation.serverConfig !== null &&
-        (selectedEnvironmentIds === null || selectedEnvironmentIds.has(environmentId)),
-    )
-    .map(([environmentId]) => environmentId)
-    .sort()
-    .join(",");
-  const autoRefreshLimits = useEffectEvent(() => {
-    void refreshLimits(true);
-  });
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- refreshes provider limits from the server when the connected environment set changes
-  useEffect(() => {
-    if (showingLimits && connectedLimitsEnvironments) autoRefreshLimits();
-  }, [showingLimits, connectedLimitsEnvironments]);
-
   const days = enumerateDays(shownWindow.sinceDay, shownWindow.untilDay);
   const hours =
     shownWindow.sinceTime === undefined || shownWindow.untilTime === undefined
@@ -1024,7 +980,7 @@ function UsageOverview({
   );
 }
 
-function ProviderMark({
+export function ProviderMark({
   provider,
   className,
 }: {

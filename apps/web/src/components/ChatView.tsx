@@ -2392,6 +2392,7 @@ export default function ChatView(props: ChatViewProps) {
     addFilesSurfaceStable,
     addPullRequestSurfaceStable,
     addPullRequestsSurfaceStable,
+    addUsageSurfaceStable,
     closePreviewPanelStable,
     copyRightPanelFilePathStable,
     createBrowserSurface,
@@ -3243,6 +3244,7 @@ export default function ChatView(props: ChatViewProps) {
       onSendAnnotation={sendPreviewAnnotationStable}
       onCloseSurface={closeRightPanelSurface}
       sideChatParentPanel={sideChatParentPanel}
+      contextWindow={activeContextWindow}
       terminal={{
         launchContext: activeTerminalLaunchContext ?? null,
         keybindings,
@@ -4032,6 +4034,7 @@ export default function ChatView(props: ChatViewProps) {
           onAddBrowserInProfile={createBrowserSurfaceStable}
           onAddTerminal={addTerminalSurfaceStable}
           onAddDiff={addDiffSurfaceStable}
+          onAddUsage={addUsageSurfaceStable}
           onAddFiles={addFilesSurfaceStable}
           onAddPullRequest={addPullRequestSurfaceStable}
           onAddPullRequests={addPullRequestsSurfaceStable}

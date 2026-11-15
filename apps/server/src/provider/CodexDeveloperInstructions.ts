@@ -36,6 +36,7 @@ export interface CodexRuntimeInfo {
   readonly modelName?: string | undefined;
   readonly reasoningEffort?: string | undefined;
   readonly outputShaperEnabled?: boolean;
+  readonly pythonRepl?: "only" | "alongside";
 }
 
 /** Keep this outside collaboration mode; model-catalog mode text overrides client developer_instructions. */

@@ -1396,7 +1396,7 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed({ openai: "", xai: "", openrouter: "" })),
   ),
   speechModelId: Schema.String.pipe(
-    Schema.withDecodingDefault(Effect.succeed("handy-computer/parakeet-unified-en-0.6b-gguf")),
+    Schema.withDecodingDefault(Effect.succeed("handy-computer/parakeet-ultra-gguf")),
   ),
   speechAcceleration: SpeechAcceleration.pipe(Schema.withDecodingDefault(Effect.succeed("auto"))),
   speechModelUnloadTimeout: SpeechModelUnloadTimeout.pipe(
@@ -1462,6 +1462,8 @@ export const ServerSettings = Schema.Struct({
   rsiAutoDistillEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   contextCompressionEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   outputShaperEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  /** Experimental: one persistent `python` tool for every agent; built-in tools are removed where the harness allows it. */
+  pythonReplMode: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   verificationGateMode: VerificationGateMode.pipe(
     Schema.withDecodingDefault(Effect.succeed("auto" as const)),
   ),
@@ -1922,6 +1924,7 @@ export const ServerSettingsPatch = Schema.Struct({
   rsiAutoDistillEnabled: Schema.optionalKey(Schema.Boolean),
   contextCompressionEnabled: Schema.optionalKey(Schema.Boolean),
   outputShaperEnabled: Schema.optionalKey(Schema.Boolean),
+  pythonReplMode: Schema.optionalKey(Schema.Boolean),
   verificationGateMode: Schema.optionalKey(VerificationGateMode),
   autoVerifyEnabled: Schema.optionalKey(Schema.Boolean),
   obsidianMemorySyncEnabled: Schema.optionalKey(Schema.Boolean),

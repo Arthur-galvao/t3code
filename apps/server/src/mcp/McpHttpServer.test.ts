@@ -1546,6 +1546,12 @@ it.effect("hides tools for links and refuses another environment while the beta 
           failure: OrchestratorMcpFailure,
           failureMode: "return",
         }).annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenWhileLinksOff),
+        Tool.make("snake", {
+          description: "Needs Python REPL mode.",
+          success: Schema.Struct({ ok: Schema.Boolean }),
+          failure: OrchestratorMcpFailure,
+          failureMode: "return",
+        }).annotate(McpSchema.EnabledWhen, McpInvocationContext.pythonReplEnabled),
         Tool.make("where", {
           description: "Says where it ran.",
           parameters: Schema.Struct({ environmentId: OrchestratorMcpEnvironmentTarget }),
@@ -1561,6 +1567,7 @@ it.effect("hides tools for links and refuses another environment while the beta 
           LinksToolkit,
           McpToolAccess.toLayer(LinksToolkit, {
             links: McpToolAccess.reads(() => Effect.succeed({ links: 0 })),
+            snake: McpToolAccess.reads(() => Effect.succeed({ ok: true })),
             where: McpToolAccess.reads(() => Effect.succeed({ ranIn: "here" })),
           }),
         ),
@@ -1635,6 +1642,12 @@ it.effect("hides tools for links and refuses another environment while the beta 
       expect((yield* ranIn(environmentId)).structuredContent).toEqual({ ranIn: "here" });
 
       yield* settings.updateSettings({ linkedEnvironmentsEnabled: true });
+      expect(yield* listed()).toEqual(["links", "where"]);
+
+      // The setting alone grants `python` to a thread caller, without a header.
+      yield* settings.updateSettings({ pythonReplMode: true });
+      expect(yield* listed()).toEqual(["links", "snake", "where"]);
+      yield* settings.updateSettings({ pythonReplMode: false });
       expect(yield* listed()).toEqual(["links", "where"]);
       // On, the call goes on to the forwarding, which this server lacks.
       expect(yield* ranIn(elsewhere)).toMatchObject({

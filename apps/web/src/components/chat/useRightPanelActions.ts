@@ -138,6 +138,11 @@ export function useRightPanelActions(input: RightPanelActionsInput) {
     addDiffSurface();
   };
   const openChangesFromThreadPanelStable = useStableCallback(openChangesFromThreadPanel);
+  const addUsageSurface = () => {
+    if (!activeThreadRef) return;
+    useRightPanelStore.getState().open(activeThreadRef, "usage");
+  };
+  const addUsageSurfaceStable = useStableCallback(addUsageSurface);
   const addFilesSurface = () => {
     if (!activeThreadRef || !activeProject) return;
     useRightPanelStore.getState().open(activeThreadRef, "files");
@@ -324,6 +329,7 @@ export function useRightPanelActions(input: RightPanelActionsInput) {
     addFilesSurfaceStable,
     addPullRequestSurfaceStable,
     addPullRequestsSurfaceStable,
+    addUsageSurfaceStable,
     closePreviewPanelStable,
     copyRightPanelFilePathStable,
     createBrowserSurface,

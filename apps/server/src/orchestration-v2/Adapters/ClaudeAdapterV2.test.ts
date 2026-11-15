@@ -820,6 +820,22 @@ describe("ClaudeAdapterV2 native protocol logging", () => {
     const logged = ClaudeAdapterV2.loggedClaudeQueryOptions(options);
     assert.equal(logged.hasMcpServers, true);
     assert.notInclude(JSON.stringify(logged), "secret-claude-token");
+    assert.notDeepEqual(options.tools, ["ToolSearch"]);
+
+    const pythonOptions = ClaudeAdapterV2.makeClaudeQueryOptions({
+      modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+      nativeThreadId: "native-thread-claude-python",
+      resume: false,
+      cwd: "/workspace",
+      mcpServers: overrides.mcpServers ?? {},
+      pythonRepl: true,
+      environment: {},
+    });
+    assert.deepEqual(pythonOptions.tools, ["ToolSearch"]);
+    assert.include(
+      JSON.stringify(pythonOptions.systemPrompt),
+      "Your only coding tool is the `python` tool",
+    );
   });
 
   it("logs --settings key names without their values", () => {

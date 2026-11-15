@@ -5,6 +5,18 @@ export const PULL_REQUEST_LINKING_INSTRUCTIONS = `<pull_request_linking>
 Link each PR you create, take over, or push to: link_pull_request, or link_pull_requests for several, full URL, every stack layer, as your next call. Host tools don't link for you. If linking fails, say so. Skip PRs you only read or review and PRs named only as background. Call watch_pull_request when asked to monitor or babysit, or when work you were asked to do, such as a merge, still waits on checks or reviews, even after an earlier unwatch. Finish any needed branch update and push first, then watch and end your turn. Otherwise act now or hand back. Delegated children never watch, even if the brief says babysit. After PR work, a child's last line is: PR <full URL>, head <SHA>, checks and reviews <state>. Links and watches persist across pushes. For PR waits, no sleep, loops, gh --watch, Monitor or ScheduleWakeup. Before handback, call unwatch_pull_request on any PR you watch.
 </pull_request_linking>`;
 
+/** `only` when the harness's built-in tools were removed, `alongside` when they remain. */
+export type PythonReplInstructions = "only" | "alongside";
+
+const pythonReplInstructions = (mode: PythonReplInstructions) =>
+  `<python_repl>
+${
+  mode === "only"
+    ? "Your only coding tool is the `python` tool"
+    : "Prefer the `python` tool over shell and file tools"
+} from the t3-code MCP server: a persistent Python 3 REPL for this thread. Variables, imports and functions stay defined between calls, and a final expression is printed. Do all reading, searching, editing and verifying in it, and batch several steps into one call. Run shell commands with \`subprocess.run(..., capture_output=True, text=True)\`. Define helpers once (read a file, replace text, grep, run tests) and reuse them. Output is truncated when long, so print only what you need.
+</python_repl>`;
+
 /** Omit model and effort when the harness manages them dynamically. */
 export function buildRuntimeInstructions(runtime: {
   readonly harness: string;
@@ -15,6 +27,8 @@ export function buildRuntimeInstructions(runtime: {
   readonly pullRequestLinking?: boolean;
   /** False to omit concise output-shaper instructions (defaults to true). */
   readonly outputShaperEnabled?: boolean;
+  /** Set while Python REPL mode is on and the `python` tool is reachable. */
+  readonly pythonRepl?: PythonReplInstructions | undefined;
 }): string {
   const harness = toSingleLine(runtime.harness);
   const model = toSingleLine(runtime.model ?? "");
@@ -29,6 +43,7 @@ export function buildRuntimeInstructions(runtime: {
     runtimeInfo,
     ...(runtime.pullRequestLinking === false ? [] : [PULL_REQUEST_LINKING_INSTRUCTIONS]),
     ...(runtime.outputShaperEnabled === false ? [] : [T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS]),
+    ...(runtime.pythonRepl === undefined ? [] : [pythonReplInstructions(runtime.pythonRepl)]),
   ].join("\n\n");
 }
 

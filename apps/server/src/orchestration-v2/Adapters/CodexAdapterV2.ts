@@ -795,6 +795,7 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     /** The user's `model_reasoning_summary` from the Codex config, when set. */
     readonly configuredReasoningSummary?: CodexSchema.V2TurnStartParams__ReasoningSummary;
     readonly outputShaperEnabled?: boolean;
+    readonly pythonRepl?: boolean;
   }) {
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
     const approvalPolicy =
@@ -838,6 +839,10 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
               ...(input.outputShaperEnabled === undefined
                 ? {}
                 : { outputShaperEnabled: input.outputShaperEnabled }),
+              // Codex keeps its built-in tools, so the tool is only offered alongside them.
+              ...(input.pythonRepl === true && sandboxPolicy?.type !== "readOnly"
+                ? { pythonRepl: "alongside" as const }
+                : {}),
             },
             {
               browser: input.browserToolsAvailable ?? true,
@@ -1864,6 +1869,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
   const readMcpSession = (threadId: ThreadId | null) =>
     threadId === null ? Effect.undefined : mcpSessions.read(threadId);
   const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
+  const readPythonReplMode = Effect.fnUntraced(function* () {
+    if (Option.isNone(serverSettings)) {
+      return false;
+    }
+    return yield* serverSettings.value.getSettings.pipe(
+      Effect.map((settings) => settings.pythonReplMode),
+      Effect.orElseSucceed(() => false),
+    );
+  });
   const readOutputShaperEnabled = Effect.fnUntraced(function* () {
     if (Option.isNone(serverSettings)) {
       return true;
@@ -7435,6 +7449,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
               omitServiceTier: adapterOptions.resolveRuntime !== undefined,
               outputShaperEnabled: yield* readOutputShaperEnabled(),
+              pythonRepl: yield* readPythonReplMode(),
               ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
               ...(configuredReasoningSummary === undefined ? {} : { configuredReasoningSummary }),
             });

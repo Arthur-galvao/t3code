@@ -117,18 +117,48 @@ const layerAdvertisedTools = McpHttpServer.layerTools.pipe(
   Layer.provide(toolHandlerServices),
 );
 
-// Claude Code loads these tools up front instead of behind ToolSearch, outside this budget.
-it.effect("only request_secret and send_to_user ask Claude Code to load them up front", () =>
+const nonStringEnums = (schema: unknown, path: ReadonlyArray<string> = []): Array<string> => {
+  if (Array.isArray(schema))
+    return schema.flatMap((item, index) => nonStringEnums(item, [...path, String(index)]));
+  if (typeof schema !== "object" || schema === null) return [];
+  if ("enum" in schema && Array.isArray(schema.enum)) {
+    const values: ReadonlyArray<unknown> = schema.enum;
+    const bad = values.filter((value) => typeof value !== "string" || value.length === 0);
+    return bad.length === 0
+      ? []
+      : [`${[...path, "enum"].join(".")}: ${bad.map(String).join(", ")}`];
+  }
+  return Object.entries(schema).flatMap(([key, value]) => nonStringEnums(value, [...path, key]));
+};
+
+// Gemini rejects a tool schema whose enum holds anything but non-empty strings, which breaks
+// Antigravity before the first turn.
+it.effect("advertises only string enum values", () =>
   Effect.gen(function* () {
     const mcp = yield* McpServer.McpServer;
-    const alwaysLoad = mcp.tools
-      .filter(({ tool }) => tool._meta?.["anthropic/alwaysLoad"] !== undefined)
-      .map(({ tool }) => [tool.name, tool._meta]);
-    expect(alwaysLoad).toEqual([
-      ["request_secret", { "anthropic/alwaysLoad": true }],
-      ["send_to_user", { "anthropic/alwaysLoad": true }],
-    ]);
+    const offenders = mcp.tools.flatMap(({ tool }) =>
+      nonStringEnums(tool.inputSchema).map((where) => `${tool.name} ${where}`),
+    );
+
+    expect(offenders).toEqual([]);
   }).pipe(Effect.provide(layerAdvertisedTools)),
+);
+
+// Claude Code loads these tools up front instead of behind ToolSearch, outside this budget.
+it.effect(
+  "only request_secret, send_to_user, and python ask Claude Code to load them up front",
+  () =>
+    Effect.gen(function* () {
+      const mcp = yield* McpServer.McpServer;
+      const alwaysLoad = mcp.tools
+        .filter(({ tool }) => tool._meta?.["anthropic/alwaysLoad"] !== undefined)
+        .map(({ tool }) => [tool.name, tool._meta]);
+      expect(alwaysLoad).toEqual([
+        ["request_secret", { "anthropic/alwaysLoad": true }],
+        ["send_to_user", { "anthropic/alwaysLoad": true }],
+        ["python", { "anthropic/alwaysLoad": true }],
+      ]);
+    }).pipe(Effect.provide(layerAdvertisedTools)),
 );
 
 // CI rejects a PR that raises any value above main's agentContextBudget.json, so growth

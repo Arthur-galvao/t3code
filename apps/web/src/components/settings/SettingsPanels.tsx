@@ -2090,6 +2090,32 @@ export function ThreadsSettingsPanel() {
         />
         <SettingsRow
           serverScoped
+          id="python-repl-mode"
+          title="Python REPL mode (experimental)"
+          description="Give agents one persistent Python tool and remove built-in tools where the harness allows it. Code runs without per-tool permission prompts."
+          settingKeys={["pythonReplMode"]}
+          resetAction={
+            hasServerTargets &&
+            settings.pythonReplMode !== DEFAULT_UNIFIED_SETTINGS.pythonReplMode ? (
+              <SettingResetButton
+                label="Python REPL mode"
+                onClick={() =>
+                  updateSettings({ pythonReplMode: DEFAULT_UNIFIED_SETTINGS.pythonReplMode })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["pythonReplMode"]}
+              checked={settings.pythonReplMode}
+              onCheckedChange={(checked) => updateSettings({ pythonReplMode: Boolean(checked) })}
+              aria-label="Python REPL mode"
+            />
+          }
+        />
+        <SettingsRow
+          serverScoped
           id="verification-gate-mode"
           title="Verification gate"
           description={

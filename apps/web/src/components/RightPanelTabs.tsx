@@ -42,6 +42,7 @@ import {
   ChevronRight,
   FileDiff,
   Files,
+  Gauge,
   Globe2,
   MessagesSquare,
   Plus,
@@ -139,6 +140,7 @@ export interface RightPanelTabsProps {
   onAddBrowserInProfile: (profileId: string) => void;
   onAddTerminal: () => void;
   onAddDiff: () => void;
+  onAddUsage: () => void;
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddPullRequests: () => void;
@@ -181,6 +183,7 @@ const SURFACE_DISABLED_REASONS = {
   pullRequest: "This thread's branch has no pull request yet.",
   pullRequests: "No linked pull requests are available for this thread.",
   device: "Devices are only available from a thread.",
+  usage: "Usage is only available from a thread.",
   sideChat: "Side chats start after the first message.",
 } as const;
 
@@ -320,6 +323,7 @@ function RightPanelEmptyState(props: {
   browserProfiles: ReadonlyArray<{ readonly id: string; readonly name: string }>;
   onAddTerminal: () => void;
   onAddDiff: () => void;
+  onAddUsage: () => void;
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddPullRequests: () => void;
@@ -370,6 +374,14 @@ function RightPanelEmptyState(props: {
       available: props.diffAvailable,
       disabledReason: SURFACE_UNAVAILABLE_HINTS.diff,
       onClick: props.onAddDiff,
+    },
+    {
+      label: "Usage",
+      description: "Context, limits and spend per provider.",
+      icon: Gauge,
+      shortcut: "U",
+      available: true,
+      onClick: props.onAddUsage,
     },
     {
       label: "Pull request",
@@ -577,6 +589,8 @@ function surfaceTitle(
   switch (surface.kind) {
     case "diff":
       return "Diff";
+    case "usage":
+      return "Usage";
     case "files":
       return "Files";
     case "file":
@@ -661,6 +675,8 @@ function SurfaceIcon({
       return <PreviewFavicon capturedUrl={previewCapturedUrl} url={previewUrl} />;
     case "diff":
       return <FileDiff className="size-3 shrink-0" />;
+    case "usage":
+      return <Gauge className="size-3 shrink-0" />;
     case "files":
       return <Files className="size-3 shrink-0" />;
     case "file":
@@ -1131,6 +1147,15 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       onClick: props.onAddDiff,
     },
     {
+      label: "Usage",
+      description: "Context, limits and spend per provider.",
+      icon: Gauge,
+      shortcut: "U",
+      available: true,
+      disabledReason: SURFACE_DISABLED_REASONS.usage,
+      onClick: props.onAddUsage,
+    },
+    {
       label: "Pull request",
       icon: PullRequestGlyph.pullRequest,
       shortcut: "P",
@@ -1547,6 +1572,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             browserProfiles={browserProfiles}
             onAddTerminal={props.onAddTerminal}
             onAddDiff={props.onAddDiff}
+            onAddUsage={props.onAddUsage}
             onAddFiles={props.onAddFiles}
             onAddPullRequest={props.onAddPullRequest}
             onAddPullRequests={props.onAddPullRequests}

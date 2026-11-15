@@ -65,4 +65,13 @@ describe("buildRuntimeInstructions", () => {
     assert.notInclude(disabled, "<output_shaper>");
     assert.include(disabled, "<pull_request_linking>");
   });
+
+  it("adds Python REPL instructions only when asked, worded for whether built-ins remain", () => {
+    assert.notInclude(buildRuntimeInstructions({ harness: "Codex" }), "<python_repl>");
+    const alongside = buildRuntimeInstructions({ harness: "Codex", pythonRepl: "alongside" });
+    assert.include(alongside, "Prefer the `python` tool over shell and file tools");
+    assert.notInclude(alongside, "Your only coding tool");
+    const only = buildRuntimeInstructions({ harness: "Claude Code", pythonRepl: "only" });
+    assert.include(only, "Your only coding tool is the `python` tool");
+  });
 });

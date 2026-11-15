@@ -2258,6 +2258,8 @@ export function makeClaudeQueryOptions(input: {
   /** The thread's T3 MCP session holds the `device` capability. */
   readonly deviceToolsAvailable?: boolean;
   readonly tools?: ClaudeAgentSdkQueryTools;
+  /** Replaces the built-in tools with the T3 `python` tool. Needs `mcpServers`. */
+  readonly pythonRepl?: boolean;
   readonly allowedTools?: ReadonlyArray<string>;
   readonly disallowedTools?: ReadonlyArray<string>;
   readonly permissionMode?: PermissionMode;
@@ -2301,7 +2303,9 @@ export function makeClaudeQueryOptions(input: {
   const threadIdentity: ClaudeAgentSdkThreadIdentity = input.resume
     ? { resume: input.nativeThreadId }
     : { sessionId: input.nativeThreadId };
-  const selectedTools = input.tools ?? CLAUDE_CODE_PRESET_TOOLS;
+  const pythonRepl = input.pythonRepl === true && input.mcpServers !== undefined;
+  // Keep ToolSearch: T3 MCP tools are deferred behind it.
+  const selectedTools = pythonRepl ? ["ToolSearch"] : (input.tools ?? CLAUDE_CODE_PRESET_TOOLS);
   const selectionSettings =
     Object.keys(compiledSelection.settings).length === 0
       ? undefined
@@ -2431,6 +2435,7 @@ export function makeClaudeQueryOptions(input: {
           ...(input.outputShaperEnabled === undefined
             ? {}
             : { outputShaperEnabled: input.outputShaperEnabled }),
+          ...(pythonRepl ? { pythonRepl: "only" as const } : {}),
         }) +
           (input.mcpServers === undefined
             ? ""
@@ -3603,6 +3608,7 @@ export function claudeEffectiveQueryPolicyKey(
     readonly allowedTools?: ReadonlyArray<string>;
     readonly mcpServers?: ClaudeQueryOptions["mcpServers"];
   },
+  pythonRepl = false,
 ): string {
   return JSON.stringify({
     runtimePolicy: claudeRuntimeQueryPolicyKey({
@@ -3612,6 +3618,7 @@ export function claudeEffectiveQueryPolicyKey(
         : { allowedTools: mcpOverrides.allowedTools }),
     }),
     mcpServers: mcpOverrides.mcpServers,
+    pythonRepl,
   });
 }
 
@@ -5630,6 +5637,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     return yield* serverSettings.value.getSettings.pipe(
       Effect.map((settings) => settings.contextCompressionEnabled),
       Effect.orElseSucceed(() => true),
+    );
+  });
+  const readPythonReplMode = Effect.fnUntraced(function* () {
+    if (Option.isNone(serverSettings)) {
+      return false;
+    }
+    return yield* serverSettings.value.getSettings.pipe(
+      Effect.map((settings) => settings.pythonReplMode),
+      Effect.orElseSucceed(() => false),
     );
   });
   const readOutputShaperEnabled = Effect.fnUntraced(function* () {
@@ -12749,15 +12765,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           queryPolicy: Effect.Success<ReturnType<typeof queryPolicyForTurn>>,
         ) {
           const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+          const readOnlySandbox =
+            sandboxPolicyKindForClaudeRuntimePolicy(turnInput.runtimePolicy) === "readOnly";
+          // Part of the query policy key, so toggling the setting reopens the query.
+          const pythonRepl =
+            (yield* readPythonReplMode()) && !readOnlySandbox && queryPolicy.tools === undefined;
           const mcpOverrides = claudeMcpQueryOverrides({
             mcpSession,
-            readOnlySandbox:
-              sandboxPolicyKindForClaudeRuntimePolicy(turnInput.runtimePolicy) === "readOnly",
+            readOnlySandbox,
             ...(queryPolicy.allowedTools === undefined
               ? {}
               : { allowedTools: queryPolicy.allowedTools }),
           });
-          const queryPolicyKey = claudeEffectiveQueryPolicyKey(queryPolicy, mcpOverrides);
+          const queryPolicyKey = claudeEffectiveQueryPolicyKey(
+            queryPolicy,
+            mcpOverrides,
+            pythonRepl,
+          );
           const resumeSessionAt = yield* getNativeConversationHeadId(turnInput.providerThread);
           const existing = yield* Ref.get(queryContext);
           // Continuations drain existing output without prompting; retain the live process regardless of selection.
@@ -12907,6 +12931,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               shouldResume,
             ),
             tools: queryPolicy.tools ?? CLAUDE_CODE_PRESET_TOOLS,
+            pythonRepl,
             ...(mcpOverrides.allowedTools === undefined
               ? {}
               : { allowedTools: mcpOverrides.allowedTools }),

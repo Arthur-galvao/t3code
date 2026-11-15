@@ -50,6 +50,7 @@ import {
 import { ProviderWorkspaceMissingError } from "../provider/Errors.ts";
 import * as ProviderInstallationGate from "../provider/ProviderInstallationGate.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as PythonRepl from "../pythonRepl/PythonRepl.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
@@ -431,6 +432,7 @@ export const layerWithOptions = (
       /** Unreadable settings must preserve explicit browser-access opt-outs. */
       const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
       const projectService = yield* Effect.serviceOption(ProjectService.ProjectService);
+      const pythonRepl = yield* Effect.serviceOption(PythonRepl.PythonRepl);
       const eventSink = yield* EventSink.EventSinkV2;
       const commandOutput = yield* CommandOutputHub.CommandOutputHub;
       const promptSuggestionStore = yield* SubscriptionRef.make<
@@ -621,7 +623,7 @@ export const layerWithOptions = (
               }),
             );
       const clearMcpSession = (threadId: ThreadId, mcpCredentialId?: string) =>
-        mcpCredentialId === undefined
+        (mcpCredentialId === undefined
           ? mcpSessionRegistry
               .revokeThread(threadId)
               .pipe(Effect.tap(() => mcpSessions.clear(threadId)))
@@ -633,7 +635,12 @@ export const layerWithOptions = (
                   }
                 }),
               ),
-            );
+            )
+        ).pipe(
+          Effect.andThen(
+            Option.isSome(pythonRepl) ? pythonRepl.value.close(threadId) : Effect.void,
+          ),
+        );
 
       const subscriberReleaseCleanup = new WeakMap<
         Queue.Queue<ProviderSessionEventSignal, Cause.Done>,

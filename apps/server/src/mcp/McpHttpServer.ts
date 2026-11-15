@@ -49,6 +49,7 @@ import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpToolExposure from "./McpToolExposure.ts";
 import { MCP_TOOL_EXPOSURE_HEADER } from "@t3tools/provider-core/server/mcpSession";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
+import * as PythonRepl from "../pythonRepl/PythonRepl.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
 import * as PreviewControlsHandlers from "./toolkits/previewControls/handlers.ts";
 import { EnvironmentToolkit } from "./toolkits/environment/tools.ts";
@@ -72,6 +73,8 @@ import {
   PreviewSnapshotToolkit,
   PreviewStandardToolkit,
 } from "./toolkits/preview/tools.ts";
+import * as PythonHandlers from "./toolkits/python/handlers.ts";
+import { PythonToolkit } from "./toolkits/python/tools.ts";
 import * as WorktreeHandlers from "./toolkits/worktree/handlers.ts";
 import { WorktreeToolkit } from "./toolkits/worktree/tools.ts";
 import * as WorktreeMcpService from "./WorktreeMcpService.ts";
@@ -196,6 +199,15 @@ const withModeLimit = (
     : { ...invocation, client: { ...invocation.client, narrowedTo: limit.value } };
 };
 
+/** Python REPL mode is a server setting; only a thread's own provider session can use it. */
+const withPythonRepl = (
+  invocation: McpInvocationContext.McpInvocationScope,
+  enabled: boolean,
+): McpInvocationContext.McpInvocationScope =>
+  enabled && invocation.thread !== undefined && invocation.client === undefined
+    ? { ...invocation, capabilities: new Set([...invocation.capabilities, "python"]) }
+    : invocation;
+
 const decodeSenderThread = Schema.decodeUnknownOption(OrchestrationV2LinkedSender);
 
 /** Records the thread a linked environment calls for; a malformed header only loses the name. */
@@ -242,6 +254,10 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     Effect.map((settings) => settings.linkedEnvironmentsEnabled),
     Effect.orElseSucceed(() => false),
   );
+  const pythonReplEnabled = serverSettings.getSettings.pipe(
+    Effect.map((settings) => settings.pythonReplMode),
+    Effect.orElseSucceed(() => false),
+  );
   const authenticateRequest = Effect.fn("McpHttpServer.authenticateRequest")(function* (
     request: HttpServerRequest.HttpServerRequest,
   ) {
@@ -269,7 +285,11 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
         offerOAuth: Option.isSome(clients) && !looksLikeProviderToken(token),
       });
     }
-    const asked = withModeLimit(withSenderThread(invocation, request), request);
+    const pythonRepl = yield* pythonReplEnabled;
+    const asked = withModeLimit(
+      withSenderThread(withPythonRepl(invocation, pythonRepl), request),
+      request,
+    );
     if (asked === undefined) return invalidModeLimit;
     const limited = McpInvocationContext.withRuntimeModeCeiling(asked, runtimeModeCeiling);
     const linkedEnvironments = yield* linksEnabled;
@@ -1258,6 +1278,10 @@ export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandl
 
 const layerMessageToolkit = toolkitRegistration(MessageToolkit, MessageHandlers.layer);
 
+const layerPythonToolkit = toolkitRegistration(PythonToolkit, PythonHandlers.layer).pipe(
+  Layer.provide(PythonRepl.layer),
+);
+
 const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeToolkit,
   WorktreeHandlers.layer,
@@ -1349,6 +1373,7 @@ export const layerTools = Layer.mergeAll(
   layerDeviceToolkit,
   layerHtmlToolkit,
   layerMessageToolkit,
+  layerPythonToolkit,
 );
 
 const layerToolExposure = Layer.effect(

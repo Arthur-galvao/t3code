@@ -5,6 +5,7 @@ import {
   OrchestratorMcpFailure,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import * as Struct from "effect/Struct";
 import { Tool, Toolkit } from "effect/ai";
 import * as EnvironmentTheme from "../../../environmentTheme.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -12,6 +13,9 @@ import * as ThreadCommandExecutor from "../../../orchestration-v2/ThreadCommandE
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 
 const Appearance = Schema.Literals(["light", "dark", "system"]);
+
+// Gemini rejects a numeric enum in a function declaration, and the service writes `version` itself.
+const ThemeFileInput = Schema.Struct(Struct.omit(EnvironmentThemeFile.fields, ["version"]));
 
 const shared = {
   failure: OrchestratorMcpFailure,
@@ -56,7 +60,7 @@ const ThemeSetTool = Tool.make("t3_theme_set", {
     "Restyle T3 Code itself, only when the user asks. With `theme`, publish it as `themeId` (the same id updates it) and switch this machine's web and desktop clients to it. Without `theme`, switch to a built-in or published `themeId`. `appearance` switches them to light, dark, or system mode, with or without a theme. Live full-access or default caller thread only.",
   parameters: Schema.Struct({
     themeId: Schema.optionalKey(EnvironmentThemeId),
-    theme: Schema.optionalKey(EnvironmentThemeFile),
+    theme: Schema.optionalKey(ThemeFileInput),
     appearance: Schema.optionalKey(Appearance),
   }),
   success: Schema.Struct({
