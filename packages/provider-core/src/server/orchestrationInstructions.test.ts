@@ -157,6 +157,8 @@ describe("T3 device instructions", () => {
   it("exports concise KV-cache-friendly output shaper instructions", () => {
     assert.include(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS, "<output_shaper>");
     assert.include(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS, "context_retrieve");
+    assert.include(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS, "tailscale serve");
+    assert.match(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS, /never [`']?funnel[`']?/i);
     assert.isBelow(T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS.length, 400);
   });
 

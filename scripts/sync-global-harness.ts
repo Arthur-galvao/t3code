@@ -194,12 +194,72 @@ const syncSkillDirs = Effect.gen(function* () {
   }
 });
 
+const TAILSCALE_MARKER_START = "<!-- t3code:tailscale-preview:start -->";
+const TAILSCALE_MARKER_END = "<!-- t3code:tailscale-preview:end -->";
+const TAILSCALE_PREVIEW_BLOCK = [
+  TAILSCALE_MARKER_START,
+  "## Tailscale Serve Previews",
+  "",
+  "- Whenever sharing a link to a local server, preview, review page, or dashboard running on this PC, check `tailscale status` first.",
+  "- If Tailscale is active, publish privately with `tailscale serve --bg --https=<port> http://127.0.0.1:<port>` (never overwrite port 443 used by T3 Code and never use `tailscale funnel`), verify the `https://<host>.<tailnet>.ts.net:<port>` URL responds, and send that Tailscale link.",
+  "- Fall back to `localhost` only when Tailscale is inactive or unavailable.",
+  TAILSCALE_MARKER_END,
+].join("\n");
+
+const syncGlobalClaudeMd = Effect.fn("syncGlobalClaudeMd")(function* (filePath: string) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const parentDir = path.dirname(filePath);
+  if (!(yield* fs.exists(parentDir)) && !initMissing) {
+    yield* logAction(
+      "skip-missing",
+      filePath,
+      "parent dir not present (pass --init-missing to create)",
+    );
+    return;
+  }
+
+  const existing = (yield* fs.exists(filePath)) ? yield* fs.readFileString(filePath) : "";
+  const startIdx = existing.indexOf(TAILSCALE_MARKER_START);
+  const endIdx = existing.indexOf(TAILSCALE_MARKER_END);
+
+  let next: string;
+  if (startIdx !== -1 && endIdx !== -1 && endIdx >= startIdx) {
+    const before = existing.slice(0, startIdx);
+    const after = existing.slice(endIdx + TAILSCALE_MARKER_END.length);
+    next = `${before}${TAILSCALE_PREVIEW_BLOCK}${after}`;
+  } else if (existing.trim().length === 0) {
+    next = `${TAILSCALE_PREVIEW_BLOCK}\n`;
+  } else {
+    const separator = existing.endsWith("\n\n") ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
+    next = `${existing}${separator}${TAILSCALE_PREVIEW_BLOCK}\n`;
+  }
+
+  if (next === existing) {
+    yield* logAction("claude-md", filePath, "already in sync");
+    return;
+  }
+
+  if (!dryRun) {
+    yield* fs.makeDirectory(parentDir, { recursive: true });
+    yield* fs.writeFileString(filePath, next);
+  }
+  yield* logAction(
+    "claude-md",
+    filePath,
+    startIdx !== -1 && endIdx !== -1
+      ? "updated tailscale preview rule"
+      : "added tailscale preview rule",
+  );
+});
+
 const main = Effect.gen(function* () {
   const path = yield* Path.Path;
   yield* syncJsonMcpFile(path.join(homeDir, ".claude.json"));
   yield* syncJsonMcpFile(path.join(homeDir, ".claude", ".claude.json"));
   yield* syncJsonMcpFile(path.join(homeDir, ".gemini", "antigravity", "mcp_config.json"));
   yield* syncCodexToml(path.join(homeDir, ".codex", "config.toml"));
+  yield* syncGlobalClaudeMd(path.join(homeDir, ".claude", "CLAUDE.md"));
   yield* syncSkillDirs;
 });
 
