@@ -624,6 +624,7 @@ it.effect(
       });
 
       assert.strictEqual(result.telemetryInputs.length, 1);
+      assert.strictEqual(result.telemetryInputs[0]?.cwd, "/repo");
       assert.strictEqual(result.telemetryInputs[0]?.usedTokens, 1200);
       assert.strictEqual(result.telemetryInputs[0]?.cachedInputTokens, 900);
       assert.strictEqual(result.telemetryInputs[0]?.durationMs, 2000);
@@ -762,5 +763,70 @@ it.effect(
         ],
       });
       assert.strictEqual(cappedResult.writtenEvents.length, 0);
+    }),
+);
+
+it.effect(
+  "extracts recoveredCommandPair and scrubs multi-line error paths in summarizeRunTelemetry",
+  () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const recoveryThreadId = ThreadId.make("thread_recovery_pair");
+      const recoveryRunId = RunId.make("run_recovery_pair");
+      const recoveryResult = yield* makeFinalizationIntegrationFixture({
+        key: "recovery_pair",
+        turnItems: [
+          {
+            id: TurnItemId.make("cmd-fail-1"),
+            threadId: recoveryThreadId,
+            runId: recoveryRunId,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "failed",
+            title: "Run tests",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "command_execution",
+            input: "vp test run src/a.test.ts",
+            output: String.raw`Failed at C:\Users\Arthur\repo\a.ts
+Directory: C:\Users\Arthur
+Mode LastWriteTime Length Name`,
+          },
+          {
+            id: TurnItemId.make("cmd-pass-2"),
+            threadId: recoveryThreadId,
+            runId: recoveryRunId,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 2,
+            status: "completed",
+            title: "Run tests",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "command_execution",
+            input: "../../node_modules/.bin/vp.cmd test run src/a.test.ts",
+            exitCode: 0,
+          },
+        ],
+      });
+
+      const recorded = recoveryResult.telemetryInputs[0];
+      assert.deepStrictEqual(recorded?.recoveredCommandPair, {
+        failedCommand: "vp test run",
+        succeededCommand: "../../node_modules/.bin/vp.cmd test run",
+      });
+      assert.strictEqual(recorded?.failureSignature?.errorSignature, "Failed at <path>");
+      assert.isDefined(recorded?.failureSignature?.guidance);
+      assert.isFalse((recorded?.failureSignature?.guidance ?? "").includes("C:\\Users\\Arthur"));
+      assert.isFalse((recorded?.failureSignature?.guidance ?? "").includes("\n"));
     }),
 );

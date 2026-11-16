@@ -115,6 +115,7 @@ describe("RsiService", () => {
           wastedReads: 0,
           outcome: "failed",
           durationMs: 1000,
+          cwd: "/repo",
           failureSignature: {
             tool: "Bash",
             errorSignature: "Command Timeout 30s",
@@ -136,6 +137,7 @@ describe("RsiService", () => {
           wastedReads: 0,
           outcome: "failed",
           durationMs: 1100,
+          cwd: "/repo",
           failureSignature: {
             tool: "Write",
             errorSignature: "EACCES protected file",
@@ -158,6 +160,7 @@ describe("RsiService", () => {
           wastedReads: 0,
           outcome: "failed",
           durationMs: 900,
+          cwd: "/repo",
           failureSignature: {
             tool: "Bash",
             errorSignature: "Command Timeout 30s",
@@ -190,6 +193,11 @@ describe("RsiService", () => {
         expect(codexWrite).toBeDefined();
         expect(claudeBash?.hits).toBe(2);
         expect(claudeBash?.confidence ?? 0).toBeGreaterThan(codexWrite?.confidence ?? 0);
+
+        // usedTokens is context size: three runs on one thread count once, by the latest run.
+        const summary = yield* rsi.getTelemetrySummary();
+        expect(summary.totalTokens).toBe(700);
+        expect(summary.totalCachedInputTokens).toBe(500);
       }).pipe(Effect.provide(RsiService.layer)),
   );
 
@@ -442,15 +450,21 @@ describe("RsiService", () => {
   );
 
   it.effect(
-    "Evaluate->Retain boosts applied lessons on clean success and demotes/prunes on failures",
+    "Evaluate->Retain boosts only related applied lessons on clean success and demotes/prunes on failures",
     () =>
       Effect.gen(function* () {
         const rsi = yield* makeRsiService();
         const strong = yield* rsi.recordLesson({
           key: "manual:strong-lesson",
           title: "Check workspace types",
-          guidance: "Run typecheck after editing.",
+          guidance: "Run `vp typecheck` after editing.",
           confidence: 0.8,
+        });
+        const unrelated = yield* rsi.recordLesson({
+          key: "manual:unrelated-lesson",
+          title: "Keep PR diffs small",
+          guidance: "Prefer small targeted diffs.",
+          confidence: 0.7,
         });
         const fragile = yield* rsi.recordLesson({
           key: "manual:fragile-lesson",
@@ -467,9 +481,10 @@ describe("RsiService", () => {
         });
         expect(formatted.prefix).toContain("Check workspace types");
         expect(formatted.lessonIds).toContain(strong.id);
+        expect(formatted.lessonIds).toContain(unrelated.id);
         expect(formatted.lessonIds).not.toContain(fragile.id);
 
-        // Clean success on r-eval-1 boosts tracked lesson confidence (+0.05) and hits (+1).
+        // Clean success on r-eval-1 boosts only strong (matching verifiedCommands), leaving unrelated untouched.
         yield* rsi.recordRunTelemetry({
           threadId: "t-eval",
           runId: "r-eval-1",
@@ -483,11 +498,16 @@ describe("RsiService", () => {
           wastedReads: 0,
           outcome: "completed",
           durationMs: 500,
+          verifiedCommands: ["vp typecheck"],
         });
 
-        const boosted = (yield* rsi.queryLessons()).find((lesson) => lesson.id === strong.id);
+        const afterSuccess = yield* rsi.queryLessons();
+        const boosted = afterSuccess.find((lesson) => lesson.id === strong.id);
+        const untouched = afterSuccess.find((lesson) => lesson.id === unrelated.id);
         expect(boosted?.confidence).toBe(0.85);
         expect(boosted?.hits).toBe(2);
+        expect(untouched?.confidence).toBe(0.7);
+        expect(untouched?.hits).toBe(1);
 
         // Failure with explicit appliedLessonIds demotes strong and auto-removes fragile (< 0.15).
         yield* rsi.recordRunTelemetry({
@@ -531,6 +551,7 @@ describe("RsiService", () => {
           wastedReads: 0,
           outcome: "completed",
           durationMs: 1_100,
+          cwd: "/repo",
           editedFiles: ["apps/server/src/ws.ts"],
           verifiedCommands: ["pnpm test apps/server/src/ws.test.ts"],
         });
@@ -549,6 +570,7 @@ describe("RsiService", () => {
           wastedReads: 0,
           outcome: "success",
           durationMs: 900,
+          cwd: "/repo",
           editedFiles: ["apps/server/src/auth/RpcAuthorization.ts"],
           verifiedCommands: ["pnpm test apps/server/src/ws.test.ts"],
         });
@@ -567,15 +589,17 @@ describe("RsiService", () => {
           wastedReads: 0,
           outcome: "completed",
           durationMs: 1_000,
+          cwd: "/repo",
           editedFiles: ["apps/server/src/server.ts"],
           verifiedCommands: ["pnpm typecheck"],
         });
 
         const lessons = yield* rsi.queryLessons();
-        const wsVerifyLessons = lessons.filter((lesson) =>
-          lesson.title.includes("pnpm test apps/server/src/ws.test.ts"),
+        const wsVerifyLessons = lessons.filter(
+          (lesson) => lesson.title === "Verify edits with pnpm test",
         );
         expect(wsVerifyLessons).toHaveLength(1);
+        expect(wsVerifyLessons[0]?.title.length).toBeLessThan(60);
         expect(wsVerifyLessons[0]?.hits).toBeGreaterThanOrEqual(2);
         expect(lessons.some((lesson) => lesson.key.includes("::recovery::"))).toBe(true);
       }),
@@ -816,6 +840,16 @@ describe("RsiService", () => {
             ].join("\n"),
           );
 
+          // In-session queryLessons does NOT re-import Obsidian markdown files.
+          const midSessionLessons = yield* rsi.queryLessons();
+          expect(midSessionLessons[0]?.guidance).toBe(
+            "Search symbols first and read bounded StartLine/EndLine slices.",
+          );
+        }).pipe(Effect.provide(serviceLayer));
+
+        // Fresh service startup/hydrate imports the edited Obsidian note into lessons.json.
+        yield* Effect.gen(function* () {
+          const rsi = yield* RsiService;
           const updatedLessons = yield* rsi.queryLessons();
           expect(updatedLessons[0]?.guidance).toBe(
             "Use PowerShell Select-String first and read under 150 lines per call.",
@@ -842,6 +876,24 @@ describe("RsiService", () => {
       Effect.gen(function* () {
         const rsi = yield* makeRsiService();
 
+        // No cwd: telemetry is kept but no unscoped lesson is distilled.
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-no-cwd",
+          runId: "r-no-cwd",
+          provider: "claudeAgent",
+          model: "sonnet",
+          usedTokens: 4_000,
+          cachedInputTokens: 2_000,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 4,
+          outcome: "completed",
+          durationMs: 1_500,
+        });
+        expect(yield* rsi.queryLessons()).toHaveLength(0);
+        expect((yield* rsi.getTelemetrySummary()).totalRuns).toBe(1);
+
         yield* rsi.recordRunTelemetry({
           threadId: "t-token",
           runId: "r-token-1",
@@ -855,6 +907,7 @@ describe("RsiService", () => {
           wastedReads: 4,
           outcome: "completed",
           durationMs: 1_500,
+          cwd: "/repo",
         });
 
         const lessons = yield* rsi.queryLessons();
@@ -873,5 +926,560 @@ describe("RsiService", () => {
         expect(formatted.prefix).toContain("[Auto-Spec]");
         expect(formatted.prefix).toContain("ask 1-3 brief clarifying questions");
       }),
+  );
+
+  it.effect(
+    "scopes auto-distilled lessons to projectRoot case/separator-insensitively and drops legacy global auto lessons on load",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-project-scope-" });
+        const rsiDir = path.join(tempRoot, "rsi");
+        const lessonsPath = path.join(rsiDir, "lessons.json");
+        yield* fs.makeDirectory(rsiDir, { recursive: true });
+        yield* fs.writeFileString(
+          lessonsPath,
+          JSON.stringify({
+            version: 1,
+            maxLessons: MAX_LESSONS,
+            lessons: [
+              {
+                id: "rsi_lesson_auto_legacy_global_1",
+                key: "auto::global::verify::legacy",
+                title: "Legacy unscoped auto lesson",
+                guidance: "Should be dropped on load.",
+                rationaleTrace: "Auto-distilled from run r-old (outcome=failed).",
+                triggerCondition: "",
+                scope: "global",
+                globs: [],
+                confidence: 0.9,
+                hits: 12,
+                createdAt: "2026-11-01T00:00:00.000Z",
+                updatedAt: "2026-11-01T00:00:00.000Z",
+              },
+              {
+                // Manual lesson recorded with `tool` gets an auto:: key and id; it must survive.
+                id: "rsi_lesson_auto_global_git_manual_1",
+                key: "auto::global::git::manual_rule",
+                title: "Manual git rule",
+                guidance: "Keep manual git rules.",
+                rationaleTrace: "",
+                triggerCondition: "",
+                scope: "global",
+                globs: [],
+                confidence: 0.9,
+                hits: 1,
+                createdAt: "2026-11-01T00:00:00.000Z",
+                updatedAt: "2026-11-01T00:00:00.000Z",
+              },
+              {
+                id: "rsi_lesson_manual_posix_1",
+                key: "manual::posix_scoped",
+                title: "POSIX scoped rule",
+                guidance: "Case-sensitive project root.",
+                rationaleTrace: "",
+                triggerCondition: "",
+                scope: "global",
+                globs: [],
+                projectRoot: "/Srv/App",
+                confidence: 0.9,
+                hits: 1,
+                createdAt: "2026-11-01T00:00:00.000Z",
+                updatedAt: "2026-11-01T00:00:00.000Z",
+              },
+              {
+                id: "rsi_lesson_manual_global_1",
+                key: "manual::keep_me",
+                title: "Manual global rule",
+                guidance: "Keep manual global rules.",
+                rationaleTrace: "",
+                triggerCondition: "",
+                scope: "global",
+                globs: [],
+                confidence: 0.9,
+                hits: 1,
+                createdAt: "2026-11-01T00:00:00.000Z",
+                updatedAt: "2026-11-01T00:00:00.000Z",
+              },
+            ],
+          }),
+        );
+
+        const rsi = yield* makeRsiService({
+          persistence: {
+            fs,
+            path,
+            rsiDir,
+            lessonsPath,
+            telemetryPath: path.join(rsiDir, "telemetry.jsonl"),
+          },
+        });
+
+        const loaded = yield* rsi.queryLessons();
+        expect(loaded.some((l) => l.id === "rsi_lesson_auto_legacy_global_1")).toBe(false);
+        expect(loaded.some((l) => l.id === "rsi_lesson_manual_global_1")).toBe(true);
+        expect(loaded.some((l) => l.id === "rsi_lesson_auto_global_git_manual_1")).toBe(true);
+
+        const idsFor = (cwd: string | null) =>
+          rsi.queryLessons({ cwd }).pipe(Effect.map((rows) => rows.map((l) => l.id)));
+        expect(yield* idsFor("/Srv/App/sub")).toContain("rsi_lesson_manual_posix_1");
+        expect(yield* idsFor("/srv/app")).not.toContain("rsi_lesson_manual_posix_1");
+        expect(yield* idsFor(null)).not.toContain("rsi_lesson_manual_posix_1");
+
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-proj-a",
+          runId: "r-proj-a",
+          provider: "codex",
+          model: "gpt-5",
+          usedTokens: 500,
+          cachedInputTokens: 200,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 500,
+          cwd: "C:\\Users\\Arthur\\Documents\\ProjA",
+          editedFiles: ["src/index.ts"],
+          verifiedCommands: ["vp test run src/index.test.ts"],
+        });
+
+        const projAInside = yield* rsi.formatSessionPrefix({
+          cwd: "c:/users/arthur/documents/proja/apps/server",
+          provider: "codex",
+        });
+        expect(projAInside).toContain("Verify edits with vp test run");
+        expect(projAInside).toContain("Manual global rule");
+
+        const projB = yield* rsi.formatSessionPrefix({
+          cwd: "C:\\Users\\Arthur\\Documents\\ProjA-Other",
+          provider: "codex",
+        });
+        expect(projB).not.toContain("Verify edits with vp test run");
+        expect(projB).toContain("Manual global rule");
+
+        const verifyId = (yield* rsi.queryLessons()).find((l) =>
+          l.title.startsWith("Verify edits"),
+        )!.id;
+        for (const cwd of [
+          "/c/Users/Arthur/Documents/ProjA",
+          "\\\\?\\C:\\Users\\Arthur\\Documents\\ProjA\\src",
+          "c:/users/arthur/documents/proja/",
+        ]) {
+          expect(yield* idsFor(cwd)).toContain(verifyId);
+        }
+        expect(yield* idsFor("C:\\Users\\Arthur\\Documents\\ProjA-Other")).not.toContain(verifyId);
+        expect(yield* idsFor(null)).not.toContain(verifyId);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "normalizes verified commands without mid-command truncation or duplicates and caps titles under 60 chars",
+    () =>
+      Effect.gen(function* () {
+        const rsi = yield* makeRsiService();
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-cmd-norm",
+          runId: "r-cmd-norm",
+          provider: "claudeAgent",
+          model: "sonnet",
+          usedTokens: 500,
+          cachedInputTokens: 200,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 400,
+          cwd: "/repo",
+          editedFiles: ["src/a.ts", "src/b.ts"],
+          verifiedCommands: [
+            "cd /c/Users/Arthur/Documents/t3code/apps/server; timeout 200 ../../node_modules/.bin/vp.cmd test run src/provider/CodeA.test.ts 2>&1 | tail -n 20",
+            "cd /c/Users/Arthur/Documents/t3code/apps/server && timeout 200 ../../node_modules/.bin/vp.cmd test run src/provider/CodeB.test.ts",
+            "cd /c/Users/Arthur/Documents/t3code; timeout 110 vp lint apps/web/src/components/LiquidGlassAsciiBackdrop.tsx",
+            `vp run ${"very-long-subcommand-flag-".repeat(5)}check`,
+          ],
+        });
+
+        const lessons = yield* rsi.queryLessons();
+        expect(lessons).toHaveLength(1);
+        const lesson = lessons[0]!;
+        expect(lesson.title).toBe("Verify edits with vp test run");
+        expect(lesson.title.length).toBeLessThan(60);
+        expect(lesson.guidance).toBe(
+          "Run `../../node_modules/.bin/vp.cmd test run` and `vp lint` to verify source edits before finishing.",
+        );
+        expect(lesson.guidance).not.toContain("timeout");
+        expect(lesson.guidance).not.toContain("cd ");
+        expect(lesson.guidance).not.toContain("very-long-subcommand");
+      }),
+  );
+
+  it.effect("does not re-boost lessons on subsequent thread runs that had no injection", () =>
+    Effect.gen(function* () {
+      const rsi = yield* makeRsiService();
+      const lesson = yield* rsi.recordLesson({
+        title: "Run targeted tests",
+        guidance: "Run `vp test run` after editing.",
+        scope: "global",
+        confidence: 0.7,
+      });
+
+      yield* rsi.formatSessionPrefixWithMetadata({
+        cwd: "/repo",
+        threadId: "t-no-fallback",
+        runId: "r-injected",
+        provider: "codex",
+      });
+
+      // Second run in same thread/provider had NO formatSessionPrefix call.
+      const secondIds = yield* rsi.getAppliedLessonIds({
+        threadId: "t-no-fallback",
+        runId: "r-not-injected",
+        provider: "codex",
+      });
+      expect(secondIds).toEqual([]);
+
+      yield* rsi.recordRunTelemetry({
+        threadId: "t-no-fallback",
+        runId: "r-not-injected",
+        provider: "codex",
+        model: "gpt-5",
+        usedTokens: 400,
+        cachedInputTokens: 200,
+        toolErrorCount: 0,
+        loopTripped: false,
+        safetyBlockedCount: 0,
+        wastedReads: 0,
+        outcome: "completed",
+        durationMs: 300,
+        editedFiles: ["src/a.ts"],
+        verifiedCommands: ["vp test run src/a.test.ts"],
+      });
+
+      const unchanged = (yield* rsi.queryLessons()).find((l) => l.id === lesson.id);
+      expect(unchanged?.hits).toBe(1);
+      expect(unchanged?.confidence).toBe(0.7);
+    }),
+  );
+
+  it.effect("takes both title and guidance from the newer lesson on merge", () =>
+    Effect.gen(function* () {
+      const rsi = yield* makeRsiService();
+      yield* rsi.recordLesson({
+        key: "manual::merge_pair",
+        title: "Old very long title that used to win length comparison",
+        guidance: "Old short guidance.",
+        confidence: 0.7,
+      });
+      yield* TestClock.adjust("5 seconds");
+      const merged = yield* rsi.recordLesson({
+        key: "manual::merge_pair",
+        title: "Concise new title",
+        guidance: "Newer guidance that belongs with the concise new title.",
+        confidence: 0.75,
+      });
+      expect(merged.title).toBe("Concise new title");
+      expect(merged.guidance).toBe("Newer guidance that belongs with the concise new title.");
+      expect(merged.hits).toBe(2);
+    }),
+  );
+
+  it.effect(
+    "decays stale lessons over time and evicts them before fresher equal-confidence lessons",
+    () =>
+      Effect.gen(function* () {
+        const rsi = yield* makeRsiService();
+        const stale = yield* rsi.recordLesson({
+          key: "auto::codex::stale::check",
+          title: "Stale workspace rule",
+          guidance: "Run `vp check` carefully.",
+          confidence: 0.75,
+          hits: 2,
+          scope: "global",
+        });
+
+        yield* TestClock.adjust("31 days");
+
+        const fresh = yield* rsi.recordLesson({
+          key: "auto::codex::fresh::check",
+          title: "Fresh workspace rule",
+          guidance: "Run `vp test` carefully.",
+          confidence: 0.75,
+          hits: 2,
+          scope: "global",
+        });
+
+        const ranked = yield* rsi.queryLessons();
+        expect(ranked[0]?.id).toBe(fresh.id);
+        expect(ranked[1]?.id).toBe(stale.id);
+
+        for (let i = 0; i < 24; i += 1) {
+          yield* rsi.recordLesson({
+            key: `auto::codex::fill_${i}::sig_${i}`,
+            title: `Fresh filler ${i}`,
+            guidance: `Execute filler command ${i}.`,
+            confidence: 0.75,
+            hits: 2,
+            scope: "global",
+          });
+        }
+
+        const atCapacity = yield* rsi.queryLessons();
+        expect(atCapacity.length).toBe(25);
+        expect(atCapacity.some((lesson) => lesson.id === stale.id)).toBe(false);
+        expect(atCapacity.some((lesson) => lesson.id === fresh.id)).toBe(true);
+      }),
+  );
+
+  it.effect(
+    "distills command recovery pair when a failed tool is replaced by a passing variant, never same-for-same",
+    () =>
+      Effect.gen(function* () {
+        const rsi = yield* makeRsiService();
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-pair",
+          runId: "r-pair-diff",
+          provider: "codex",
+          model: "gpt-5",
+          cwd: "/repo/t3code",
+          usedTokens: 500,
+          cachedInputTokens: 100,
+          toolErrorCount: 1,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 400,
+          recoveredCommandPair: {
+            failedCommand: "vp test run src/a.test.ts",
+            succeededCommand: "../../node_modules/.bin/vp.cmd test run src/b.test.ts",
+          },
+        });
+
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-pair",
+          runId: "r-pair-same",
+          provider: "codex",
+          model: "gpt-5",
+          cwd: "/repo/t3code",
+          usedTokens: 500,
+          cachedInputTokens: 100,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 300,
+          recoveredCommandPair: {
+            failedCommand: "vp test run src/a.test.ts",
+            succeededCommand: "vp test run src/b.test.ts",
+          },
+        });
+
+        const lessons = yield* rsi.queryLessons();
+        const pairLesson = lessons.find((lesson) =>
+          lesson.guidance.includes("instead of `vp test run`"),
+        );
+        expect(pairLesson).toBeDefined();
+        expect(pairLesson?.guidance).toBe(
+          "Use `../../node_modules/.bin/vp.cmd test run` instead of `vp test run`.",
+        );
+        expect(pairLesson?.projectRoot).toBe("/repo/t3code");
+        expect(
+          lessons.some((lesson) =>
+            lesson.guidance.includes("Use `vp test run` instead of `vp test run`"),
+          ),
+        ).toBe(false);
+      }),
+  );
+
+  it.effect("scrubs multi-line output and user paths from distilled failure lessons", () =>
+    Effect.gen(function* () {
+      const rsi = yield* makeRsiService();
+      const noisyError = [
+        String.raw`Error: module not found at C:\Users\Arthur\Documents\t3code\apps\server\src\foo.ts and /home/arthur/work/bar.ts while invoking command`,
+        "Directory: C:\\Users\\Arthur",
+        "Mode LastWriteTime Length Name",
+      ].join("\n");
+
+      for (const runId of ["r-scrub-1", "r-scrub-2"]) {
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-scrub",
+          runId,
+          provider: "codex",
+          model: "gpt-5",
+          cwd: "/repo/t3code",
+          usedTokens: 600,
+          cachedInputTokens: 100,
+          toolErrorCount: 1,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "failed",
+          durationMs: 300,
+          failureSignature: {
+            tool: "command_execution",
+            errorSignature: noisyError,
+            title: "Avoid command_execution failure",
+            guidance: `Inspect error "${noisyError}" before retrying.`,
+          },
+        });
+      }
+
+      const distilled = (yield* rsi.queryLessons()).find(
+        (lesson) => lesson.title === "Avoid command_execution failure",
+      );
+      expect(distilled).toBeDefined();
+      expect(distilled?.guidance).not.toContain("\n");
+      expect(distilled?.guidance).not.toContain("C:\\Users\\Arthur");
+      expect(distilled?.guidance).not.toContain("/home/arthur");
+      expect(distilled?.guidance).toContain("<path>");
+      expect(distilled?.guidance.length).toBeLessThanOrEqual(160);
+    }),
+  );
+
+  it.effect(
+    "caps in-memory telemetry at 500 records and compacts telemetry.jsonl past 1000 lines",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-compact-" });
+        const rsiDir = path.join(tempRoot, "rsi");
+        const written: Array<string> = [];
+        const persistence = {
+          fs: {
+            ...fs,
+            writeFileString: (filePath, data, options) => {
+              written.push(filePath.replaceAll("\\", "/"));
+              return fs.writeFileString(filePath, data, options);
+            },
+          } satisfies FileSystem.FileSystem,
+          path,
+          rsiDir,
+          lessonsPath: path.join(rsiDir, "lessons.json"),
+          telemetryPath: path.join(rsiDir, "telemetry.jsonl"),
+        };
+        const rsi = yield* makeRsiService({
+          persistence,
+          isAutoDistillEnabled: () => Effect.succeed(false),
+        });
+
+        for (let i = 1; i <= 1005; i += 1) {
+          yield* rsi.recordRunTelemetry({
+            threadId: "t-compact",
+            runId: `r-compact-${i}`,
+            provider: "codex",
+            model: "gpt-5",
+            usedTokens: 100,
+            cachedInputTokens: 50,
+            toolErrorCount: 0,
+            loopTripped: false,
+            safetyBlockedCount: 0,
+            wastedReads: 0,
+            outcome: "completed",
+            durationMs: 100,
+          });
+        }
+
+        const summary = yield* rsi.getTelemetrySummary({ limit: 1_000 });
+        expect(summary.totalRuns).toBe(500);
+        expect(summary.recentRuns[0]?.runId).toBe("r-compact-1005");
+        expect(summary.recentRuns.at(-1)?.runId).toBe("r-compact-506");
+
+        const rawAfter = yield* fs.readFileString(persistence.telemetryPath);
+        const linesAfter = rawAfter.split(/\r?\n/).filter((line) => line.trim() !== "");
+        expect(linesAfter).toHaveLength(504);
+
+        // Compaction goes through a temp file renamed over the original, never an in-place rewrite.
+        const telemetryFile = persistence.telemetryPath.replaceAll("\\", "/");
+        expect(written).toContain(`${telemetryFile}.tmp`);
+        expect(written).not.toContain(telemetryFile);
+        expect(yield* fs.exists(`${persistence.telemetryPath}.tmp`)).toBe(false);
+
+        // Reloading a >1000-line file also compacts telemetry.jsonl down to 500 lines on hydrate.
+        const padded = Array.from({ length: 1002 }, (_, idx) =>
+          JSON.stringify({
+            threadId: "t-reload",
+            runId: `r-reload-${idx + 1}`,
+            provider: "codex",
+            model: "gpt-5",
+            usedTokens: 100,
+            cachedInputTokens: 50,
+            cacheHitRate: 0.5,
+            toolErrorCount: 0,
+            loopTripped: false,
+            safetyBlockedCount: 0,
+            wastedReads: 0,
+            outcome: "completed",
+            durationMs: 100,
+            timestamp: "2026-11-15T00:00:00.000Z",
+          }),
+        ).join("\n");
+        yield* fs.writeFileString(persistence.telemetryPath, `${padded}\n`);
+
+        const reloaded = yield* makeRsiService({ persistence });
+        const reloadedSummary = yield* reloaded.getTelemetrySummary({ limit: 1_000 });
+        expect(reloadedSummary.totalRuns).toBe(500);
+        const compactedRaw = yield* fs.readFileString(persistence.telemetryPath);
+        const compactedLines = compactedRaw.split(/\r?\n/).filter((line) => line.trim() !== "");
+        expect(compactedLines).toHaveLength(500);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("skips rewriting unchanged Obsidian lesson markdown files during sync", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-sync-skip-" });
+      const rsiDir = path.join(tempRoot, "rsi");
+      const vaultRoot = path.join(tempRoot, "vault");
+      const brainDir = path.join(vaultRoot, "T3-Brain");
+
+      const writtenFiles: Array<string> = [];
+      const spyFs: FileSystem.FileSystem = {
+        ...fs,
+        writeFileString: (filePath, data, options) => {
+          writtenFiles.push(filePath.replaceAll("\\", "/"));
+          return fs.writeFileString(filePath, data, options);
+        },
+      };
+
+      const rsi = yield* makeRsiService({
+        persistence: {
+          fs: spyFs,
+          path,
+          rsiDir,
+          lessonsPath: path.join(rsiDir, "lessons.json"),
+          telemetryPath: path.join(rsiDir, "telemetry.jsonl"),
+          resolveObsidianBrainDir: () => Effect.succeed(brainDir),
+        },
+      });
+
+      const first = yield* rsi.recordLesson({
+        key: "manual::obsidian_first",
+        title: "First synced rule",
+        guidance: "Keep first rule unchanged.",
+        scope: "global",
+      });
+
+      const writesAfterFirst = writtenFiles.filter((p) => p.endsWith(`${first.id}.md`)).length;
+      expect(writesAfterFirst).toBe(1);
+
+      writtenFiles.length = 0;
+      yield* rsi.recordLesson({
+        key: "manual::obsidian_second",
+        title: "Second synced rule",
+        guidance: "Different rule triggers persist.",
+        scope: "global",
+      });
+
+      expect(writtenFiles.filter((p) => p.endsWith(`${first.id}.md`)).length).toBe(0);
+      expect(
+        writtenFiles.some((p) => p.includes("/Lessons/") && !p.endsWith(`${first.id}.md`)),
+      ).toBe(true);
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

@@ -146,11 +146,48 @@ function extractEditedSourceFiles(item: OrchestrationV2TurnItem): ReadonlyArray<
   return candidates.filter(VerificationGate.isSourceCodeFile);
 }
 
+function extractRawErrorMessage(item: OrchestrationV2TurnItem): string {
+  const like = item as LoopCircuitBreaker.LoopCircuitBreakerItemLike;
+  if (typeof like.error === "string" && like.error.trim() !== "") {
+    return like.error;
+  }
+  if (typeof like.output === "string" && like.output.trim() !== "") {
+    return like.output;
+  }
+  if (like.output && typeof like.output === "object") {
+    const record = like.output as Record<string, unknown>;
+    if (typeof record.error === "string" && record.error.trim() !== "") {
+      return record.error;
+    }
+    if (typeof record.message === "string" && record.message.trim() !== "") {
+      return record.message;
+    }
+  }
+  return "";
+}
+
+function summarizeFailureTitle(signature: LoopCircuitBreaker.LoopSignature): string {
+  if (signature.itemType === "command_execution") {
+    const subcommand = RsiService.extractToolSubcommand(
+      RsiService.normalizeVerifiedCommand(signature.target),
+    );
+    return RsiService.capTitle(
+      subcommand !== "" ? `Avoid ${subcommand} failure` : "Avoid command failure",
+    );
+  }
+  if (signature.itemType === "file_change") {
+    return "Avoid repeated file edit failure";
+  }
+  const toolName = signature.target.split(":")[0]?.trim() || signature.itemType;
+  return RsiService.capTitle(`Avoid ${toolName} failure`);
+}
+
 function summarizeRunTelemetry(input: {
   readonly threadId: ThreadId;
   readonly run: OrchestrationV2Run;
   readonly providerTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
   readonly turnItems: ReadonlyArray<OrchestrationV2TurnItem>;
+  readonly cwd?: string | undefined;
 }): RsiService.RsiRunTelemetryInput {
   const latestTurn = latestProviderTurnForAttempt(input.providerTurns, input.run.activeAttemptId);
   const runItems = input.turnItems.filter((item) => item.runId === input.run.id);
@@ -166,9 +203,11 @@ function summarizeRunTelemetry(input: {
   let wastedReads = 0;
   let loopTripped = false;
   let lastFailedItem: OrchestrationV2TurnItem | undefined;
+  let recoveredCommandPair: RsiService.RsiRecoveredCommandPair | undefined;
   const seenTargets = new Set<string>();
   const editedFilesSet = new Set<string>();
   const verifiedCommandsSet = new Set<string>();
+  const failedCommandsByTool = new Map<string, string>();
 
   for (const item of runItems) {
     if (item.type === "system_notice") {
@@ -196,15 +235,39 @@ function summarizeRunTelemetry(input: {
     for (const editedFile of extractEditedSourceFiles(item)) {
       editedFilesSet.add(editedFile);
     }
-    if (
-      item.type === "command_execution" &&
-      item.status === "completed" &&
-      typeof item.input === "string" &&
-      VerificationGate.isVerificationCommand(item.input) &&
-      item.outputIndicatesFailure !== true &&
-      (item.exitCode === undefined || item.exitCode === 0)
-    ) {
-      verifiedCommandsSet.add(item.input.trim());
+    if (item.type === "command_execution" && typeof item.input === "string") {
+      const rawCmd = item.input.trim();
+      const normalizedCmd = RsiService.normalizeVerifiedCommand(rawCmd);
+      if (normalizedCmd !== "") {
+        const baseTool = RsiService.extractBaseToolName(normalizedCmd);
+        const commandFailed =
+          item.status === "failed" ||
+          item.outputIndicatesFailure === true ||
+          (typeof item.exitCode === "number" && item.exitCode !== 0);
+        if (commandFailed) {
+          failedCommandsByTool.set(baseTool, normalizedCmd);
+        } else if (item.status === "completed") {
+          const priorFailed = failedCommandsByTool.get(baseTool);
+          if (
+            priorFailed !== undefined &&
+            priorFailed.toLowerCase() !== normalizedCmd.toLowerCase()
+          ) {
+            recoveredCommandPair = {
+              failedCommand: priorFailed,
+              succeededCommand: normalizedCmd,
+            };
+          }
+          failedCommandsByTool.delete(baseTool);
+        }
+      }
+      if (
+        item.status === "completed" &&
+        VerificationGate.isVerificationCommand(item.input) &&
+        item.outputIndicatesFailure !== true &&
+        (item.exitCode === undefined || item.exitCode === 0)
+      ) {
+        verifiedCommandsSet.add(rawCmd);
+      }
     }
   }
 
@@ -221,11 +284,15 @@ function summarizeRunTelemetry(input: {
     lastFailedItem !== undefined
       ? (() => {
           const signature = LoopCircuitBreaker.canonicalizeToolItemSignature(lastFailedItem);
+          const title = summarizeFailureTitle(signature);
+          const rawFirstLine = RsiService.scrubErrorText(extractRawErrorMessage(lastFailedItem));
+          const scrubbedError =
+            rawFirstLine || RsiService.scrubErrorText(signature.error) || "failed";
           return {
             tool: signature.itemType,
-            errorSignature: signature.error || "failed",
-            title: `Avoid repeated failure in ${signature.itemType} (${signature.target})`,
-            guidance: `Inspect error "${signature.error || "failed"}" before retrying ${signature.itemType} on ${signature.target}.`,
+            errorSignature: scrubbedError,
+            title,
+            guidance: `Inspect error "${scrubbedError}" before retrying ${signature.itemType}.`,
           };
         })()
       : loopTripped
@@ -254,9 +321,11 @@ function summarizeRunTelemetry(input: {
     wastedReads,
     outcome: input.run.status,
     durationMs,
+    ...(input.cwd !== undefined && input.cwd.trim() !== "" ? { cwd: input.cwd.trim() } : {}),
     ...(failureSignature !== undefined ? { failureSignature } : {}),
     ...(editedFiles.length > 0 ? { editedFiles } : {}),
     ...(verifiedCommands.length > 0 ? { verifiedCommands } : {}),
+    ...(recoveredCommandPair !== undefined ? { recoveredCommandPair } : {}),
   };
 }
 
@@ -351,6 +420,7 @@ const make = Effect.gen(function* () {
     readonly threadId: ThreadId;
     readonly runId: RunId;
     readonly scopeId: CheckpointScopeId;
+    readonly cwd?: string | undefined;
   }) {
     const records = yield* readThreadRecordsSafe(input);
     if (records === null) {
@@ -419,6 +489,7 @@ const make = Effect.gen(function* () {
         run,
         providerTurns: records.providerTurns,
         turnItems: records.turnItems,
+        ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
       });
       const telemetryInput: RsiService.RsiRunTelemetryInput =
         appliedLessonIds.length > 0
@@ -473,6 +544,7 @@ const make = Effect.gen(function* () {
       threadId: input.threadId,
       runId: input.runId,
       scopeId: input.scopeId,
+      ...(cwd === undefined ? {} : { cwd }),
     });
   });
   return RunFinalizationService.of({ finalize });

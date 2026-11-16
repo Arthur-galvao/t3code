@@ -821,7 +821,7 @@ function RsiObservabilityDiagnostics({
           value={telemetry ? formatPercent(telemetry.avgCacheHitRate, 1) : "..."}
           tooltip={
             telemetry
-              ? `${formatTokens(telemetry.totalCachedInputTokens)} cached input tokens out of ${formatTokens(telemetry.totalTokens)} total tokens.`
+              ? `${formatTokens(telemetry.totalCachedInputTokens)} cached input tokens out of ${formatTokens(telemetry.totalTokens)} context tokens (latest per thread).`
               : undefined
           }
         />

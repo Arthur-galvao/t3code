@@ -367,6 +367,7 @@ const RsiLessonSchema = Schema.Struct({
   triggerCondition: Schema.String,
   scope: RsiLessonScopeSchema,
   globs: Schema.Array(Schema.String),
+  projectRoot: Schema.optional(Schema.String),
   confidence: Schema.Number,
   hits: Schema.Number,
   createdAt: Schema.String,

@@ -31,6 +31,7 @@ export interface RsiLesson {
   readonly triggerCondition: string;
   readonly scope: RsiLessonScope;
   readonly globs: ReadonlyArray<string>;
+  readonly projectRoot?: string | undefined;
   readonly confidence: number;
   readonly hits: number;
   readonly createdAt: string;
@@ -49,6 +50,7 @@ export interface RsiRecordLessonInput {
   readonly triggerCondition?: string | undefined;
   readonly scope?: RsiLessonScope | undefined;
   readonly globs?: ReadonlyArray<string> | undefined;
+  readonly projectRoot?: string | undefined;
   readonly confidence?: number | undefined;
   readonly hits?: number | undefined;
 }
@@ -75,6 +77,11 @@ export interface RsiRunFailureSignature {
   readonly globs?: ReadonlyArray<string> | undefined;
 }
 
+export interface RsiRecoveredCommandPair {
+  readonly failedCommand: string;
+  readonly succeededCommand: string;
+}
+
 export interface RsiRunTelemetryInput {
   readonly threadId: string;
   readonly runId: string;
@@ -95,6 +102,8 @@ export interface RsiRunTelemetryInput {
   readonly appliedLessonIds?: ReadonlyArray<string> | undefined;
   readonly editedFiles?: ReadonlyArray<string> | undefined;
   readonly verifiedCommands?: ReadonlyArray<string> | undefined;
+  readonly recoveredCommandPair?: RsiRecoveredCommandPair | undefined;
+  readonly cwd?: string | undefined;
   readonly timestamp?: string | undefined;
 }
 
@@ -386,46 +395,242 @@ function matchesAnyGlob(
   });
 }
 
-function lessonUtilityScore(lesson: RsiLesson): number {
+const MAX_DISPLAY_COMMAND_CHARS = 80;
+const MAX_TITLE_CHARS = 59;
+const MAX_ERROR_TEXT_CHARS = 160;
+const LESSON_DECAY_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1_000;
+const MAX_IN_MEMORY_TELEMETRY = 500;
+const TELEMETRY_COMPACT_LINE_THRESHOLD = 1_000;
+const SCRIPT_INTERPRETERS = new Set(["python", "python3", "py", "node", "tsx", "ts-node"]);
+const PATH_EXTENSION_REGEX =
+  /\.(?:ts|tsx|js|jsx|mjs|cjs|mts|cts|py|rs|go|css|scss|html|json|md|mdx|yml|yaml)$/i;
+const WINDOWS_ABS_PATH_REGEX = /(?:[a-zA-Z]:\\|[a-zA-Z]:\/)[^\s"'`<>|;,)\]]+/g;
+const UNIX_ABS_PATH_REGEX =
+  /(?<![:\w/])\/(?:Users|home|root|tmp|var|opt|etc|mnt|Volumes|[a-zA-Z]\/Users|[a-zA-Z]\/home)\/[^\s"'`<>|;,)\]]*/gi;
+
+export function scrubErrorText(raw: string): string {
+  const firstLine =
+    raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line !== "") ?? "";
+  if (firstLine === "") return "";
+  const scrubbed = firstLine
+    .replace(WINDOWS_ABS_PATH_REGEX, "<path>")
+    .replace(UNIX_ABS_PATH_REGEX, "<path>")
+    .replace(/\s+/g, " ")
+    .trim();
+  return scrubbed.slice(0, MAX_ERROR_TEXT_CHARS).trimEnd();
+}
+
+function extractBacktickedCommands(guidance: string): ReadonlyArray<string> {
+  const commands: Array<string> = [];
+  const regex = /`([^`]+)`/g;
+  for (const match of guidance.matchAll(regex)) {
+    const normalized = normalizeVerifiedCommand(match[1] ?? "");
+    if (normalized !== "") {
+      commands.push(normalized.toLowerCase());
+    }
+  }
+  return commands;
+}
+
+function isLessonRelatedToRun(
+  lesson: RsiLesson,
+  context: {
+    readonly verifiedCommands: ReadonlyArray<string>;
+    readonly editedFiles: ReadonlyArray<string>;
+    readonly cwd?: string | undefined;
+  },
+): boolean {
+  if (
+    lesson.globs.length > 0 &&
+    context.editedFiles.length > 0 &&
+    matchesAnyGlob(lesson.globs, context.editedFiles, context.cwd)
+  ) {
+    return true;
+  }
+  if (context.verifiedCommands.length > 0) {
+    const normalizedRunCommands = context.verifiedCommands
+      .map((cmd) => normalizeVerifiedCommand(cmd))
+      .filter((cmd) => cmd !== "");
+    if (normalizedRunCommands.length > 0) {
+      const lessonCommands = new Set(extractBacktickedCommands(lesson.guidance));
+      for (const cmd of normalizedRunCommands) {
+        if (lessonCommands.has(cmd.toLowerCase())) {
+          return true;
+        }
+        const sig = normalizeSignaturePart(cmd);
+        if (
+          lesson.key.startsWith("auto::") &&
+          (lesson.key.endsWith(`::${sig}`) || lesson.key.endsWith(`::${sig.slice(0, 48)}`))
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function normalizeProjectRoot(raw: string | null | undefined): string | undefined {
+  if (raw == null) return undefined;
+  const replaced = raw.trim().replaceAll("\\", "/");
+  if (replaced === "") return undefined;
+  if (replaced === "/" || /^[a-zA-Z]:\/$/.test(replaced)) return replaced;
+  return replaced.replace(/\/+$/, "");
+}
+
+// Unifies `/c/x`, `C:\x`, `\\?\C:\x` and `c:/x/`; only drive-letter paths (Windows) are case-insensitive.
+function comparablePath(raw: string | null | undefined): string | undefined {
+  const root = normalizeProjectRoot(raw?.trim().replace(/^\\\\\?\\/, ""))?.replace(
+    /^\/([a-zA-Z])(?=\/|$)/,
+    "$1:",
+  );
+  return root !== undefined && /^[a-zA-Z]:/.test(root) ? root.toLowerCase() : root;
+}
+
+function isSameOrInsidePath(candidateCwd: string | null | undefined, projectRoot: string): boolean {
+  const normCwd = comparablePath(candidateCwd);
+  const normRoot = comparablePath(projectRoot);
+  if (normCwd === undefined || normRoot === undefined) return false;
+  if (normCwd === normRoot) return true;
+  const prefix = normRoot.endsWith("/") ? normRoot : `${normRoot}/`;
+  return normCwd.startsWith(prefix);
+}
+
+// The `auto::` id prefix is also built for manual lessons that supply provider/tool/errorSignature,
+// so the auto-distiller's own rationaleTrace stamp is required too.
+// shortcut: distilled lessons that took a failure signature's rationaleTrace are not recognized and are kept.
+const AUTO_DISTILL_RATIONALE = /^(?:Auto-distilled|Post-success)/;
+
+function isLegacyUnscopedAutoLesson(
+  lesson: Pick<RsiLesson, "id" | "scope" | "projectRoot" | "rationaleTrace">,
+): boolean {
+  return (
+    lesson.id.startsWith("rsi_lesson_auto_") &&
+    AUTO_DISTILL_RATIONALE.test(lesson.rationaleTrace) &&
+    lesson.scope === "global" &&
+    (lesson.projectRoot === undefined || lesson.projectRoot.trim() === "")
+  );
+}
+
+function sameProjectScope(a: string | undefined, b: string | undefined): boolean {
+  const normA = normalizeProjectRoot(a)?.toLowerCase();
+  const normB = normalizeProjectRoot(b)?.toLowerCase();
+  if (normA === undefined && normB === undefined) return true;
+  return normA === normB;
+}
+
+export function extractBaseToolName(command: string): string {
+  const firstToken = command.trim().split(/\s+/)[0] ?? "";
+  const basename = firstToken.replaceAll("\\", "/").split("/").at(-1) ?? firstToken;
+  return basename.replace(/\.(?:cmd|exe|bat|ps1|sh)$/i, "").toLowerCase();
+}
+
+export function normalizeVerifiedCommand(raw: string): string {
+  let cmd = raw.trim().replace(/\s+/g, " ");
+  if (cmd === "") return "";
+  while (/^cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:;|&&)\s*/i.test(cmd)) {
+    cmd = cmd.replace(/^cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:;|&&)\s*/i, "");
+  }
+  cmd = cmd.replace(/^timeout\s+(?:-\S+\s+)*\d+(?:\.\d+)?[smhd]?\s+/i, "");
+  cmd = cmd
+    .replace(/\s*\|\s*.*$/, "")
+    .replace(/\s*(?:2>&1|1>&2|>\s*\/dev\/null)\s*$/g, "")
+    .trim();
+  if (cmd === "") return "";
+  const tokens = cmd.split(/\s+/);
+  const head = tokens[0]!;
+  const headTool = extractBaseToolName(head);
+  const kept: Array<string> = [head];
+  for (let i = 1; i < tokens.length; i += 1) {
+    const token = tokens[i]!;
+    if (token === "--") continue;
+    const isInterpreterScript = i === 1 && tokens.length === 2 && SCRIPT_INTERPRETERS.has(headTool);
+    const isPathToken =
+      !isInterpreterScript &&
+      !token.startsWith("-") &&
+      !token.startsWith("@") &&
+      (token.includes("/") || token.includes("\\") || PATH_EXTENSION_REGEX.test(token));
+    if (!isPathToken) {
+      kept.push(token);
+    }
+  }
+  return kept.join(" ").trim();
+}
+
+export function extractToolSubcommand(normalizedCmd: string): string {
+  const tokens = normalizedCmd.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return "";
+  const tool = extractBaseToolName(tokens[0]!);
+  return [tool, ...tokens.slice(1)].join(" ").trim();
+}
+
+export function capTitle(raw: string, maxLen = MAX_TITLE_CHARS): string {
+  const collapsed = raw.trim().replace(/\s+/g, " ");
+  if (collapsed.length <= maxLen) return collapsed;
+  const sliced = collapsed.slice(0, maxLen);
+  const lastSpace = sliced.lastIndexOf(" ");
+  if (lastSpace > 12) {
+    return sliced.slice(0, lastSpace).trimEnd();
+  }
+  return sliced.trimEnd();
+}
+
+function shortPathHash(value: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36).slice(0, 6);
+}
+
+function lessonUtilityScore(lesson: RsiLesson, nowMs?: number): number {
   const updatedMs = Date.parse(lesson.updatedAt);
+  const baseScore = lesson.confidence * (1 + Math.log1p(Math.max(1, lesson.hits)));
+  const ageMs =
+    nowMs !== undefined && Number.isFinite(updatedMs) ? Math.max(0, nowMs - updatedMs) : 0;
+  const decayFactor = 1 / (1 + ageMs / LESSON_DECAY_HALF_LIFE_MS);
   const recencyTieBreaker = Number.isFinite(updatedMs) ? (updatedMs % 1_000_000_000) / 1e14 : 0;
-  return lesson.confidence * (1 + Math.log1p(Math.max(1, lesson.hits))) + recencyTieBreaker;
+  return baseScore * decayFactor + recencyTieBreaker;
 }
 
 function mergeLessonRecords(existing: RsiLesson, incoming: RsiLesson): RsiLesson {
   const mergedGlobs = Array.from(new Set([...existing.globs, ...incoming.globs]));
   const mergedScope: RsiLessonScope =
     existing.scope === "global" || incoming.scope === "global" ? "global" : "glob";
+  const newer = incoming.updatedAt >= existing.updatedAt ? incoming : existing;
+  const older = newer === incoming ? existing : incoming;
+  const mergedProjectRoot = newer.projectRoot ?? older.projectRoot;
   return {
     ...existing,
-    // Keep the richer guidance/rationale while bumping hits & confidence.
-    title: incoming.title.length > existing.title.length ? incoming.title : existing.title,
-    guidance:
-      incoming.guidance.length >= existing.guidance.length ? incoming.guidance : existing.guidance,
-    rationaleTrace:
-      incoming.rationaleTrace.length > existing.rationaleTrace.length
-        ? incoming.rationaleTrace
-        : existing.rationaleTrace,
-    triggerCondition:
-      incoming.triggerCondition.length > existing.triggerCondition.length
-        ? incoming.triggerCondition
-        : existing.triggerCondition,
+    title: newer.title,
+    guidance: newer.guidance,
+    rationaleTrace: newer.rationaleTrace || older.rationaleTrace,
+    triggerCondition: newer.triggerCondition || older.triggerCondition,
     scope: mergedScope,
-    globs: mergedScope === "global" ? mergedGlobs : mergedGlobs,
+    globs: mergedGlobs,
+    ...(mergedProjectRoot === undefined ? {} : { projectRoot: mergedProjectRoot }),
     confidence: clampConfidence(Math.max(existing.confidence, incoming.confidence) + 0.05),
     hits: existing.hits + Math.max(1, incoming.hits),
-    updatedAt: incoming.updatedAt,
+    updatedAt: newer.updatedAt,
   };
 }
 
 function curateLessonStore(
   currentLessons: ReadonlyArray<RsiLesson>,
   candidate: RsiLesson,
+  nowMs?: number,
 ): { readonly lessons: ReadonlyArray<RsiLesson>; readonly stored: RsiLesson } {
   const next = [...currentLessons];
   let stored: RsiLesson | undefined;
 
-  const exactIndex = next.findIndex((lesson) => lesson.key === candidate.key);
+  const exactIndex = next.findIndex(
+    (lesson) =>
+      lesson.key === candidate.key && sameProjectScope(lesson.projectRoot, candidate.projectRoot),
+  );
   if (exactIndex >= 0) {
     const merged = mergeLessonRecords(next[exactIndex]!, candidate);
     next[exactIndex] = merged;
@@ -437,6 +642,9 @@ function curateLessonStore(
     for (let i = 0; i < next.length; i += 1) {
       const existing = next[i]!;
       if (existing.scope !== candidate.scope) continue;
+      if (!sameProjectScope(existing.projectRoot, candidate.projectRoot)) continue;
+      // Auto lessons already use normalized (provider, tool, signature) keys as canonical identity.
+      if (existing.key.startsWith("auto::") && candidate.key.startsWith("auto::")) continue;
       const similarity = jaccardSimilarity(candidateTokens, lessonTokens(existing));
       if (similarity >= SIMILARITY_MERGE_THRESHOLD && similarity > bestScore) {
         bestScore = similarity;
@@ -454,23 +662,25 @@ function curateLessonStore(
   }
 
   if (next.length > MAX_LESSONS) {
-    next.sort((a, b) => lessonUtilityScore(b) - lessonUtilityScore(a));
+    next.sort((a, b) => lessonUtilityScore(b, nowMs) - lessonUtilityScore(a, nowMs));
     next.length = MAX_LESSONS;
     if (!next.some((lesson) => lesson.id === stored!.id)) {
       // Candidate itself lost to higher-utility lessons; keep the top MAX_LESSONS and return it.
       return { lessons: next, stored: stored! };
     }
   } else {
-    next.sort((a, b) => lessonUtilityScore(b) - lessonUtilityScore(a));
+    next.sort((a, b) => lessonUtilityScore(b, nowMs) - lessonUtilityScore(a, nowMs));
   }
 
   return { lessons: next, stored: stored! };
 }
 
-function stableLessonId(key: string, nowIso: string): string {
+function stableLessonId(key: string, nowIso: string, projectRoot?: string): string {
   const slug = normalizeSignaturePart(key).slice(0, 48);
   const stamp = nowIso.replace(/[^0-9]/g, "").slice(0, 14) || "0";
-  return `rsi_lesson_${slug}_${stamp}`;
+  const projectSuffix =
+    projectRoot !== undefined ? `_${shortPathHash(projectRoot.toLowerCase())}` : "";
+  return `rsi_lesson_${slug}${projectSuffix}_${stamp}`;
 }
 
 function extractProviderFromKey(key: string): string | undefined {
@@ -504,11 +714,6 @@ function roundConfidence(value: number): number {
   return Math.round(value * 1_000) / 1_000;
 }
 
-function normalizeTrackKey(threadId: string, provider: string | undefined): string {
-  const normalizedProvider = provider?.trim().toLowerCase() ?? "";
-  return `${threadId}::${normalizedProvider}`;
-}
-
 function setBoundedMap<V>(
   current: ReadonlyMap<string, V>,
   key: string,
@@ -537,7 +742,10 @@ interface PersistenceHandles {
   readonly resolveObsidianBrainDir?: () => Effect.Effect<string | null>;
 }
 
-function parseLessonsFile(raw: string): ReadonlyArray<RsiLesson> {
+function parseLessonsFileWithStats(raw: string): {
+  readonly lessons: ReadonlyArray<RsiLesson>;
+  readonly droppedLegacy: boolean;
+} {
   try {
     const parsed: unknown = JSON.parse(raw);
     const list: unknown = Array.isArray(parsed)
@@ -548,8 +756,9 @@ function parseLessonsFile(raw: string): ReadonlyArray<RsiLesson> {
           Array.isArray((parsed as { readonly lessons: unknown }).lessons)
         ? (parsed as { readonly lessons: unknown[] }).lessons
         : [];
-    if (!Array.isArray(list)) return [];
+    if (!Array.isArray(list)) return { lessons: [], droppedLegacy: false };
     const valid: Array<RsiLesson> = [];
+    let droppedLegacy = false;
     for (const entry of list) {
       if (
         entry !== null &&
@@ -560,7 +769,12 @@ function parseLessonsFile(raw: string): ReadonlyArray<RsiLesson> {
         typeof (entry as RsiLesson).guidance === "string"
       ) {
         const record = entry as Partial<RsiLesson>;
-        valid.push({
+        const scope: RsiLessonScope = record.scope === "glob" ? "glob" : "global";
+        const projectRoot =
+          typeof record.projectRoot === "string"
+            ? normalizeProjectRoot(record.projectRoot)
+            : undefined;
+        const lesson: RsiLesson = {
           id: record.id!,
           key: record.key!,
           title: record.title!,
@@ -568,22 +782,28 @@ function parseLessonsFile(raw: string): ReadonlyArray<RsiLesson> {
           rationaleTrace: typeof record.rationaleTrace === "string" ? record.rationaleTrace : "",
           triggerCondition:
             typeof record.triggerCondition === "string" ? record.triggerCondition : "",
-          scope: record.scope === "glob" ? "glob" : "global",
+          scope,
           globs: Array.isArray(record.globs)
             ? record.globs.filter((item): item is string => typeof item === "string")
             : [],
+          ...(projectRoot === undefined ? {} : { projectRoot }),
           confidence: clampConfidence(
             typeof record.confidence === "number" ? record.confidence : 0.7,
           ),
           hits: typeof record.hits === "number" && record.hits > 0 ? Math.floor(record.hits) : 1,
           createdAt: typeof record.createdAt === "string" ? record.createdAt : "",
           updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : "",
-        });
+        };
+        if (isLegacyUnscopedAutoLesson(lesson)) {
+          droppedLegacy = true;
+          continue;
+        }
+        valid.push(lesson);
       }
     }
-    return valid.slice(0, MAX_LESSONS);
+    return { lessons: valid.slice(0, MAX_LESSONS), droppedLegacy };
   } catch {
-    return [];
+    return { lessons: [], droppedLegacy: false };
   }
 }
 
@@ -635,6 +855,9 @@ function formatObsidianLessonMarkdown(lesson: RsiLesson): string {
     `confidence: ${lesson.confidence.toFixed(2)}`,
     `hits: ${lesson.hits}`,
     `globs: ${JSON.stringify(lesson.globs)}`,
+    ...(lesson.projectRoot === undefined
+      ? []
+      : [`projectRoot: ${JSON.stringify(lesson.projectRoot)}`]),
     `createdAt: ${JSON.stringify(lesson.createdAt)}`,
     `updatedAt: ${JSON.stringify(lesson.updatedAt)}`,
     `tags: ${JSON.stringify(["t3-memory", "rsi-lesson", lesson.scope])}`,
@@ -849,6 +1072,7 @@ function parseObsidianLessonMarkdown(
   const hits = Number.isFinite(parsedHits) && parsedHits > 0 ? parsedHits : 1;
   const createdAt = parseFrontmatterScalar(meta.get("createdAt") ?? "") || fallbackNowIso;
   const updatedAt = parseFrontmatterScalar(meta.get("updatedAt") ?? "") || fallbackNowIso;
+  const projectRoot = normalizeProjectRoot(parseFrontmatterScalar(meta.get("projectRoot") ?? ""));
 
   return {
     id,
@@ -859,6 +1083,7 @@ function parseObsidianLessonMarkdown(
     triggerCondition: triggerLines.join("\n").trim(),
     scope,
     globs,
+    ...(projectRoot === undefined ? {} : { projectRoot }),
     confidence,
     hits,
     createdAt,
@@ -907,15 +1132,13 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   const lessonsRef = yield* Ref.make<ReadonlyArray<RsiLesson>>([]);
   const telemetryRef = yield* Ref.make<ReadonlyArray<RsiRunTelemetryRecord>>([]);
   const recurrenceRef = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
-  const injectedByThreadProviderRef = yield* Ref.make<ReadonlyMap<string, ReadonlyArray<string>>>(
-    new Map(),
-  );
   const injectedByRunRef = yield* Ref.make<ReadonlyMap<string, ReadonlyArray<string>>>(new Map());
   const lastSyncedCcrRef = yield* Ref.make<{
     readonly tokensSavedEst: number;
     readonly compressedCallsCount: number;
   }>({ tokensSavedEst: 0, compressedCallsCount: 0 });
   const hydratedRef = yield* Ref.make(false);
+  const telemetryFileLinesRef = yield* Ref.make(0);
   const mutex = Semaphore.makeUnsafe(1);
 
   const persistence = input?.persistence;
@@ -939,10 +1162,14 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       for (const lesson of lessons) {
         const fileName = obsidianLessonFileName(lesson.id);
         expectedFiles.add(fileName);
-        yield* persistence.fs.writeFileString(
-          persistence.path.join(lessonsDir, fileName),
-          formatObsidianLessonMarkdown(lesson),
-        );
+        const filePath = persistence.path.join(lessonsDir, fileName);
+        const nextContent = formatObsidianLessonMarkdown(lesson);
+        const existingContent = yield* persistence.fs
+          .readFileString(filePath)
+          .pipe(Effect.orElseSucceed(() => null as string | null));
+        if (existingContent !== nextContent) {
+          yield* persistence.fs.writeFileString(filePath, nextContent);
+        }
       }
 
       const existingEntries = yield* persistence.fs
@@ -956,11 +1183,14 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         }
       }
 
+      const mocPath = persistence.path.join(brainDir, "00-MOC-Memory.md");
       const mocMarkdown = formatObsidianMocMarkdown(lessons, latestLessonUpdatedAt(lessons));
-      yield* persistence.fs.writeFileString(
-        persistence.path.join(brainDir, "00-MOC-Memory.md"),
-        mocMarkdown,
-      );
+      const existingMoc = yield* persistence.fs
+        .readFileString(mocPath)
+        .pipe(Effect.orElseSucceed(() => null as string | null));
+      if (existingMoc !== mocMarkdown) {
+        yield* persistence.fs.writeFileString(mocPath, mocMarkdown);
+      }
     }).pipe(
       Effect.catch((cause) =>
         Effect.logWarning("RsiService: failed to sync Obsidian second-brain vault", { cause }),
@@ -987,6 +1217,8 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         return { lessons: currentLessons, changed: false };
       }
 
+      const parsedNowMs = Date.parse(nowIso);
+      const nowMs = Number.isFinite(parsedNowMs) ? parsedNowMs : undefined;
       let next = [...currentLessons];
       let changed = false;
       for (const fileName of markdownEntries) {
@@ -995,13 +1227,15 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           .pipe(Effect.orElseSucceed(() => ""));
         if (raw.trim() === "") continue;
         const parsed = parseObsidianLessonMarkdown(raw, fileName, nowIso);
-        if (parsed === null) continue;
+        if (parsed === null || isLegacyUnscopedAutoLesson(parsed)) continue;
 
         const existingIdx = next.findIndex(
-          (lesson) => lesson.id === parsed.id || lesson.key === parsed.key,
+          (lesson) =>
+            (lesson.id === parsed.id || lesson.key === parsed.key) &&
+            sameProjectScope(lesson.projectRoot, parsed.projectRoot),
         );
         if (existingIdx < 0) {
-          const curated = curateLessonStore(next, parsed);
+          const curated = curateLessonStore(next, parsed, nowMs);
           next = [...curated.lessons];
           changed = true;
           continue;
@@ -1045,7 +1279,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       }
 
       if (changed) {
-        next.sort((a, b) => lessonUtilityScore(b) - lessonUtilityScore(a));
+        next.sort((a, b) => lessonUtilityScore(b, nowMs) - lessonUtilityScore(a, nowMs));
       }
       return { lessons: next, changed };
     },
@@ -1058,10 +1292,17 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       const lessonsRaw = yield* persistence.fs
         .readFileString(persistence.lessonsPath)
         .pipe(Effect.orElseSucceed(() => ""));
-      let loadedLessons = lessonsRaw.trim() !== "" ? parseLessonsFile(lessonsRaw) : [];
+      const parsedLessons =
+        lessonsRaw.trim() !== ""
+          ? parseLessonsFileWithStats(lessonsRaw)
+          : { lessons: [], droppedLegacy: false };
+      let loadedLessons = parsedLessons.lessons;
       const imported = yield* importObsidianLessonsLocked(loadedLessons, nowIso);
       if (imported.changed) {
         loadedLessons = imported.lessons;
+        yield* Ref.set(lessonsRef, loadedLessons);
+        yield* persistLessonsLocked(loadedLessons);
+      } else if (parsedLessons.droppedLegacy) {
         yield* Ref.set(lessonsRef, loadedLessons);
         yield* persistLessonsLocked(loadedLessons);
       } else if (loadedLessons.length > 0) {
@@ -1072,13 +1313,38 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         .readFileString(persistence.telemetryPath)
         .pipe(Effect.orElseSucceed(() => ""));
       if (telemetryRaw.trim() !== "") {
+        const rawLineCount = telemetryRaw
+          .split(/\r?\n/)
+          .filter((line) => line.trim() !== "").length;
         const telemetryRows = parseTelemetryJsonl(telemetryRaw);
-        yield* Ref.set(telemetryRef, telemetryRows);
-        yield* Ref.set(recurrenceRef, buildRecurrenceCountsFromTelemetry(telemetryRows));
+        const retained = telemetryRows.slice(-MAX_IN_MEMORY_TELEMETRY);
+        yield* Ref.set(telemetryRef, retained);
+        yield* Ref.set(recurrenceRef, buildRecurrenceCountsFromTelemetry(retained));
+        if (rawLineCount > TELEMETRY_COMPACT_LINE_THRESHOLD) {
+          yield* writeCompactedTelemetryLocked(retained);
+          yield* Ref.set(telemetryFileLinesRef, retained.length);
+        } else {
+          yield* Ref.set(telemetryFileLinesRef, rawLineCount);
+        }
       }
     }
     yield* Ref.set(hydratedRef, true);
   });
+
+  const writeCompactedTelemetryLocked = (rows: ReadonlyArray<RsiRunTelemetryRecord>) => {
+    if (persistence === undefined) return Effect.void;
+    const payload = rows.map((row) => encodeTelemetryLine(row)).join("");
+    return Effect.gen(function* () {
+      yield* persistence.fs
+        .makeDirectory(persistence.rsiDir, { recursive: true })
+        .pipe(Effect.ignore);
+      const tmpPath = `${persistence.telemetryPath}.tmp`;
+      yield* persistence.fs.writeFileString(tmpPath, payload);
+      yield* persistence.fs.rename(tmpPath, persistence.telemetryPath);
+    }).pipe(
+      Effect.catch((cause) => Effect.logWarning("Failed to compact RSI telemetry", { cause })),
+    );
+  };
 
   const persistLessonsLocked = Effect.fn("RsiService.persistLessonsLocked")(function* (
     lessons: ReadonlyArray<RsiLesson>,
@@ -1096,8 +1362,15 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
 
   const appendTelemetryLocked = Effect.fn("RsiService.appendTelemetryLocked")(function* (
     record: RsiRunTelemetryRecord,
+    retainedRows: ReadonlyArray<RsiRunTelemetryRecord>,
   ) {
     if (persistence === undefined) return;
+    const nextLines = (yield* Ref.get(telemetryFileLinesRef)) + 1;
+    if (nextLines > TELEMETRY_COMPACT_LINE_THRESHOLD) {
+      yield* writeCompactedTelemetryLocked(retainedRows);
+      yield* Ref.set(telemetryFileLinesRef, retainedRows.length);
+      return;
+    }
     yield* persistence.fs
       .makeDirectory(persistence.rsiDir, { recursive: true })
       .pipe(Effect.ignore);
@@ -1108,6 +1381,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         yield* handle.writeAll(new TextEncoder().encode(line));
       }),
     ).pipe(Effect.catch((cause) => Effect.logWarning("Failed to append RSI telemetry", { cause })));
+    yield* Ref.set(telemetryFileLinesRef, nextLines);
   });
 
   const recordLessonLocked = Effect.fn("RsiService.recordLessonLocked")(function* (
@@ -1118,8 +1392,9 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     const scope: RsiLessonScope =
       lessonInput.scope ?? (lessonInput.globs?.length ? "glob" : "global");
     const globs = normalizeGlobs(lessonInput.globs);
+    const projectRoot = normalizeProjectRoot(lessonInput.projectRoot);
     const candidate: RsiLesson = {
-      id: lessonInput.id?.trim() || stableLessonId(key, nowIso),
+      id: lessonInput.id?.trim() || stableLessonId(key, nowIso, projectRoot),
       key,
       title: lessonInput.title.trim(),
       guidance: lessonInput.guidance.trim(),
@@ -1127,6 +1402,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       triggerCondition: lessonInput.triggerCondition?.trim() ?? "",
       scope: scope === "glob" && globs.length > 0 ? "glob" : "global",
       globs,
+      ...(projectRoot === undefined ? {} : { projectRoot }),
       confidence: clampConfidence(lessonInput.confidence ?? 0.7),
       hits:
         lessonInput.hits !== undefined && Number.isFinite(lessonInput.hits) && lessonInput.hits > 0
@@ -1135,8 +1411,10 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       createdAt: nowIso,
       updatedAt: nowIso,
     };
+    const parsedNowMs = Date.parse(nowIso);
+    const nowMs = Number.isFinite(parsedNowMs) ? parsedNowMs : undefined;
     const current = yield* Ref.get(lessonsRef);
-    const curated = curateLessonStore(current, candidate);
+    const curated = curateLessonStore(current, candidate, nowMs);
     yield* Ref.set(lessonsRef, curated.lessons);
     yield* persistLessonsLocked(curated.lessons);
     return curated.stored;
@@ -1193,7 +1471,9 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       return { matched: false, removedIds: [], updatedLesson: null };
     }
 
-    next.sort((a, b) => lessonUtilityScore(b) - lessonUtilityScore(a));
+    const parsedNowMs = Date.parse(nowIso);
+    const nowMs = Number.isFinite(parsedNowMs) ? parsedNowMs : undefined;
+    next.sort((a, b) => lessonUtilityScore(b, nowMs) - lessonUtilityScore(a, nowMs));
     yield* Ref.set(lessonsRef, next);
     yield* persistLessonsLocked(next);
     return { matched: true, removedIds, updatedLesson };
@@ -1220,7 +1500,9 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     });
 
     if (!changed) return;
-    next.sort((a, b) => lessonUtilityScore(b) - lessonUtilityScore(a));
+    const parsedNowMs = Date.parse(nowIso);
+    const nowMs = Number.isFinite(parsedNowMs) ? parsedNowMs : undefined;
+    next.sort((a, b) => lessonUtilityScore(b, nowMs) - lessonUtilityScore(a, nowMs));
     yield* Ref.set(lessonsRef, next);
     yield* persistLessonsLocked(next);
   });
@@ -1284,30 +1566,23 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     },
     consumeRunId: boolean,
   ): Effect.fn.Return<ReadonlyArray<string>> {
-    if (lookup.runId !== undefined && lookup.runId.trim() !== "") {
-      const byRun = yield* Ref.get(injectedByRunRef);
-      const matched = byRun.get(lookup.runId);
-      if (matched !== undefined) {
-        if (consumeRunId) {
-          yield* Ref.update(injectedByRunRef, (current) => {
-            const copy = new Map(current);
-            copy.delete(lookup.runId!);
-            return copy;
-          });
-        }
-        return matched;
-      }
+    if (lookup.runId === undefined || lookup.runId.trim() === "") {
+      return [];
     }
-    const byThreadProvider = yield* Ref.get(injectedByThreadProviderRef);
-    const providerKey = normalizeTrackKey(lookup.threadId, lookup.provider);
-    const matchedByProvider = byThreadProvider.get(providerKey);
-    if (matchedByProvider !== undefined) {
-      return matchedByProvider;
+    const runId = lookup.runId.trim();
+    const byRun = yield* Ref.get(injectedByRunRef);
+    const matched = byRun.get(runId);
+    if (matched === undefined) {
+      return [];
     }
-    if (lookup.provider === undefined) {
-      return byThreadProvider.get(normalizeTrackKey(lookup.threadId, undefined)) ?? [];
+    if (consumeRunId) {
+      yield* Ref.update(injectedByRunRef, (current) => {
+        const copy = new Map(current);
+        copy.delete(runId);
+        return copy;
+      });
     }
-    return [];
+    return matched;
   });
 
   const recordRunTelemetry: RsiServiceShape["recordRunTelemetry"] = Effect.fn(
@@ -1389,13 +1664,20 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
             : normalizedSafetyBlocks > 0
               ? "safety_guard"
               : "runtime");
-        const failureErrorSignature =
+        const rawFailureErrorSignature =
           sig?.errorSignature ??
           (telemetryInput.loopTripped
             ? `loop_${telemetryInput.outcome}`
             : normalizedSafetyBlocks > 0
               ? "safety_block"
               : `run_${telemetryInput.outcome}`);
+        const failureErrorSignature = scrubErrorText(rawFailureErrorSignature) || "failed";
+        const scrubbedSigGuidance =
+          sig?.guidance === undefined ? undefined : scrubErrorText(sig.guidance) || undefined;
+        const scrubbedSigTrigger =
+          sig?.triggerCondition === undefined
+            ? undefined
+            : scrubErrorText(sig.triggerCondition) || undefined;
         const recurrenceKey = hasFailureSignal
           ? buildAutoLessonKey({
               provider: telemetryInput.provider,
@@ -1428,8 +1710,10 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           timestamp: nowIso,
         };
 
-        yield* Ref.update(telemetryRef, (rows) => [...rows, record]);
-        yield* appendTelemetryLocked(record);
+        const retainedRows = yield* Ref.updateAndGet(telemetryRef, (rows) =>
+          [...rows, record].slice(-MAX_IN_MEMORY_TELEMETRY),
+        );
+        yield* appendTelemetryLocked(record, retainedRows);
 
         const resolvedAppliedIds =
           telemetryInput.appliedLessonIds !== undefined
@@ -1456,13 +1740,32 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
 
         if (appliedIdSet.size > 0) {
           if (cleanSuccess) {
-            yield* boostLessonsLocked(appliedIdSet, 0.05, nowIso);
+            const currentLessons = yield* Ref.get(lessonsRef);
+            const runContext = {
+              verifiedCommands: telemetryInput.verifiedCommands ?? [],
+              editedFiles: telemetryInput.editedFiles ?? [],
+              cwd: telemetryInput.cwd,
+            };
+            const relatedAppliedIds = new Set(
+              currentLessons
+                .filter(
+                  (lesson) =>
+                    (appliedIdSet.has(lesson.id) || appliedIdSet.has(lesson.key)) &&
+                    isLessonRelatedToRun(lesson, runContext),
+                )
+                .map((lesson) => lesson.id),
+            );
+            if (relatedAppliedIds.size > 0) {
+              yield* boostLessonsLocked(relatedAppliedIds, 0.05, nowIso);
+            }
           } else if (shouldDemoteApplied) {
             yield* demoteLessonLocked(appliedIdSet, 0.1, nowIso);
           }
         }
 
-        if (!autoDistill) return record;
+        const projectRoot = normalizeProjectRoot(telemetryInput.cwd);
+        // Without a cwd the lesson would be stored unscoped, injected everywhere and dropped on restart.
+        if (!autoDistill || projectRoot === undefined) return record;
         let distilledForSignature = false;
 
         if (hasFailureSignal && recurrenceKey !== undefined) {
@@ -1476,13 +1779,14 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
 
           if (record.loopTripped || updatedCount >= 2) {
             distilledForSignature = true;
-            const title =
+            const rawTitle =
               sig?.title ??
               (record.loopTripped
                 ? `Avoid ${failureTool} loop (${record.provider})`
                 : `Recurring ${failureTool} failure (${record.provider})`);
+            const title = capTitle(rawTitle);
             const guidance =
-              sig?.guidance ??
+              scrubbedSigGuidance ??
               (record.loopTripped
                 ? `Breaker tripped on ${failureTool} (${failureErrorSignature}); inspect tool inputs or switch approach before retrying.`
                 : `Repeated ${failureTool} failures for ${failureErrorSignature}; verify preconditions and paths before re-running.`);
@@ -1498,10 +1802,11 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
                   sig?.rationaleTrace ??
                   `Auto-distilled from run ${record.runId} (outcome=${record.outcome}, toolErrors=${record.toolErrorCount}, loopTripped=${record.loopTripped}, occurrences=${updatedCount}).`,
                 triggerCondition:
-                  sig?.triggerCondition ??
+                  scrubbedSigTrigger ??
                   `${record.provider}:${failureTool}:${failureErrorSignature}`,
                 ...(sig?.scope === undefined ? {} : { scope: sig.scope }),
                 ...(sig?.globs === undefined ? {} : { globs: sig.globs }),
+                ...(projectRoot === undefined ? {} : { projectRoot }),
                 confidence: record.loopTripped ? 0.78 : 0.65,
               },
               nowIso,
@@ -1520,12 +1825,13 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
               provider: record.provider,
               tool: "read_file",
               errorSignature: "wasted_reads",
-              title: `Avoid repeated full-file reads (${record.provider})`,
+              title: capTitle(`Avoid repeated full-file reads (${record.provider})`),
               guidance:
                 "Locate symbols first, read bounded line ranges, and use context_retrieve for [T3 CCR:...] blocks instead of re-reading unchanged files.",
               rationaleTrace: `Auto-distilled token-economy rule from run ${record.runId} (wastedReads=${record.wastedReads}).`,
               triggerCondition: "Before opening files in repeated search/read cycles",
               scope: "global",
+              ...(projectRoot === undefined ? {} : { projectRoot }),
               confidence: 0.72,
             },
             nowIso,
@@ -1541,82 +1847,130 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
                 .filter((filePath) => filePath !== ""),
             ),
           );
-          const verifiedCommands = Array.from(
+          const normalizedCommands = Array.from(
             new Set(
               (telemetryInput.verifiedCommands ?? [])
-                .map((cmd) => cmd.trim())
+                .map((cmd) => normalizeVerifiedCommand(cmd))
                 .filter((cmd) => cmd !== ""),
             ),
           );
 
-          if (editedFiles.length > 0 && verifiedCommands.length > 0) {
-            const primaryCommand = verifiedCommands[0]!.slice(0, 120);
+          if (editedFiles.length > 0 && normalizedCommands.length > 0) {
+            const primaryCommand = normalizedCommands[0]!;
             const verifyKey = buildAutoLessonKey({
               provider: "global",
               tool: "verify",
               errorSignature: normalizeSignaturePart(primaryCommand).slice(0, 48) || "verify",
             });
-            const commandSummary =
-              verifiedCommands.length > 1
-                ? verifiedCommands
-                    .slice(0, 2)
-                    .map((cmd) => `\`${cmd.slice(0, 80)}\``)
-                    .join(" and ")
-                : `\`${primaryCommand}\``;
+            const displayCommands = normalizedCommands
+              .filter((cmd) => cmd.length <= MAX_DISPLAY_COMMAND_CHARS)
+              .slice(0, 2);
+            const guidance =
+              displayCommands.length > 0
+                ? `Run ${displayCommands.map((cmd) => `\`${cmd}\``).join(" and ")} to verify source edits before finishing.`
+                : "Run the project verification check before finishing.";
+            const subcommand = extractToolSubcommand(primaryCommand);
+            const title = capTitle(
+              subcommand !== "" ? `Verify edits with ${subcommand}` : "Verify workspace edits",
+            );
             yield* recordLessonLocked(
               {
                 key: verifyKey,
                 provider: "global",
                 tool: "verify",
                 errorSignature: primaryCommand,
-                title: `Verified workspace check: ${primaryCommand}`,
-                guidance: `Run ${commandSummary} to verify source edits before finishing.`,
+                title,
+                guidance,
                 rationaleTrace: `Post-success distillation from run ${record.runId} after editing ${editedFiles.length} file(s) with passing verification.`,
                 triggerCondition: "After editing workspace source files",
                 scope: "global",
+                ...(projectRoot === undefined ? {} : { projectRoot }),
                 confidence: 0.72,
               },
               nowIso,
             );
           }
 
-          if (
+          const pair = telemetryInput.recoveredCommandPair;
+          const pairFailed = pair !== undefined ? normalizeVerifiedCommand(pair.failedCommand) : "";
+          const pairSucceeded =
+            pair !== undefined ? normalizeVerifiedCommand(pair.succeededCommand) : "";
+          const hasValidRecoveryPair =
+            pairFailed !== "" &&
+            pairSucceeded !== "" &&
+            pairFailed.length <= MAX_DISPLAY_COMMAND_CHARS &&
+            pairSucceeded.length <= MAX_DISPLAY_COMMAND_CHARS &&
+            extractBaseToolName(pairFailed) === extractBaseToolName(pairSucceeded) &&
+            pairFailed.toLowerCase() !== pairSucceeded.toLowerCase();
+
+          if (!distilledForSignature && hasValidRecoveryPair) {
+            const pairSig = `${pairSucceeded}_instead_of_${pairFailed}`;
+            const pairKey = buildAutoLessonKey({
+              provider: record.provider,
+              tool: "recovery",
+              errorSignature: pairSig,
+            });
+            const pairTitle = `Use ${pairSucceeded} instead of ${pairFailed}`;
+            yield* recordLessonLocked(
+              {
+                key: pairKey,
+                provider: record.provider,
+                tool: "recovery",
+                errorSignature: pairSig,
+                title: capTitle(
+                  pairTitle.length <= MAX_TITLE_CHARS ? pairTitle : `Use ${pairSucceeded}`,
+                ),
+                guidance: `Use \`${pairSucceeded}\` instead of \`${pairFailed}\`.`,
+                rationaleTrace: `Post-success recovery pair from run ${record.runId} (${pairFailed} -> ${pairSucceeded}).`,
+                triggerCondition: `When ${extractBaseToolName(pairSucceeded)} command fails`,
+                scope: "global",
+                ...(projectRoot === undefined ? {} : { projectRoot }),
+                confidence: 0.7,
+              },
+              nowIso,
+            );
+          } else if (
             record.toolErrorCount > 0 &&
             !distilledForSignature &&
-            (verifiedCommands.length > 0 || editedFiles.length > 0 || sig !== undefined)
+            (normalizedCommands.length > 0 || editedFiles.length > 0 || sig !== undefined)
           ) {
             const recoveryTool = sig?.tool ?? "recovery";
+            const recoveryCmd =
+              normalizedCommands.length > 0 &&
+              normalizedCommands[0]!.length <= MAX_DISPLAY_COMMAND_CHARS
+                ? normalizedCommands[0]!
+                : undefined;
             const recoverySig =
-              sig?.errorSignature ??
-              (verifiedCommands.length > 0
-                ? verifiedCommands[0]!.slice(0, 80)
-                : "recovered_after_tool_errors");
+              scrubErrorText(sig?.errorSignature ?? "") ||
+              (recoveryCmd ?? "recovered_after_tool_errors");
             const recoveryKey = buildAutoLessonKey({
               provider: record.provider,
               tool: recoveryTool,
               errorSignature: recoverySig,
             });
+            const rawRecoveryTitle = sig?.title
+              ? `Recovered: ${sig.title}`
+              : `Verify preconditions before ${recoveryTool} (${record.provider})`;
             yield* recordLessonLocked(
               {
                 key: recoveryKey,
                 provider: record.provider,
                 tool: recoveryTool,
                 errorSignature: recoverySig,
-                title: sig?.title
-                  ? `Recovered: ${sig.title}`
-                  : `Verify preconditions before ${recoveryTool} (${record.provider})`,
+                title: capTitle(rawRecoveryTitle),
                 guidance:
-                  verifiedCommands.length > 0
-                    ? `Recovered after ${record.toolErrorCount} tool error(s); verify changes with \`${verifiedCommands[0]!.slice(0, 120)}\`.`
-                    : (sig?.guidance ??
+                  recoveryCmd !== undefined
+                    ? `Recovered after ${record.toolErrorCount} tool error(s); verify changes with \`${recoveryCmd}\`.`
+                    : (scrubbedSigGuidance ??
                       `Recovered after ${record.toolErrorCount} tool error(s); inspect paths and preconditions before editing.`),
                 rationaleTrace:
                   sig?.rationaleTrace ??
                   `Post-success recovery distillation from run ${record.runId} (${record.toolErrorCount} tool error(s) resolved).`,
                 triggerCondition:
-                  sig?.triggerCondition ?? `${record.provider}:${recoveryTool}:${recoverySig}`,
+                  scrubbedSigTrigger ?? `${record.provider}:${recoveryTool}:${recoverySig}`,
                 scope: sig?.scope ?? "global",
                 ...(sig?.globs === undefined ? {} : { globs: sig.globs }),
+                ...(projectRoot === undefined ? {} : { projectRoot }),
                 confidence: 0.68,
               },
               nowIso,
@@ -1631,17 +1985,12 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
 
   const queryLessons: RsiServiceShape["queryLessons"] = Effect.fn("RsiService.queryLessons")(
     function* (queryInput) {
-      const nowIso = DateTime.formatIso(yield* DateTime.now);
+      const now = yield* DateTime.now;
+      const nowMs = DateTime.toEpochMillis(now);
       const lessons = yield* mutex.withPermits(1)(
         Effect.gen(function* () {
           yield* hydrateLocked();
-          const current = yield* Ref.get(lessonsRef);
-          const synced = yield* importObsidianLessonsLocked(current, nowIso);
-          if (synced.changed) {
-            yield* Ref.set(lessonsRef, synced.lessons);
-            yield* persistLessonsLocked(synced.lessons);
-          }
-          return synced.lessons;
+          return yield* Ref.get(lessonsRef);
         }),
       );
       const minConfidence = queryInput?.minConfidence ?? 0;
@@ -1658,6 +2007,14 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         .filter((lesson) => {
           if (lesson.confidence < minConfidence) return false;
           if (queryInput?.scope !== undefined && lesson.scope !== queryInput.scope) return false;
+          // A passed cwd (even null) is a session context; omitting it lists everything for the UI.
+          if (
+            queryInput?.cwd !== undefined &&
+            lesson.projectRoot !== undefined &&
+            !isSameOrInsidePath(queryInput.cwd, lesson.projectRoot)
+          ) {
+            return false;
+          }
           if (normalizedProvider !== undefined) {
             const lessonProvider = extractProviderFromKey(lesson.key);
             if (lessonProvider !== undefined && lessonProvider !== normalizedProvider) return false;
@@ -1677,7 +2034,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           const globMatched =
             lesson.scope === "glob" && matchesAnyGlob(lesson.globs, activePaths, queryInput?.cwd);
           const priorityBoost = globMatched ? 10 : lesson.scope === "global" ? 2 : 0;
-          return { lesson, rank: priorityBoost + lessonUtilityScore(lesson), globMatched };
+          return { lesson, rank: priorityBoost + lessonUtilityScore(lesson, nowMs), globMatched };
         })
         .filter((entry) =>
           activePaths.length > 0 ? entry.lesson.scope === "global" || entry.globMatched : true,
@@ -1724,8 +2081,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     let safetyBlocks = 0;
     let totalToolErrors = 0;
     let totalWastedReads = 0;
-    let totalTokens = 0;
-    let totalCachedInputTokens = 0;
+    const latestByThread = new Map<string, RsiRunTelemetryRecord>();
     let totalTokensSavedEst = 0;
     let totalCompressedCalls = 0;
     let cacheHitRateSum = 0;
@@ -1749,8 +2105,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       safetyBlocks += row.safetyBlockedCount;
       totalToolErrors += row.toolErrorCount;
       totalWastedReads += row.wastedReads;
-      totalTokens += row.usedTokens;
-      totalCachedInputTokens += row.cachedInputTokens;
+      latestByThread.set(row.threadId, row);
       totalTokensSavedEst += clampNonNegativeNumber(row.tokensSavedEst ?? 0);
       totalCompressedCalls += Math.floor(clampNonNegativeNumber(row.compressedCallsCount ?? 0));
       cacheHitRateSum += row.cacheHitRate;
@@ -1781,6 +2136,14 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           : lastSynced.compressedCallsCount;
       totalTokensSavedEst += Math.max(0, storeStats.tokensSavedEst - baseTokens);
       totalCompressedCalls += Math.max(0, storeStats.compressedCallsCount - baseCalls);
+    }
+
+    // usedTokens is the context size of a run's last message, not spend: count each thread's latest run once.
+    let totalTokens = 0;
+    let totalCachedInputTokens = 0;
+    for (const row of latestByThread.values()) {
+      totalTokens += row.usedTokens;
+      totalCachedInputTokens += row.cachedInputTokens;
     }
 
     const totalRuns = filtered.length;
@@ -1825,15 +2188,17 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           ? distillTechnicalPromptSpec(prefixInput.userPrompt).specHint
           : undefined;
       const lessons = yield* queryLessons({
-        ...(prefixInput.cwd === undefined ? {} : { cwd: prefixInput.cwd }),
+        cwd: prefixInput.cwd ?? null,
         ...(prefixInput.provider === undefined ? {} : { provider: prefixInput.provider }),
         activePaths,
         minConfidence: 0.4,
       });
       const eligible = lessons.filter(
         (lesson) =>
-          lesson.scope === "global" ||
-          (activePaths.length > 0 && matchesAnyGlob(lesson.globs, activePaths, prefixInput.cwd)),
+          (lesson.projectRoot === undefined ||
+            isSameOrInsidePath(prefixInput.cwd, lesson.projectRoot)) &&
+          (lesson.scope === "global" ||
+            (activePaths.length > 0 && matchesAnyGlob(lesson.globs, activePaths, prefixInput.cwd))),
       );
 
       let prefix = "";
@@ -1876,34 +2241,16 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         prefix = specHint.length <= maxChars ? specHint : specHint.slice(0, maxChars);
       }
 
-      if (prefixInput.threadId !== undefined && prefixInput.threadId.trim() !== "") {
-        const threadId = prefixInput.threadId.trim();
+      if (
+        prefixInput.threadId !== undefined &&
+        prefixInput.threadId.trim() !== "" &&
+        prefixInput.runId !== undefined &&
+        prefixInput.runId.trim() !== ""
+      ) {
         const trackedIds: ReadonlyArray<string> = [...lessonIds];
-        yield* Ref.update(injectedByThreadProviderRef, (map) => {
-          let next = setBoundedMap(
-            map,
-            normalizeTrackKey(threadId, prefixInput.provider),
-            trackedIds,
-            MAX_TRACKED_RUN_LESSONS,
-          );
-          if (
-            prefixInput.providerInstanceId !== undefined &&
-            prefixInput.providerInstanceId.trim() !== ""
-          ) {
-            next = setBoundedMap(
-              next,
-              normalizeTrackKey(threadId, prefixInput.providerInstanceId),
-              trackedIds,
-              MAX_TRACKED_RUN_LESSONS,
-            );
-          }
-          return next;
-        });
-        if (prefixInput.runId !== undefined && prefixInput.runId.trim() !== "") {
-          yield* Ref.update(injectedByRunRef, (map) =>
-            setBoundedMap(map, prefixInput.runId!.trim(), trackedIds, MAX_TRACKED_RUN_LESSONS),
-          );
-        }
+        yield* Ref.update(injectedByRunRef, (map) =>
+          setBoundedMap(map, prefixInput.runId!.trim(), trackedIds, MAX_TRACKED_RUN_LESSONS),
+        );
       }
 
       return { prefix, lessonIds };
