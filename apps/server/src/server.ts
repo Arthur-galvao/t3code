@@ -83,6 +83,7 @@ import * as SecretCheck from "./secrets/SecretCheck.ts";
 import * as SecretResolver from "./secrets/SecretResolver.ts";
 import * as ProviderInstanceRegistryHydration from "./provider/ProviderInstanceRegistryHydration.ts";
 import * as ProjectSettingsOverrideSweep from "./provider/ProjectSettingsOverrideSweep.ts";
+import { installBundledSkills } from "./skills/installBundledSkills.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as PeerForwarding from "./peer/PeerForwarding.ts";
@@ -722,6 +723,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ProviderInstallation.layer,
   ReplayMarkers.layer,
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
+  Layer.effectDiscard(installBundledSkills(process.env)),
 ).pipe(
   Layer.provideMerge(layerOrchestrationApplication),
   Layer.provideMerge(RuntimeLayer.layerEventInfrastructure),
