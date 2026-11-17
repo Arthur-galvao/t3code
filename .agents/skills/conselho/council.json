@@ -1,0 +1,29 @@
+{
+  "minQuorum": 2,
+  "members": [
+    {
+      "name": "Hydrogen",
+      "target": {
+        "providerInstanceId": "antigravity",
+        "model": "gemini-4-hydrogen",
+        "options": { "thought_level": "medium" }
+      }
+    },
+    {
+      "name": "Opus",
+      "target": {
+        "providerInstanceId": "claudeAgent",
+        "model": "claude-opus-5-5",
+        "options": { "effort": "medium" }
+      }
+    },
+    {
+      "name": "Sonnet",
+      "target": {
+        "providerInstanceId": "claudeAgent",
+        "model": "claude-sonnet-5-5",
+        "options": { "effort": "high" }
+      }
+    }
+  ]
+}
