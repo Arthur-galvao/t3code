@@ -1,7 +1,7 @@
 ---
 name: conselho
-description: Convoca um conselho de modelos configurado em council.json (padrão: Gemini 4 Hydrogen medium, Claude Opus 5.5 medium, Claude Sonnet 5.5 high) para avaliar algo de forma independente e depois sintetiza consenso, divergências e veredito. Só roda via /conselho <assunto>.
-argument-hint: <o que deve ser avaliado: ideia, código, arquivo, decisão, texto>
+description: "Convoca um conselho de modelos configurado em council.json (padrão: Gemini 4 Hydrogen medium, Claude Opus 5.5 medium, Claude Sonnet 5.5 high) para avaliar algo de forma independente e depois sintetiza consenso, divergências e veredito. Só roda via /conselho <assunto>."
+argument-hint: "<o que deve ser avaliado: ideia, código, arquivo, decisão, texto>"
 disable-model-invocation: true
 allowed-tools: ToolSearch, Read, Grep, Glob, Write, PowerShell(git status:*), PowerShell(git diff:*), PowerShell(Get-FileHash:*), PowerShell(Get-Item:*), PowerShell(Remove-Item:*), mcp__t3-code__orchestrator_capabilities, mcp__t3-code__delegate_task, mcp__t3-code__task_status, mcp__t3-code__task_cancel, mcp__t3-code__t3_pending_request, mcp__t3-code__python
 ---
