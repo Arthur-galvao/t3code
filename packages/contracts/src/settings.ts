@@ -1463,7 +1463,7 @@ export const ServerSettings = Schema.Struct({
   contextCompressionEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   outputShaperEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   /** Experimental: one persistent `python` tool for every agent; built-in tools are removed where the harness allows it. */
-  pythonReplMode: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  pythonReplMode: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   verificationGateMode: VerificationGateMode.pipe(
     Schema.withDecodingDefault(Effect.succeed("auto" as const)),
   ),

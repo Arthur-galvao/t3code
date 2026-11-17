@@ -1562,6 +1562,8 @@ it.effect("hides tools for links and refuses another environment while the beta 
       );
       const settingsContext = yield* Layer.build(ServerSettings.layerTest());
       const settings = Context.get(settingsContext, ServerSettings.ServerSettingsService);
+      // The Python REPL defaults on; start from off to observe the setting granting it.
+      yield* settings.updateSettings({ pythonReplMode: false });
       const serverLayer = McpHttpServer.layerMcpTransport(
         McpHttpServer.toolkitRegistration(
           LinksToolkit,
