@@ -16,15 +16,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork main
-        uses: actions/checkout@v6
-        with:
-          ref: main
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags origin main
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout -B main origin/main
 
       - name: Fetch upstream pingdotgg/t3code
         id: check
@@ -41,7 +43,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git merge --no-edit upstream/main
+          if ! git merge --no-edit upstream/main; then
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            echo "::error::Upstream merge has conflicts; manual resolution required."
+            exit 1
+          fi
 
       - name: Setup Vite+ for release metadata
         if: steps.check.outputs.ahead != '0'
@@ -61,7 +68,10 @@ jobs:
           $sha = (& git rev-parse HEAD).Trim()
           $meta = & node scripts/resolve-nightly-release.ts --date $date --run-number "${{ github.run_number }}" --sha $sha --channel nightly
           $tagLine = $meta | Where-Object { $_ -like "tag=*" } | Select-Object -First 1
-          $tag = $tagLine.Substring(4)
+          $tag = if ($tagLine) { $tagLine.Substring(4).Trim() } else { "" }
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw "Failed to resolve nightly release tag from resolve-nightly-release.ts output"
+          }
           & git tag -f $tag
           & git push origin main
           & git push origin $tag --force

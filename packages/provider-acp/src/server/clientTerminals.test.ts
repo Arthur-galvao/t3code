@@ -164,9 +164,12 @@ describe("AcpClientTerminals", () => {
         environmentForSession: () => ({ T3_ACP_MCP_NODE: "mailbox-probe" }),
       });
       yield* Effect.addFinalizer(() => terminals.disposeAll);
+      const command = (yield* HostProcess.isWindows)
+        ? `echo %T3_ACP_MCP_NODE% | "${process.execPath}" -e "const fs=require('node:fs');console.log(fs.readFileSync(0,'utf8').trim().toUpperCase())"`
+        : 'printf "%s\\n" "$T3_ACP_MCP_NODE" | tr a-z A-Z';
       const terminal = yield* terminals.create({
         sessionId: "devin",
-        command: 'printf "%s\\n" "$T3_ACP_MCP_NODE" | tr a-z A-Z',
+        command,
       });
       const exit = yield* terminals.waitForExit({ sessionId: "devin", ...terminal });
       const output = yield* terminals.output({ sessionId: "devin", ...terminal });

@@ -173,23 +173,36 @@ const syncSkillDirs = Effect.gen(function* () {
     }
     let copied = 0;
     for (const skill of skillNames) {
-      const srcFile = path.join(sourceDir, skill, "SKILL.md");
-      if (!(yield* fs.exists(srcFile))) continue;
-      const destFile = path.join(targetRoot, skill, "SKILL.md");
-      const srcText = yield* fs.readFileString(srcFile);
-      const destText = (yield* fs.exists(destFile)) ? yield* fs.readFileString(destFile) : null;
-      if (srcText !== destText) {
-        if (!dryRun) {
-          yield* fs.makeDirectory(path.dirname(destFile), { recursive: true });
-          yield* fs.writeFileString(destFile, srcText);
+      const skillSourceDir = path.join(sourceDir, skill);
+      const skillMarker = path.join(skillSourceDir, "SKILL.md");
+      if (!(yield* fs.exists(skillMarker))) continue;
+
+      const skillEntries = yield* fs.readDirectory(skillSourceDir);
+      for (const fileName of skillEntries) {
+        if (fileName.startsWith(".")) continue;
+        const srcFile = path.join(skillSourceDir, fileName);
+        const fileInfo = yield* fs.stat(srcFile);
+        if (fileInfo.type !== "File") continue;
+
+        const destFile = path.join(targetRoot, skill, fileName);
+        const destExists = yield* fs.exists(destFile);
+        if (fileName === "council.json" && destExists) continue;
+
+        const srcText = yield* fs.readFileString(srcFile);
+        const destText = destExists ? yield* fs.readFileString(destFile) : null;
+        if (srcText !== destText) {
+          if (!dryRun) {
+            yield* fs.makeDirectory(path.dirname(destFile), { recursive: true });
+            yield* fs.writeFileString(destFile, srcText);
+          }
+          copied += 1;
         }
-        copied += 1;
       }
     }
     yield* logAction(
       "skills",
       targetRoot,
-      copied > 0 ? `synced ${copied} skill(s)` : "already in sync",
+      copied > 0 ? `synced ${copied} skill file(s)` : "already in sync",
     );
   }
 });

@@ -116,12 +116,20 @@ function LiquidGlassAsciiStage() {
 
     resize();
     syncLoop();
+    const classObserver = new MutationObserver(() => {
+      draw();
+    });
+    classObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class"],
+    });
     window.addEventListener("resize", resize);
     window.addEventListener("pointermove", handlePointerMove, { passive: true });
     document.addEventListener("visibilitychange", syncLoop);
     motionQuery.addEventListener("change", syncLoop);
 
     return () => {
+      classObserver.disconnect();
       window.cancelAnimationFrame(rafId);
       window.removeEventListener("resize", resize);
       window.removeEventListener("pointermove", handlePointerMove);
