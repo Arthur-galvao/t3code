@@ -29,6 +29,7 @@ export interface CcrRetrieveInput {
   readonly query?: string | undefined;
   readonly startLine?: number | undefined;
   readonly endLine?: number | undefined;
+  readonly contextLines?: number | undefined;
   readonly maxChars?: number | undefined;
 }
 
@@ -94,6 +95,7 @@ export interface CcrStore {
 const DEFAULT_MAX_ENTRIES = 200;
 const DEFAULT_MAX_BYTES = 20_000_000;
 const DEFAULT_MAX_ENTRIES_PER_THREAD = 100;
+const MAX_CONTEXT_LINES = 20;
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_PERSIST_DEBOUNCE_MS = 250;
 const DEFAULT_RETRIEVE_MAX_CHARS = 12_000;
@@ -523,19 +525,23 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
 
     const query = input.query !== undefined && input.query.trim() !== "" ? input.query : undefined;
     const matcher = query !== undefined ? buildLineMatcher(query) : undefined;
+    const contextLines =
+      matcher !== undefined &&
+      input.contextLines !== undefined &&
+      Number.isFinite(input.contextLines)
+        ? Math.min(MAX_CONTEXT_LINES, Math.max(0, Math.floor(input.contextLines)))
+        : 0;
 
-    const matched: Array<{ readonly lineNum: number; readonly formatted: string }> = [];
+    const matchedLineNumbers: Array<number> = [];
     for (let lineNum = effectiveStart; lineNum <= effectiveEnd; lineNum += 1) {
       const lineText = lines[lineNum - 1] ?? "";
       if (matcher === undefined || matcher(lineText)) {
-        matched.push({
-          lineNum,
-          formatted: `L${lineNum}: ${lineText}`,
-        });
+        matchedLineNumbers.push(lineNum);
       }
     }
 
-    if (matched.length === 0) {
+    const exactMatchCount = matchedLineNumbers.length;
+    if (exactMatchCount === 0) {
       return {
         found: true,
         ccrId: entry.ccrId,
@@ -550,17 +556,51 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
       };
     }
 
+    const candidateItems: Array<{ readonly lineNum?: number; readonly formatted: string }> = [];
+    if (contextLines === 0 || matcher === undefined) {
+      for (const lineNum of matchedLineNumbers) {
+        candidateItems.push({
+          lineNum,
+          formatted: `L${lineNum}: ${lines[lineNum - 1] ?? ""}`,
+        });
+      }
+    } else {
+      const intervals: Array<{ start: number; end: number }> = [];
+      for (const lineNum of matchedLineNumbers) {
+        const rangeStart = Math.max(effectiveStart, lineNum - contextLines);
+        const rangeEnd = Math.min(effectiveEnd, lineNum + contextLines);
+        const last = intervals.at(-1);
+        if (last !== undefined && rangeStart <= last.end + 1) {
+          last.end = Math.max(last.end, rangeEnd);
+        } else {
+          intervals.push({ start: rangeStart, end: rangeEnd });
+        }
+      }
+      for (let intervalIdx = 0; intervalIdx < intervals.length; intervalIdx += 1) {
+        if (intervalIdx > 0) {
+          candidateItems.push({ formatted: "--" });
+        }
+        const interval = intervals[intervalIdx]!;
+        for (let lineNum = interval.start; lineNum <= interval.end; lineNum += 1) {
+          candidateItems.push({
+            lineNum,
+            formatted: `L${lineNum}: ${lines[lineNum - 1] ?? ""}`,
+          });
+        }
+      }
+    }
+
     const outputLines: Array<string> = [];
     let usedChars = 0;
     let firstIncludedLine: number | undefined;
     let lastIncludedLine: number | undefined;
     let truncated = false;
 
-    for (const item of matched) {
+    for (const item of candidateItems) {
       const separatorChars = outputLines.length === 0 ? 0 : 1;
       const neededChars = separatorChars + item.formatted.length;
       if (usedChars + neededChars > maxChars) {
-        if (outputLines.length === 0) {
+        if (outputLines.length === 0 && item.lineNum !== undefined) {
           outputLines.push(item.formatted.slice(0, maxChars));
           firstIncludedLine = item.lineNum;
           lastIncludedLine = item.lineNum;
@@ -570,8 +610,13 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
       }
       outputLines.push(item.formatted);
       usedChars += neededChars;
-      firstIncludedLine ??= item.lineNum;
-      lastIncludedLine = item.lineNum;
+      if (item.lineNum !== undefined) {
+        firstIncludedLine ??= item.lineNum;
+        lastIncludedLine = item.lineNum;
+      }
+    }
+    if (outputLines.at(-1) === "--") {
+      outputLines.pop();
     }
 
     return {
@@ -582,7 +627,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
       ...(entry.sourceLabel !== undefined ? { sourceLabel: entry.sourceLabel } : {}),
       ...(entry.path !== undefined ? { path: entry.path } : {}),
       totalLines,
-      matchedLines: matched.length,
+      matchedLines: exactMatchCount,
       ...(firstIncludedLine !== undefined ? { startLine: firstIncludedLine } : {}),
       ...(lastIncludedLine !== undefined ? { endLine: lastIncludedLine } : {}),
       truncated,

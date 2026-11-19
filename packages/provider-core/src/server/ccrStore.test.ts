@@ -205,4 +205,81 @@ describe("createCcrStore", () => {
       NodeFS.rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it("supports contextLines around query matches, merges overlapping ranges, and clamps to 20", () => {
+    const store = createCcrStore();
+    const lines = Array.from({ length: 60 }, (_, idx) => {
+      const lineNum = idx + 1;
+      if (lineNum === 5 || lineNum === 8 || lineNum === 40) {
+        return `ERROR line ${lineNum}`;
+      }
+      return `info line ${lineNum}`;
+    });
+    const entry = store.put({
+      content: lines.join("\n"),
+      contentType: "logs",
+    });
+
+    const withContext = store.retrieve({
+      ccrId: entry.ccrId,
+      query: "ERROR",
+      contextLines: 2,
+    });
+    assert.equal(withContext.found, true);
+    assert.equal(withContext.matchedLines, 3);
+    assert.equal(withContext.startLine, 3);
+    assert.equal(withContext.endLine, 42);
+    // Lines 5 and 8 with ±2 merge continuously (3..10) with no duplicate lines and `--` before 38..42.
+    assert.equal(
+      withContext.content,
+      [
+        "L3: info line 3",
+        "L4: info line 4",
+        "L5: ERROR line 5",
+        "L6: info line 6",
+        "L7: info line 7",
+        "L8: ERROR line 8",
+        "L9: info line 9",
+        "L10: info line 10",
+        "--",
+        "L38: info line 38",
+        "L39: info line 39",
+        "L40: ERROR line 40",
+        "L41: info line 41",
+        "L42: info line 42",
+      ].join("\n"),
+    );
+
+    // Clamping > 20 around line 40 gives 20..60 (since 40-20=20, 40+20=60), while 5±20 gives 1..25 (disjoint from 20? No, 20<=25+1 -> merges!).
+    const clamped = store.retrieve({
+      ccrId: entry.ccrId,
+      query: "ERROR",
+      startLine: 30,
+      endLine: 60,
+      contextLines: 50,
+    });
+    assert.equal(clamped.matchedLines, 1);
+    assert.equal(clamped.startLine, 30);
+    assert.equal(clamped.endLine, 60);
+  });
+
+  it("never leaves a trailing '--' separator when contextLines output is truncated by maxChars", () => {
+    const store = createCcrStore();
+    const lines = Array.from({ length: 30 }, (_, idx) => {
+      const lineNum = idx + 1;
+      return lineNum === 2 || lineNum === 25 ? `ERROR at ${lineNum}` : `row ${lineNum}`;
+    });
+    const entry = store.put({ content: lines.join("\n"), contentType: "logs" });
+
+    // First hunk L1..L3 is 34 chars; "--" brings length to 37, while L24 overflows maxChars=38.
+    const exactBoundary = store.retrieve({
+      ccrId: entry.ccrId,
+      query: "ERROR",
+      contextLines: 1,
+      maxChars: 38,
+    });
+    assert.equal(exactBoundary.truncated, true);
+    assert.isFalse(exactBoundary.content.endsWith("--"));
+    assert.equal(exactBoundary.endLine, 3);
+  });
 });

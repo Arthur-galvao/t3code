@@ -501,6 +501,7 @@ const ContextRetrieveInput = Schema.Struct({
   query: Schema.optional(Schema.String),
   startLine: Schema.optional(Schema.Int),
   endLine: Schema.optional(Schema.Int),
+  contextLines: Schema.optional(Schema.Int),
   maxChars: Schema.optional(Schema.Int),
 });
 
@@ -520,7 +521,8 @@ const ContextRetrieveResult = Schema.Struct({
 });
 
 const ContextRetrieveTool = Tool.make("context_retrieve", {
-  description: "Retrieve line ranges or matches from a [T3 CCR:ccr_XXXX] block.",
+  description:
+    "Retrieve line ranges or matches (with optional contextLines) from a [T3 CCR:ccr_XXXX] block.",
   parameters: ContextRetrieveInput,
   success: ContextRetrieveResult,
   failure: OrchestratorMcpFailure,

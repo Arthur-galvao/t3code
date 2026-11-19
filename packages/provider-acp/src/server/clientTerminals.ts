@@ -366,13 +366,14 @@ export const makeAcpClientTerminals = Effect.fn("makeAcpClientTerminals")(functi
             if (compressionEnabled) {
               if (!terminal.compressionEvaluated) {
                 const threadId = yield* resolveThreadId(request.sessionId);
+                const command =
+                  terminal.commandLine.trim().length > 0 ? terminal.commandLine.trim() : undefined;
                 const sourceLabel =
-                  terminal.commandLine.trim().length > 0
-                    ? `terminal: ${terminal.commandLine.trim().slice(0, 80)}`
-                    : "terminal";
+                  command !== undefined ? `terminal: ${command.slice(0, 80)}` : "terminal";
                 const compressed = compressToolOutput({
                   text: rawOutput,
                   ...(threadId === undefined ? {} : { threadId }),
+                  ...(command === undefined ? {} : { command }),
                   sourceLabel,
                   minChars: DEFAULT_TERMINAL_COMPRESSION_MIN_CHARS,
                   store: options.ccrStore ?? defaultCcrStore,

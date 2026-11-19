@@ -139,6 +139,7 @@ describe("evaluateAutoVerifyPrompt", () => {
     expect(prompt).not.toBeNull();
     expect(prompt).toContain("[Auto-Verify]");
     expect(prompt).toContain("apps/server/src/app.ts");
+    expect(prompt).toContain("diff-scoped");
   });
 
   it("skips when autoVerifyEnabled is false or verificationGateMode is off", () => {

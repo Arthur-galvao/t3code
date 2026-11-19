@@ -4,6 +4,7 @@ import {
   T3_CODE_DEVICE_TOOL_INSTRUCTIONS,
   T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH,
   T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+  T3_CODE_ORCHESTRATION_SECTIONS,
   T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS,
   distillTechnicalPromptSpec,
   t3AcpPromptWithInstructions,
@@ -179,5 +180,15 @@ describe("T3 device instructions", () => {
     assert.isFalse(concreteEnglish.isNonEnglish);
     assert.isFalse(concreteEnglish.needsClarification);
     assert.isUndefined(concreteEnglish.specHint);
+  });
+
+  it("routes UI and advisor roles to available models while keeping Codex section byte limits", () => {
+    assert.notInclude(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Fable 5.2");
+    assert.notInclude(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Gemini 4 Argon");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Advisor: Claude Opus 5.5");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Gemini 4 Neon");
+    for (const section of T3_CODE_ORCHESTRATION_SECTIONS) {
+      assert.isBelow(Buffer.byteLength(section, "utf8"), 4_000);
+    }
   });
 });

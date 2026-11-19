@@ -296,14 +296,37 @@ const STOP_WORDS = new Set([
   "never",
 ]);
 
-function lessonTokens(
-  lesson: Pick<RsiLesson, "title" | "guidance" | "triggerCondition">,
-): Set<string> {
-  const words = `${lesson.title} ${lesson.guidance} ${lesson.triggerCondition}`
+function tokenizeLessonText(text: string): Set<string> {
+  const words = text
     .toLowerCase()
     .split(/[^a-z0-9_.-]+/)
     .filter((token) => token.length >= 3 && !STOP_WORDS.has(token));
   return new Set(words);
+}
+
+function lessonTokens(
+  lesson: Pick<RsiLesson, "title" | "guidance" | "triggerCondition">,
+): Set<string> {
+  return tokenizeLessonText(`${lesson.title} ${lesson.guidance} ${lesson.triggerCondition}`);
+}
+
+function promptLessonRelevanceBoost(
+  lesson: Pick<RsiLesson, "title" | "guidance" | "triggerCondition" | "globs">,
+  userPrompt: string | undefined,
+): number {
+  if (userPrompt === undefined || userPrompt.trim() === "") return 0;
+  const promptTokens = tokenizeLessonText(userPrompt);
+  if (promptTokens.size === 0) return 0;
+  const candidateTokens = tokenizeLessonText(
+    `${lesson.title} ${lesson.guidance} ${lesson.triggerCondition} ${lesson.globs.join(" ")}`,
+  );
+  let overlap = 0;
+  for (const token of promptTokens) {
+    if (candidateTokens.has(token)) {
+      overlap += 1;
+    }
+  }
+  return Math.min(6, overlap * 2);
 }
 
 function jaccardSimilarity(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
@@ -473,6 +496,26 @@ function isLessonRelatedToRun(
   return false;
 }
 
+function findRelatedAppliedLessonIds(
+  lessons: ReadonlyArray<RsiLesson>,
+  appliedIdSet: ReadonlySet<string>,
+  runContext: {
+    readonly verifiedCommands: ReadonlyArray<string>;
+    readonly editedFiles: ReadonlyArray<string>;
+    readonly cwd?: string | undefined;
+  },
+): Set<string> {
+  return new Set(
+    lessons
+      .filter(
+        (lesson) =>
+          (appliedIdSet.has(lesson.id) || appliedIdSet.has(lesson.key)) &&
+          isLessonRelatedToRun(lesson, runContext),
+      )
+      .map((lesson) => lesson.id),
+  );
+}
+
 function normalizeProjectRoot(raw: string | null | undefined): string | undefined {
   if (raw == null) return undefined;
   const replaced = raw.trim().replaceAll("\\", "/");
@@ -619,6 +662,24 @@ function mergeLessonRecords(existing: RsiLesson, incoming: RsiLesson): RsiLesson
   };
 }
 
+function extractToolFromKey(key: string): string | undefined {
+  if (!key.startsWith("auto::")) return undefined;
+  const parts = key.split("::");
+  return parts[2] && parts[2] !== "general" ? parts[2] : undefined;
+}
+
+function extractVerifyCommandFamily(lesson: Pick<RsiLesson, "guidance">): string | undefined {
+  const firstCmd = extractBacktickedCommands(lesson.guidance)[0];
+  if (firstCmd === undefined) return undefined;
+  const tokens = extractToolSubcommand(firstCmd)
+    .split(/\s+/)
+    .filter((token) => token !== "" && !token.startsWith("-"));
+  if (tokens.length === 0) return undefined;
+  const [tool, ...rest] = tokens;
+  const action = rest[0] === "run" && rest[1] !== undefined ? rest[1] : rest[0];
+  return action !== undefined ? `${tool} ${action}` : tool;
+}
+
 function curateLessonStore(
   currentLessons: ReadonlyArray<RsiLesson>,
   candidate: RsiLesson,
@@ -643,8 +704,18 @@ function curateLessonStore(
       const existing = next[i]!;
       if (existing.scope !== candidate.scope) continue;
       if (!sameProjectScope(existing.projectRoot, candidate.projectRoot)) continue;
-      // Auto lessons already use normalized (provider, tool, signature) keys as canonical identity.
-      if (existing.key.startsWith("auto::") && candidate.key.startsWith("auto::")) continue;
+      // Auto lessons keep distinct failure/recovery signatures separate, while near-duplicate verify lessons for the same tool/subcommand family merge.
+      if (existing.key.startsWith("auto::") && candidate.key.startsWith("auto::")) {
+        const bothAutoVerify =
+          extractToolFromKey(existing.key) === "verify" &&
+          extractToolFromKey(candidate.key) === "verify";
+        if (!bothAutoVerify) continue;
+        const existingFamily = extractVerifyCommandFamily(existing);
+        const candidateFamily = extractVerifyCommandFamily(candidate);
+        if (existingFamily === undefined || existingFamily !== candidateFamily) {
+          continue;
+        }
+      }
       const similarity = jaccardSimilarity(candidateTokens, lessonTokens(existing));
       if (similarity >= SIMILARITY_MERGE_THRESHOLD && similarity > bestScore) {
         bestScore = similarity;
@@ -687,12 +758,6 @@ function extractProviderFromKey(key: string): string | undefined {
   if (!key.startsWith("auto::")) return undefined;
   const parts = key.split("::");
   return parts[1] && parts[1] !== "global" ? parts[1] : undefined;
-}
-
-function extractToolFromKey(key: string): string | undefined {
-  if (!key.startsWith("auto::")) return undefined;
-  const parts = key.split("::");
-  return parts[2] && parts[2] !== "general" ? parts[2] : undefined;
 }
 
 function isFailureOutcome(outcome: string): boolean {
@@ -1739,27 +1804,25 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           failureOutcome || record.loopTripped || record.safetyBlockedCount > 0;
 
         if (appliedIdSet.size > 0) {
-          if (cleanSuccess) {
-            const currentLessons = yield* Ref.get(lessonsRef);
-            const runContext = {
-              verifiedCommands: telemetryInput.verifiedCommands ?? [],
-              editedFiles: telemetryInput.editedFiles ?? [],
-              cwd: telemetryInput.cwd,
-            };
-            const relatedAppliedIds = new Set(
-              currentLessons
-                .filter(
-                  (lesson) =>
-                    (appliedIdSet.has(lesson.id) || appliedIdSet.has(lesson.key)) &&
-                    isLessonRelatedToRun(lesson, runContext),
-                )
-                .map((lesson) => lesson.id),
+          if (shouldDemoteApplied) {
+            yield* demoteLessonLocked(appliedIdSet, 0.1, nowIso);
+          } else if (cleanSuccess || record.toolErrorCount > 0) {
+            const relatedAppliedIds = findRelatedAppliedLessonIds(
+              yield* Ref.get(lessonsRef),
+              appliedIdSet,
+              {
+                verifiedCommands: telemetryInput.verifiedCommands ?? [],
+                editedFiles: telemetryInput.editedFiles ?? [],
+                cwd: telemetryInput.cwd,
+              },
             );
             if (relatedAppliedIds.size > 0) {
-              yield* boostLessonsLocked(relatedAppliedIds, 0.05, nowIso);
+              if (cleanSuccess) {
+                yield* boostLessonsLocked(relatedAppliedIds, 0.05, nowIso);
+              } else {
+                yield* demoteLessonLocked(relatedAppliedIds, 0.03, nowIso);
+              }
             }
-          } else if (shouldDemoteApplied) {
-            yield* demoteLessonLocked(appliedIdSet, 0.1, nowIso);
           }
         }
 
@@ -2193,13 +2256,25 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         activePaths,
         minConfidence: 0.4,
       });
-      const eligible = lessons.filter(
+      const baseEligible = lessons.filter(
         (lesson) =>
           (lesson.projectRoot === undefined ||
             isSameOrInsidePath(prefixInput.cwd, lesson.projectRoot)) &&
           (lesson.scope === "global" ||
             (activePaths.length > 0 && matchesAnyGlob(lesson.globs, activePaths, prefixInput.cwd))),
       );
+      const hasPromptBoost =
+        prefixInput.userPrompt !== undefined && prefixInput.userPrompt.trim() !== "";
+      const eligible = hasPromptBoost
+        ? baseEligible
+            .map((lesson, index) => ({
+              lesson,
+              index,
+              boost: promptLessonRelevanceBoost(lesson, prefixInput.userPrompt),
+            }))
+            .sort((a, b) => b.boost - a.boost || a.index - b.index)
+            .map((entry) => entry.lesson)
+        : baseEligible;
 
       let prefix = "";
       const lessonIds: Array<string> = [];

@@ -124,6 +124,9 @@ export function evaluateAutoVerifyPrompt(input: AutoVerifyEvaluationInput): stri
 
   const reason =
     decision.reason ?? "Source code was modified without a passing verification check.";
+  if (trackerState.modifiedFiles.length > 0) {
+    return `[Auto-Verify] ${reason} Prioritize diff-scoped verification for the modified files/packages first (targeted tests, typecheck, and lint) before broader suites, and fix any failures before finishing.`;
+  }
   return `[Auto-Verify] ${reason} Run the relevant verification checks (tests, typecheck, and lint) and fix any failures before finishing.`;
 }
 

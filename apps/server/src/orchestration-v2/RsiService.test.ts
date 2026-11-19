@@ -1482,4 +1482,162 @@ describe("RsiService", () => {
       ).toBe(true);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect("prioritizes prompt-relevant lessons in formatSessionPrefix within tight budgets", () =>
+    Effect.gen(function* () {
+      const rsi = yield* RsiService;
+
+      yield* rsi.recordLesson({
+        key: "manual::general_high",
+        title: "Use strict TypeScript exports",
+        guidance: "Avoid barrel re-exports in shared contracts.",
+        scope: "global",
+        confidence: 0.95,
+        hits: 8,
+      });
+      yield* rsi.recordLesson({
+        key: "manual::ccr_retrieval",
+        title: "Use context_retrieve for CCR blocks",
+        guidance: "Pass query and contextLines when inspecting large terminal logs.",
+        triggerCondition: "When reading CCR compressed tool outputs",
+        scope: "global",
+        confidence: 0.72,
+        hits: 1,
+      });
+
+      const defaultOrder = yield* rsi.formatSessionPrefix({
+        cwd: "/repo",
+        maxChars: 130,
+      });
+      expect(defaultOrder).toContain("Use strict TypeScript exports");
+      expect(defaultOrder).not.toContain("context_retrieve");
+
+      const promptBoosted = yield* rsi.formatSessionPrefix({
+        cwd: "/repo",
+        userPrompt: "Inspect the CCR compressed terminal logs with context_retrieve",
+        maxChars: 130,
+      });
+      expect(promptBoosted).toContain("Use context_retrieve for CCR blocks");
+    }).pipe(Effect.provide(RsiService.layer)),
+  );
+
+  it.effect(
+    "applies -0.03 soft-failure demotion only to related applied lessons on tool errors",
+    () =>
+      Effect.gen(function* () {
+        const rsi = yield* RsiService;
+
+        const related = yield* rsi.recordLesson({
+          key: "manual::related_verify_rule",
+          title: "Run targeted vitest",
+          guidance: "Run `vp.cmd test run` after editing server code.",
+          scope: "global",
+          confidence: 0.7,
+        });
+        const unrelated = yield* rsi.recordLesson({
+          key: "manual::unrelated_ui_rule",
+          title: "UI token spacing",
+          guidance: "Use existing spacing tokens in web views.",
+          scope: "glob",
+          globs: ["apps/web/**"],
+          confidence: 0.7,
+        });
+
+        yield* rsi.recordRunTelemetry({
+          runId: "run-soft-fail-1",
+          threadId: "thread-soft-fail",
+          provider: "claudeAgent",
+          model: "claude-sonnet-5-5",
+          wastedReads: 0,
+          cwd: "/repo",
+          outcome: "completed",
+          usedTokens: 1_000,
+          cachedInputTokens: 600,
+          durationMs: 1_500,
+          toolErrorCount: 2,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          appliedLessonIds: [related.id, unrelated.id],
+          verifiedCommands: ["vp.cmd test run"],
+        });
+
+        const after = yield* rsi.queryLessons({ cwd: "/repo" });
+        const relatedAfter = after.find((l) => l.id === related.id)!;
+        const unrelatedAfter = after.find((l) => l.id === unrelated.id)!;
+        expect(relatedAfter.confidence).toBeCloseTo(0.67, 5);
+        expect(unrelatedAfter.confidence).toBeCloseTo(0.7, 5);
+      }).pipe(Effect.provide(RsiService.layer)),
+  );
+
+  it.effect(
+    "merges near-duplicate auto verify lessons while keeping distinct auto failure lessons separate",
+    () =>
+      Effect.gen(function* () {
+        const rsi = yield* RsiService;
+
+        yield* rsi.recordLesson({
+          key: "auto::global::verify::vp_test_a",
+          title: "Verify edits with vitest",
+          guidance:
+            "Run `vp.cmd test run` to verify workspace source edits cleanly before finishing.",
+          triggerCondition: "After editing workspace source files",
+          scope: "global",
+          projectRoot: "/repo",
+          confidence: 0.72,
+        });
+        yield* rsi.recordLesson({
+          key: "auto::global::verify::vp_test_b",
+          title: "Verify edits with vitest",
+          guidance:
+            "Run `vp.cmd test run --bail=1` to verify workspace source edits cleanly before finishing now.",
+          triggerCondition: "After editing workspace source files",
+          scope: "global",
+          projectRoot: "/repo",
+          confidence: 0.72,
+        });
+        yield* rsi.recordLesson({
+          key: "auto::global::verify::vp_typecheck",
+          title: "Verify edits with typecheck",
+          guidance:
+            "Run `vp.cmd run typecheck` to verify workspace source edits cleanly before finishing.",
+          triggerCondition: "After editing workspace source files",
+          scope: "global",
+          projectRoot: "/repo",
+          confidence: 0.72,
+        });
+
+        yield* rsi.recordLesson({
+          key: "auto::claudeagent::bash::enoent_alpha",
+          title: "Recurring bash failure",
+          guidance: "Repeated bash failure: verify missing config path before re-running.",
+          triggerCondition: "claudeAgent:bash:enoent_alpha",
+          scope: "global",
+          projectRoot: "/repo",
+          confidence: 0.7,
+        });
+        yield* rsi.recordLesson({
+          key: "auto::claudeagent::bash::eacces_beta",
+          title: "Recurring bash failure",
+          guidance: "Repeated bash failure: verify missing script path before re-running.",
+          triggerCondition: "claudeAgent:bash:eacces_beta",
+          scope: "global",
+          projectRoot: "/repo",
+          confidence: 0.7,
+        });
+
+        const lessons = yield* rsi.queryLessons({ cwd: "/repo" });
+        const verifyLessons = lessons.filter((l) => l.key.startsWith("auto::global::verify::"));
+        const vitestLesson = verifyLessons.find((l) => l.title === "Verify edits with vitest");
+        const typecheckLesson = verifyLessons.find(
+          (l) => l.title === "Verify edits with typecheck",
+        );
+        const bashFailureLessons = lessons.filter((l) =>
+          l.key.startsWith("auto::claudeagent::bash::"),
+        );
+        expect(verifyLessons).toHaveLength(2);
+        expect(vitestLesson?.hits).toBe(2);
+        expect(typecheckLesson?.hits).toBe(1);
+        expect(bashFailureLessons).toHaveLength(2);
+      }).pipe(Effect.provide(RsiService.layer)),
+  );
 });

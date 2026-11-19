@@ -2141,6 +2141,21 @@ function extractPathFromToolInput(toolInput: unknown): string | undefined {
   return undefined;
 }
 
+function extractCommandFromToolInput(toolName: string, toolInput: unknown): string | undefined {
+  if (
+    toolName.toLowerCase() === "bash" &&
+    typeof toolInput === "object" &&
+    toolInput !== null &&
+    !Array.isArray(toolInput)
+  ) {
+    const command = Reflect.get(toolInput, "command");
+    if (typeof command === "string" && command.trim().length > 0) {
+      return command.trim();
+    }
+  }
+  return undefined;
+}
+
 function inferCompressionHint(
   toolName: string,
   toolInput: unknown,
@@ -2148,16 +2163,9 @@ function inferCompressionHint(
   if (toolName.toLowerCase().includes("diff")) {
     return "diff";
   }
-  if (
-    toolName === "Bash" &&
-    typeof toolInput === "object" &&
-    toolInput !== null &&
-    !Array.isArray(toolInput)
-  ) {
-    const command = Reflect.get(toolInput, "command");
-    if (typeof command === "string" && /\b(?:git\s+(?:diff|show)|diff)\b/i.test(command)) {
-      return "diff";
-    }
+  const command = extractCommandFromToolInput(toolName, toolInput);
+  if (command !== undefined && /\b(?:git\s+(?:diff|show)|diff)\b/i.test(command)) {
+    return "diff";
   }
   return undefined;
 }
@@ -2213,11 +2221,13 @@ function evaluateClaudePostToolUseCompression(input: {
   ) {
     return {};
   }
+  const command = extractCommandFromToolInput(toolName, input.hookInput.tool_input);
   const result = compressToolOutput({
     text,
     ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
     contentTypeHint: inferCompressionHint(toolName, input.hookInput.tool_input),
     sourceLabel: toolName,
+    ...(command === undefined ? {} : { command }),
     path: extractPathFromToolInput(input.hookInput.tool_input),
     minChars: CLAUDE_POST_TOOL_USE_MIN_CHARS,
     store: input.store ?? defaultCcrStore,

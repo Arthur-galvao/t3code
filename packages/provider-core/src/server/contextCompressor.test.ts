@@ -1,7 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import { createCcrStore } from "./ccrStore.ts";
-import { compressToolOutput, detectContentType } from "./contextCompressor.ts";
+import { compressToolOutput, detectContentType, stripAnsi } from "./contextCompressor.ts";
 
 describe("detectContentType", () => {
   it("detects diff, json, logs, code, and text from hints, paths, and content", () => {
@@ -217,5 +217,133 @@ describe("compressToolOutput", () => {
     assert.equal(store.getStats("thread-xyz").compressedCallsCount, 1);
     assert.isAbove(store.getStats("thread-xyz").tokensSavedEst, 0);
     assert.equal(store.getStats("other-thread").entriesCount, 0);
+  });
+
+  it("strips ANSI and compacts vitest runner output while keeping failures and lossless CCR", () => {
+    const store = createCcrStore();
+    const esc = String.fromCharCode(0x1b);
+    const passing = Array.from(
+      { length: 65 },
+      (_, i) => ` ${esc}[32m✓${esc}[39m src/feature_${i}.test.ts > case ${i} (3ms)`,
+    );
+    const raw = [
+      `${esc}[1m RUN ${esc}[22m v4.0.0`,
+      ...passing,
+      ` ${esc}[31m×${esc}[39m src/broken.test.ts > fails cleanly`,
+      `   ${esc}[31mAssertionError: expected 1 to equal 2${esc}[39m`,
+      "     at src/broken.test.ts:42:10",
+      "",
+      " Test Files  1 failed | 65 passed (66)",
+      "      Tests  1 failed | 65 passed (66)",
+      "   Duration  1.84s",
+    ].join("\n");
+
+    const result = compressToolOutput({
+      text: raw,
+      command: "vp.cmd test run",
+      store,
+    });
+
+    assert.equal(result.compressed, true);
+    assert.equal(result.contentType, "logs");
+    assert.notInclude(result.text, esc);
+    assert.include(result.text, "passing test lines omitted");
+    assert.include(result.text, "AssertionError: expected 1 to equal 2");
+    assert.include(result.text, "Test Files  1 failed | 65 passed (66)");
+    // Lossless original remains in CCR store.
+    assert.equal(store.get(result.ccrId!)?.content, raw);
+    assert.equal(stripAnsi(`${esc}[32mok${esc}[39m`), "ok");
+  });
+
+  it("compacts verbose tsc/linter diagnostics while preserving error locations and summary", () => {
+    const store = createCcrStore();
+    const diagnostics = Array.from({ length: 48 }, (_, i) => [
+      `src/module_${i}.ts(${i + 1},5): error TS2322: Type 'string' is not assignable to type 'number'.`,
+      "",
+      "",
+    ]).flat();
+    const raw = [...diagnostics, "Found 48 errors in 48 files."].join("\n");
+
+    const result = compressToolOutput({
+      text: raw,
+      command: "tsc --noEmit",
+      store,
+    });
+
+    assert.equal(result.compressed, true);
+    assert.include(result.text, "src/module_0.ts(1,5): error TS2322");
+    assert.include(result.text, "diagnostics omitted");
+    assert.include(result.text, "src/module_47.ts(48,5): error TS2322");
+    assert.include(result.text, "Found 48 errors in 48 files.");
+  });
+
+  it("strips git status helper hints and caps oversized file lists", () => {
+    const store = createCcrStore();
+    const untracked = Array.from({ length: 95 }, (_, i) => `\tsrc/generated/file_${i}.ts`);
+    const raw = [
+      "On branch main",
+      "Changes not staged for commit:",
+      '  (use "git add <file>..." to update what will be committed)',
+      '  (use "git restore <file>..." to discard changes)',
+      "\tmodified:   src/app.ts",
+      "",
+      "Untracked files:",
+      '  (use "git add <file>..." to include in what will be committed)',
+      ...untracked,
+    ].join("\n");
+
+    const result = compressToolOutput({
+      text: raw,
+      command: "git status",
+      store,
+    });
+
+    assert.equal(result.compressed, true);
+    assert.notInclude(result.text, '(use "git add');
+    assert.include(result.text, "modified:   src/app.ts");
+    assert.include(result.text, "more files in section");
+    assert.notInclude(result.text, "file_94.ts");
+  });
+
+  it("strips pnpm install download churn and infers command from terminal sourceLabel", () => {
+    const store = createCcrStore();
+    const downloads = Array.from(
+      { length: 70 },
+      (_, i) => `Downloading registry.npmjs.org/pkg-${i}/-/${i}.tgz: 1.2 MB`,
+    );
+    const raw = [
+      "Lockfile is up to date, resolution step is skipped",
+      "Packages: +70",
+      ...downloads,
+      "WARN deprecated old-pkg@1.0.0: please upgrade",
+      "dependencies:",
+      "+ vite 6.0.0",
+      "Done in 2.4s using pnpm v10.0.0",
+    ].join("\n");
+
+    const installResult = compressToolOutput({
+      text: raw,
+      command: "pnpm install",
+      store,
+    });
+    assert.equal(installResult.compressed, true);
+    assert.include(installResult.text, "build/install lines omitted");
+    assert.include(installResult.text, "WARN deprecated old-pkg@1.0.0");
+    assert.include(installResult.text, "Done in 2.4s using pnpm v10.0.0");
+
+    // Also infer command from ACP terminal sourceLabel when `command` is omitted.
+    const vitestRaw = [
+      " RUN  v4.0.0",
+      ...Array.from({ length: 65 }, (_, i) => ` ✓ src/a_${i}.test.ts > works (2ms)`),
+      " Test Files  65 passed (65)",
+      "      Tests  65 passed (65)",
+    ].join("\n");
+    const inferred = compressToolOutput({
+      text: vitestRaw,
+      sourceLabel: "terminal: vitest run",
+      store,
+    });
+    assert.equal(inferred.compressed, true);
+    assert.include(inferred.text, "passing test lines omitted");
   });
 });

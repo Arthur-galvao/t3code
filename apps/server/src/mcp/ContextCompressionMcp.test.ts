@@ -155,6 +155,27 @@ describe("context_retrieve MCP tool", () => {
       assert.include(queryResult.content, "L47:");
       assert.include(queryResult.content, "L83:");
 
+      const contextOpt = yield* Stream.runHead(
+        yield* toolkit.handle("context_retrieve", {
+          ccrId,
+          query: "ERROR|FATAL",
+          contextLines: 1,
+        }),
+      );
+      assert.isTrue(Option.isSome(contextOpt));
+      if (Option.isNone(contextOpt)) return;
+      assert.isFalse(contextOpt.value.isFailure);
+      const contextResult = contextOpt.value.result;
+      assert.isTrue("found" in contextResult);
+      if (!("found" in contextResult)) return;
+      assert.isTrue(contextResult.found);
+      assert.equal(contextResult.matchedLines, 2);
+      assert.include(contextResult.content, "L46:");
+      assert.include(contextResult.content, "L47:");
+      assert.include(contextResult.content, "L48:");
+      assert.include(contextResult.content, "\n--\n");
+      assert.include(contextResult.content, "L82:");
+
       const boundedOpt = yield* Stream.runHead(
         yield* toolkit.handle("context_retrieve", {
           ccrId,

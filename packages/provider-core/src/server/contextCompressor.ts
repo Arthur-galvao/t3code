@@ -7,6 +7,7 @@ export interface CompressToolOutputInput {
   readonly threadId?: string | undefined;
   readonly path?: string | undefined;
   readonly sourceLabel?: string | undefined;
+  readonly command?: string | undefined;
   readonly contentTypeHint?: CompressionContentType | undefined;
   readonly minChars?: number | undefined;
   readonly store?: CcrStore | undefined;
@@ -27,6 +28,7 @@ export interface CompressToolOutputResult {
 export interface DetectContentTypeOptions {
   readonly path?: string | undefined;
   readonly sourceLabel?: string | undefined;
+  readonly command?: string | undefined;
   readonly contentTypeHint?: CompressionContentType | undefined;
 }
 
@@ -163,6 +165,35 @@ function looksLikeCode(sample: string): boolean {
   return codeSignals >= 3;
 }
 
+const ESC_CHAR = String.fromCharCode(0x1b);
+const BEL_CHAR = String.fromCharCode(0x07);
+const ANSI_OSC_RE = new RegExp(
+  `${ESC_CHAR}\\][^${BEL_CHAR}${ESC_CHAR}]*(?:${BEL_CHAR}|${ESC_CHAR}\\\\)`,
+  "g",
+);
+const ANSI_CSI_RE = new RegExp(`${ESC_CHAR}\\[[0-9;?]*[ -/]*[@-~]`, "g");
+const ANSI_CHARSET_RE = new RegExp(`${ESC_CHAR}[()][AB012]`, "g");
+
+export function stripAnsi(text: string): string {
+  if (!text.includes(ESC_CHAR)) {
+    return text;
+  }
+  return text.replace(ANSI_OSC_RE, "").replace(ANSI_CSI_RE, "").replace(ANSI_CHARSET_RE, "");
+}
+
+function resolveCommandHint(command?: string, sourceLabel?: string): string | undefined {
+  if (command !== undefined && command.trim().length > 0) {
+    return command.trim();
+  }
+  if (sourceLabel !== undefined) {
+    const match = /^terminal:\s*(.+)$/i.exec(sourceLabel.trim());
+    if (match?.[1] !== undefined && match[1].trim().length > 0) {
+      return match[1].trim();
+    }
+  }
+  return undefined;
+}
+
 export function detectContentType(
   text: string,
   options?: DetectContentTypeOptions,
@@ -171,7 +202,7 @@ export function detectContentType(
     return options.contentTypeHint;
   }
 
-  const sample = text.slice(0, 4_096);
+  const sample = stripAnsi(text.slice(0, 4_096));
   if (isDiffSample(sample)) {
     return "diff";
   }
@@ -198,6 +229,16 @@ export function detectContentType(
   }
 
   if (looksLikeLogs(sample)) {
+    return "logs";
+  }
+
+  const commandHint = resolveCommandHint(options?.command, options?.sourceLabel);
+  if (
+    commandHint !== undefined &&
+    (TEST_RUNNER_CMD_RE.test(commandHint) ||
+      TYPECHECK_LINT_CMD_RE.test(commandHint) ||
+      BUILD_INSTALL_CMD_RE.test(commandHint))
+  ) {
     return "logs";
   }
 
@@ -742,6 +783,385 @@ function compressText(text: string): string {
   return out.join("\n\n");
 }
 
+const TEST_RUNNER_CMD_RE =
+  /\b(?:vitest|jest|pytest|unittest|cargo\s+test|go\s+test|bun\s+test|vp(?:\.cmd)?\s+test|(?:pnpm|npm|yarn)\s+(?:run\s+)?test)\b/i;
+const TYPECHECK_LINT_CMD_RE =
+  /\b(?:tsc|tsgo|effect-tsgo|typecheck|eslint|oxlint|biome|ruff|mypy|vp(?:\.cmd)?\s+(?:lint|check)|(?:pnpm|npm|yarn)\s+(?:run\s+)?(?:typecheck|lint|check))\b/i;
+const GIT_STATUS_CMD_RE = /\bgit\s+status\b/i;
+const GIT_LOG_CMD_RE = /\bgit\s+log\b/i;
+const BUILD_INSTALL_CMD_RE =
+  /\b(?:pnpm|npm|yarn|bun)\s+(?:i|install|add|update|ci|build)\b|\b(?:cargo\s+build|vite\s+build|vp(?:\.cmd)?\s+build)\b/i;
+
+const PASSING_TEST_LINE_RE =
+  /^\s*(?:✓|✔|PASS\b|PASSED\b|ok\s+\S+|\.\.\.\s+ok\b|test\s+\S+\s+\.\.\.\s+ok)/i;
+const TEST_SUMMARY_LINE_RE =
+  /^\s*(?:Test Files|Tests|Snapshots|Start at|Duration|=== .* (?:passed|failed)|test result:|FAIL\s+|ok\s+\S+\s+\d)/i;
+const TEST_FAILURE_LINE_RE =
+  /\b(?:FAIL|FAILED|AssertionError|Error:|Expected|Received|Traceback|panic)\b|^\s*(?:✗|×|at\s+\S+:\d+)/;
+
+const DIAG_HEADER_LINE_RE =
+  /^(?:\S+.*\(\d+,\d+\):\s*(?:error|warning)\b|\S+:\d+:\d+(?:\s*[-:])?\s*(?:error|warning|info)?|error\[E\d+\]|warning\[|✖|×|\s*(?:error|warning)\b[:\s])/i;
+const DIAG_SUMMARY_LINE_RE =
+  /^(?:Found\s+\d+\s+errors?|Finished in\b|Checked\s+\d+\s+files?|✖\s+\d+\s+problems?|\d+\s+(?:error|warning)s?\b)/i;
+
+const GIT_STATUS_HINT_RE = /^\s*\(use "git [^"]+"[^)]*\)\s*$/;
+const GIT_STATUS_SECTION_RE =
+  /^(?:Changes to be committed:|Changes not staged for commit:|Untracked files:|Unmerged paths:)/;
+
+const BUILD_CHURN_LINE_RE =
+  /^\s*(?:Progress:|Downloading\b|Resolved\b|Resolving\b|Fetching\b|Compiling\b|Reusing\b|Already up to date|Packages:\s+[+-]\d|\|+|\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏])/i;
+const BUILD_WARN_LINE_RE = /\bwarn(?:ing)?\b/i;
+
+function markProtectedWindow(keep: Uint8Array, index: number, radius: number): void {
+  const start = Math.max(0, index - radius);
+  const end = Math.min(keep.length - 1, index + radius);
+  for (let i = start; i <= end; i += 1) {
+    keep[i] = 1;
+  }
+}
+
+function collapseKeptLines(
+  lines: ReadonlyArray<string>,
+  keep: Uint8Array,
+  omittedLabel: (count: number) => string,
+): string {
+  const out: Array<string> = [];
+  let omitted = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (keep[i] === 1) {
+      if (omitted >= 2) {
+        out.push(omittedLabel(omitted));
+      } else if (omitted === 1) {
+        out.push(lines[i - 1] ?? "");
+      }
+      omitted = 0;
+      out.push(lines[i] ?? "");
+    } else {
+      omitted += 1;
+    }
+  }
+  if (omitted >= 2) {
+    out.push(omittedLabel(omitted));
+  } else if (omitted === 1) {
+    out.push(lines[lines.length - 1] ?? "");
+  }
+  return out.join("\n");
+}
+
+function looksLikeTestRunnerOutput(lines: ReadonlyArray<string>): boolean {
+  let passingCount = 0;
+  let hasSummary = false;
+  for (const line of lines) {
+    if (PASSING_TEST_LINE_RE.test(line)) passingCount += 1;
+    if (TEST_SUMMARY_LINE_RE.test(line)) hasSummary = true;
+    if (passingCount >= 4 && hasSummary) return true;
+  }
+  return false;
+}
+
+function compressTestRunnerOutput(lines: ReadonlyArray<string>): string {
+  if (lines.length <= 12) return lines.join("\n");
+
+  const len = lines.length;
+  const keep = new Uint8Array(len);
+  for (let i = 0; i < Math.min(3, len); i += 1) keep[i] = 1;
+  for (let i = Math.max(0, len - 8); i < len; i += 1) keep[i] = 1;
+
+  for (let i = 0; i < len; i += 1) {
+    const line = lines[i] ?? "";
+    if (TEST_SUMMARY_LINE_RE.test(line)) {
+      keep[i] = 1;
+    }
+    if (TEST_FAILURE_LINE_RE.test(line) || CRITICAL_LOG_RE.test(line)) {
+      markProtectedWindow(keep, i, 3);
+    }
+  }
+
+  const out: Array<string> = [];
+  let passingOmitted = 0;
+  let otherOmitted = 0;
+
+  const flushPassing = () => {
+    if (passingOmitted === 0) return;
+    out.push(`[... ${passingOmitted} passing test lines omitted ...]`);
+    passingOmitted = 0;
+  };
+  const flushOther = (endIdx: number) => {
+    if (otherOmitted === 0) return;
+    if (otherOmitted === 1) {
+      out.push(lines[endIdx - 1] ?? "");
+    } else {
+      out.push(`[... ${otherOmitted} lines omitted ...]`);
+    }
+    otherOmitted = 0;
+  };
+
+  for (let i = 0; i < len; i += 1) {
+    const line = lines[i] ?? "";
+    if (keep[i] === 1) {
+      flushPassing();
+      flushOther(i);
+      out.push(line);
+      continue;
+    }
+    if (PASSING_TEST_LINE_RE.test(line)) {
+      flushOther(i);
+      passingOmitted += 1;
+      continue;
+    }
+    if (passingOmitted > 0 && line.trim() === "") {
+      continue;
+    }
+    flushPassing();
+    otherOmitted += 1;
+  }
+  flushPassing();
+  flushOther(len);
+
+  return out.join("\n");
+}
+
+function compressTypecheckLintOutput(lines: ReadonlyArray<string>): string {
+  const nonBlank = lines.filter((line) => line.trim() !== "");
+  if (nonBlank.length <= 12) return nonBlank.join("\n");
+
+  const summaryLines: Array<string> = [];
+  const blocks: Array<Array<string>> = [];
+  const prefixNonDiag: Array<string> = [];
+  let currentBlock: Array<string> | null = null;
+
+  for (const line of nonBlank) {
+    if (DIAG_SUMMARY_LINE_RE.test(line.trim())) {
+      if (currentBlock !== null) {
+        blocks.push(currentBlock);
+        currentBlock = null;
+      }
+      summaryLines.push(line);
+      continue;
+    }
+    if (DIAG_HEADER_LINE_RE.test(line)) {
+      if (currentBlock !== null) {
+        blocks.push(currentBlock);
+      }
+      currentBlock = [line];
+      continue;
+    }
+    if (currentBlock !== null && currentBlock.length < 5) {
+      currentBlock.push(line);
+    } else if (currentBlock === null) {
+      prefixNonDiag.push(line);
+    }
+  }
+  if (currentBlock !== null) {
+    blocks.push(currentBlock);
+  }
+
+  // Fold consecutive identical non-diagnostic lines.
+  const compactedPrefix: Array<string> = [];
+  let idx = 0;
+  while (idx < prefixNonDiag.length) {
+    const line = prefixNonDiag[idx] ?? "";
+    let end = idx + 1;
+    while (end < prefixNonDiag.length && (prefixNonDiag[end] ?? "") === line) {
+      end += 1;
+    }
+    const runLen = end - idx;
+    compactedPrefix.push(runLen >= 2 ? `${line} [x${runLen}]` : line);
+    idx = end;
+  }
+
+  // Deduplicate identical diagnostic blocks while preserving order.
+  const dedupedBlocks: Array<{ readonly lines: Array<string>; count: number }> = [];
+  const blockIndexBySig = new Map<string, number>();
+  for (const block of blocks) {
+    const sig = block.join("\n");
+    const existingIdx = blockIndexBySig.get(sig);
+    if (existingIdx !== undefined) {
+      dedupedBlocks[existingIdx]!.count += 1;
+    } else {
+      blockIndexBySig.set(sig, dedupedBlocks.length);
+      dedupedBlocks.push({ lines: block, count: 1 });
+    }
+  }
+
+  const formatBlock = (entry: {
+    readonly lines: ReadonlyArray<string>;
+    readonly count: number;
+  }) => {
+    if (entry.count === 1) return entry.lines.join("\n");
+    const [head, ...rest] = entry.lines;
+    return [`${head ?? ""} [x${entry.count}]`, ...rest].join("\n");
+  };
+
+  const out: Array<string> = [...compactedPrefix];
+  if (dedupedBlocks.length > 40) {
+    for (const block of dedupedBlocks.slice(0, 30)) {
+      out.push(formatBlock(block));
+    }
+    out.push(`[... ${dedupedBlocks.length - 35} diagnostics omitted ...]`);
+    for (const block of dedupedBlocks.slice(-5)) {
+      out.push(formatBlock(block));
+    }
+  } else {
+    for (const block of dedupedBlocks) {
+      out.push(formatBlock(block));
+    }
+  }
+
+  out.push(...summaryLines);
+  return out.join("\n");
+}
+
+function compressGitStatusOutput(lines: ReadonlyArray<string>): string {
+  const MAX_FILES_PER_SECTION = 20;
+  const out: Array<string> = [];
+  let inSection = false;
+  let sectionFileCount = 0;
+  let sectionOmitted = 0;
+
+  const flushSectionOmitted = () => {
+    if (sectionOmitted > 0) {
+      out.push(`\t[... ${sectionOmitted} more files in section ...]`);
+      sectionOmitted = 0;
+    }
+  };
+
+  for (const line of lines) {
+    if (GIT_STATUS_HINT_RE.test(line)) {
+      continue;
+    }
+    if (GIT_STATUS_SECTION_RE.test(line.trim())) {
+      flushSectionOmitted();
+      inSection = true;
+      sectionFileCount = 0;
+      out.push(line);
+      continue;
+    }
+    if (inSection) {
+      if (line.trim() === "") {
+        flushSectionOmitted();
+        inSection = false;
+        out.push(line);
+        continue;
+      }
+      sectionFileCount += 1;
+      if (sectionFileCount <= MAX_FILES_PER_SECTION) {
+        out.push(line);
+      } else {
+        sectionOmitted += 1;
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  flushSectionOmitted();
+  return out.join("\n");
+}
+
+function compressGitLogOutput(lines: ReadonlyArray<string>): string {
+  const MAX_COMMITS = 25;
+  const hasCommitHeaders = lines.some((line) => /^commit\s+[0-9a-f]{7,}/i.test(line));
+  if (!hasCommitHeaders) {
+    if (lines.length <= MAX_COMMITS) return lines.join("\n");
+    return [
+      ...lines.slice(0, MAX_COMMITS),
+      `[... ${lines.length - MAX_COMMITS} more commits omitted ...]`,
+    ].join("\n");
+  }
+
+  const commits: Array<Array<string>> = [];
+  let current: Array<string> = [];
+  let sawSubject = false;
+
+  for (const line of lines) {
+    if (/^commit\s+[0-9a-f]{7,}/i.test(line)) {
+      if (current.length > 0) commits.push(current);
+      current = [line];
+      sawSubject = false;
+      continue;
+    }
+    if (current.length === 0) continue;
+    const trimmed = line.trim();
+    if (/^(?:Author:|Date:|Merge:)/i.test(trimmed)) {
+      current.push(line);
+      continue;
+    }
+    if (!sawSubject && trimmed !== "") {
+      current.push(line);
+      sawSubject = true;
+    }
+  }
+  if (current.length > 0) commits.push(current);
+
+  const kept = commits.slice(0, MAX_COMMITS).map((c) => c.join("\n"));
+  if (commits.length > MAX_COMMITS) {
+    kept.push(`[... ${commits.length - MAX_COMMITS} more commits omitted ...]`);
+  }
+  return kept.join("\n\n");
+}
+
+function compressBuildInstallOutput(lines: ReadonlyArray<string>): string {
+  const len = lines.length;
+  if (len <= 12) return lines.join("\n");
+
+  const isImportant = (line: string) => CRITICAL_LOG_RE.test(line) || BUILD_WARN_LINE_RE.test(line);
+  const isChurn = (line: string) =>
+    !isImportant(line) && (BUILD_CHURN_LINE_RE.test(line) || line.trim() === "");
+
+  const nonChurnIndices: Array<number> = [];
+  for (let i = 0; i < len; i += 1) {
+    if (!isChurn(lines[i] ?? "")) {
+      nonChurnIndices.push(i);
+    }
+  }
+
+  const keep = new Uint8Array(len);
+  for (const idx of nonChurnIndices.slice(0, 3)) keep[idx] = 1;
+  for (const idx of nonChurnIndices.slice(-8)) keep[idx] = 1;
+
+  for (let i = 0; i < len; i += 1) {
+    if (isImportant(lines[i] ?? "")) {
+      const start = Math.max(0, i - 2);
+      const end = Math.min(len - 1, i + 2);
+      for (let j = start; j <= end; j += 1) {
+        if (!isChurn(lines[j] ?? "") || j === i) {
+          keep[j] = 1;
+        }
+      }
+    }
+  }
+
+  return collapseKeptLines(lines, keep, (n) => `[... ${n} build/install lines omitted ...]`);
+}
+
+function compressCliOutput(rawText: string, commandHint?: string): string | undefined {
+  const cleaned = stripAnsi(rawText).replace(/\r\n/g, "\n");
+  const lines = cleaned.split("\n");
+
+  if (commandHint !== undefined) {
+    if (TEST_RUNNER_CMD_RE.test(commandHint)) {
+      return compressTestRunnerOutput(lines);
+    }
+    if (TYPECHECK_LINT_CMD_RE.test(commandHint)) {
+      return compressTypecheckLintOutput(lines);
+    }
+    if (GIT_STATUS_CMD_RE.test(commandHint)) {
+      return compressGitStatusOutput(lines);
+    }
+    if (GIT_LOG_CMD_RE.test(commandHint)) {
+      return compressGitLogOutput(lines);
+    }
+    if (BUILD_INSTALL_CMD_RE.test(commandHint)) {
+      return compressBuildInstallOutput(lines);
+    }
+  }
+
+  if (looksLikeTestRunnerOutput(lines)) {
+    return compressTestRunnerOutput(lines);
+  }
+  return undefined;
+}
+
 function runCompressor(contentType: CompressionContentType, text: string): string {
   switch (contentType) {
     case "json":
@@ -770,9 +1190,11 @@ function formatCcrFooter(input: {
 export function compressToolOutput(input: CompressToolOutputInput): CompressToolOutputResult {
   const originalChars = input.text.length;
   const minChars = input.minChars ?? DEFAULT_MIN_CHARS;
+  const commandHint = resolveCommandHint(input.command, input.sourceLabel);
   const contentType = detectContentType(input.text, {
     path: input.path,
     sourceLabel: input.sourceLabel,
+    command: commandHint,
     contentTypeHint: input.contentTypeHint,
   });
 
@@ -788,7 +1210,14 @@ export function compressToolOutput(input: CompressToolOutputInput): CompressTool
     };
   }
 
-  const candidateBody = runCompressor(contentType, input.text);
+  const genericInput =
+    contentType === "logs" || contentType === "diff" ? stripAnsi(input.text) : input.text;
+  const genericCandidate = runCompressor(contentType, genericInput);
+  const cliCandidate =
+    contentType !== "json" && contentType !== "code" && contentType !== "diff"
+      ? compressCliOutput(input.text, commandHint)
+      : undefined;
+  const candidateBody = cliCandidate !== undefined ? cliCandidate : genericCandidate;
   const includeFooter = input.includeFooter !== false;
 
   if (!includeFooter) {
