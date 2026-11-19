@@ -11,11 +11,12 @@ import {
 } from "@t3tools/shared/usageFormat";
 import {
   collectLimitAccounts,
-  collectLimitNotices,
   collectLimitPools,
   displayLimitWindows,
   remainingPercent,
 } from "@t3tools/shared/usageLimits";
+import { collectLimitNotices } from "@t3tools/shared/usageLimitsCopy";
+import { T, useGT, useMessages } from "gt-react";
 import { isModelCostUnknown } from "@t3tools/shared/usageMerge";
 import { useNavigate } from "@tanstack/react-router";
 import { ChevronRightIcon, ExternalLinkIcon } from "lucide-react";
@@ -62,6 +63,8 @@ export function UsagePanel(props: {
   readonly threadId: ThreadId;
   readonly contextWindow: ContextWindowSnapshot | null;
 }) {
+  const gt = useGT();
+  const messages = useMessages();
   const navigate = useNavigate();
   const now = Date.parse(`${useNowMinute()}:00Z`);
   const hour12 = usePrimarySettings((settings) => resolveHour12(settings.timestampFormat));
@@ -100,7 +103,7 @@ export function UsagePanel(props: {
     metric,
   );
   const otherLimits = [...limitsByDriver].filter(([driver]) => !knownDrivers.has(driver));
-  const notices = collectLimitNotices(presentations);
+  const notices = collectLimitNotices(presentations, messages);
   const metricValue = (totals: { costUsd: number; totalTokens: number } | undefined) =>
     metric === "cost" ? formatUsd(totals?.costUsd ?? 0) : formatTokens(totals?.totalTokens ?? 0);
 
@@ -116,11 +119,11 @@ export function UsagePanel(props: {
     <div
       data-usage-panel
       className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto p-3"
-      aria-label="Usage"
+      aria-label={gt("Usage")}
     >
       {props.contextWindow ? (
         <section data-usage-panel-section="context" className="flex flex-col gap-1">
-          <Heading>Current thread context</Heading>
+          <Heading>{gt("Current thread context")}</Heading>
           <ThreadDetailsContext
             usage={props.contextWindow}
             environmentId={props.environmentId}
@@ -132,7 +135,7 @@ export function UsagePanel(props: {
       <section data-usage-panel-section="providers" className="flex flex-col gap-2">
         <div className="flex flex-wrap items-center gap-2">
           <ToggleGroup
-            aria-label="Usage period"
+            aria-label={gt("Usage period")}
             variant="segmented"
             value={[String(selection.days)]}
             onValueChange={(next) => {
@@ -144,12 +147,12 @@ export function UsagePanel(props: {
           >
             {WINDOW_OPTIONS.map((option) => (
               <Toggle key={option.days} value={String(option.days)}>
-                {option.label}
+                {messages(option.label)}
               </Toggle>
             ))}
           </ToggleGroup>
           <ToggleGroup
-            aria-label="Usage metric"
+            aria-label={gt("Usage metric")}
             variant="segmented"
             value={[metric]}
             onValueChange={(next) => {
@@ -159,13 +162,13 @@ export function UsagePanel(props: {
           >
             {SPEND_METRICS.map((option) => (
               <Toggle key={option.value} value={option.value}>
-                {option.label}
+                {messages(option.label)}
               </Toggle>
             ))}
           </ToggleGroup>
           <Button
             onClick={refreshAll}
-            aria-label="Refresh usage and limits"
+            aria-label={gt("Refresh usage and limits")}
             aria-busy={isRefreshing}
             disabled={isRefreshing}
             size="icon-sm"
@@ -176,7 +179,9 @@ export function UsagePanel(props: {
           </Button>
         </div>
         {providers.length === 0 ? (
-          <p className="text-xs text-muted-foreground">No activity or limits to show.</p>
+          <p className="text-xs text-muted-foreground">
+            <T>No activity or limits to show.</T>
+          </p>
         ) : (
           providers.map((provider) => {
             const totals = data.providers.find((entry) => entry.provider === provider);
@@ -199,7 +204,10 @@ export function UsagePanel(props: {
                     <span
                       data-usage-limit-meter
                       className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground tabular-nums"
-                      aria-label={`${tightest.label}: ${remainingPercent(tightest)}% left`}
+                      aria-label={gt("{label}: {percent}% left", {
+                        label: messages(tightest.label),
+                        percent: remainingPercent(tightest),
+                      })}
                     >
                       <span className="relative h-1 w-10 rounded-full bg-muted">
                         <span
@@ -237,7 +245,7 @@ export function UsagePanel(props: {
                               </span>
                               <span className="shrink-0 text-muted-foreground tabular-nums">
                                 {metric === "cost" && isModelCostUnknown(model)
-                                  ? "Unpriced"
+                                  ? gt("Unpriced")
                                   : metricValue(model)}
                                 {totals && totals.totalTokens > 0
                                   ? ` · ${formatPercent(model.totalTokens / totals.totalTokens)}`
@@ -273,7 +281,7 @@ export function UsagePanel(props: {
         className="self-start"
         onClick={() => void navigate({ to: "/usage" })}
       >
-        Open full usage page
+        <T>Open full usage page</T>
         <ExternalLinkIcon className="size-3.5" aria-hidden />
       </Button>
 
