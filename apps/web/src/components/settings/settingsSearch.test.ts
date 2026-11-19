@@ -88,6 +88,29 @@ describe("searchSettings", () => {
     });
   });
 
+  it("includes Account in the Connections nav group and search results", () => {
+    const connectionsGroup = SETTINGS_NAV_GROUPS.find((group) =>
+      group.paths.includes("/settings/connections"),
+    );
+    expect(connectionsGroup?.paths).toContain("/settings/account");
+    expect(searchSettings("account")).toContainEqual(
+      expect.objectContaining({
+        id: "t3-account",
+        to: "/settings/account",
+      }),
+    );
+    expect(searchSettings("sign in")).toContainEqual(
+      expect.objectContaining({
+        id: "t3-account",
+        to: "/settings/account",
+      }),
+    );
+    expect(searchSettings("t3 code account")[0]).toMatchObject({
+      id: "t3-account",
+      to: "/settings/account",
+    });
+  });
+
   it("matches normalized title substrings", () => {
     expect(searchSettings("  WORD   WRAP  ", ITEMS).map((item) => item.id)).toEqual(["word-wrap"]);
     expect(searchSettings("glass").map((item) => item.id)).toEqual(["setting-glass-opacity"]);

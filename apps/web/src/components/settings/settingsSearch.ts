@@ -34,6 +34,7 @@ export type SettingsPath =
   | "/settings/scheduled-tasks"
   | "/settings/source-control"
   | "/settings/worktrees"
+  | "/settings/account"
   | "/settings/connections"
   | "/settings/access"
   | "/settings/secrets"
@@ -109,6 +110,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/scheduled-tasks": msg("Scheduled tasks"),
   "/settings/source-control": msg("Source control & issues"),
   "/settings/worktrees": msg("Worktrees"),
+  "/settings/account": msg("Account"),
   "/settings/connections": msg("Environments"),
   "/settings/access": msg("Sharing & access"),
   "/settings/secrets": msg("Secrets"),
@@ -164,6 +166,7 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
   {
     heading: msg("Connections"),
     paths: [
+      "/settings/account",
       "/settings/connections",
       "/settings/access",
       ...(isSecretsFeatureEnabled ? (["/settings/secrets"] as const) : []),
@@ -1384,6 +1387,16 @@ export const SETTINGS_SEARCH_ITEMS = [
     wslAvailableOnly: true,
   },
   {
+    id: "t3-account",
+    title: msg("T3 Code account"),
+    to: "/settings/account",
+    searchTerms: [
+      msg(
+        "account login sign in sign out clerk profile t3 connect remote control mobile app t3 chat",
+      ),
+    ],
+  },
+  {
     id: "t3-connect",
     localEnvironmentOnly: true,
     title: msg("T3 Connect"),
@@ -1508,6 +1521,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/devices": null,
   "/settings/source-control": "environment-defaults",
   "/settings/worktrees": "project-defaults",
+  "/settings/account": "connections",
   "/settings/connections": "connections",
   "/settings/access": "connections",
   "/settings/secrets": null,
