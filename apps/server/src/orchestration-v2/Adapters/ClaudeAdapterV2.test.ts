@@ -6132,6 +6132,199 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         ),
       ),
     );
+
+    it.effect(
+      "exempts ranged Read calls, extracts CommandLine hints, and applies 6k thresholds to code Read and python",
+      () =>
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: "/workspace",
+          });
+          const input = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-post-tool-thresholds"),
+            text: "Test ranged reads and thresholds.",
+            attachments: [],
+            runtimePolicy,
+          });
+          yield* harness.runtime.startTurn({
+            ...input,
+            appThread: {
+              ...input.appThread,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+            },
+          });
+          const openedOptions = harness.getOpenedOptions();
+          const postHooks = openedOptions!.hooks!.PostToolUse!.flatMap((matcher) => matcher.hooks);
+          const evalPostToolUse = async (
+            toolName: string,
+            toolInput: unknown,
+            toolResponse: unknown,
+          ) => {
+            const outputs = await Promise.all(
+              postHooks.map((hook) =>
+                hook(
+                  {
+                    hook_event_name: "PostToolUse",
+                    tool_name: toolName,
+                    tool_input: toolInput,
+                    tool_response: toolResponse,
+                    tool_use_id: "tool-post-thresh",
+                    session_id: "native-thread-post-thresh",
+                    transcript_path: "/transcript.jsonl",
+                    cwd: "/workspace",
+                  },
+                  "tool-post-thresh",
+                  { signal: new AbortController().signal },
+                ),
+              ),
+            );
+            return outputs[0];
+          };
+          const updatedOf = (out: Awaited<ReturnType<typeof evalPostToolUse>>) =>
+            out &&
+            "hookSpecificOutput" in out &&
+            out.hookSpecificOutput?.hookEventName === "PostToolUse"
+              ? out.hookSpecificOutput.updatedToolOutput
+              : undefined;
+
+          const makeCodeLines = (count: number) =>
+            Array.from({ length: count }, (_, i) =>
+              [
+                `export function fn_${i}(value: number): number {`,
+                `  const step1 = value + ${i};`,
+                `  const step2 = step1 * 2;`,
+                `  const step3 = step2 - 1;`,
+                `  return step3;`,
+                `}`,
+              ].join("\n"),
+            ).join("\n");
+          const mediumCode = makeCodeLines(25);
+          assert.isAbove(mediumCode.length, 3_000);
+          assert.isBelow(mediumCode.length, 6_000);
+
+          const largeCode = makeCodeLines(50);
+          assert.isAbove(largeCode.length, 6_000);
+
+          // Ranged Read and read_file are exempt even above 6,000 chars.
+          assert.deepEqual(
+            yield* Effect.promise(() =>
+              evalPostToolUse(
+                "Read",
+                { file_path: "/workspace/foo.ts", offset: 1, limit: 140 },
+                largeCode,
+              ),
+            ),
+            {},
+          );
+          assert.deepEqual(
+            yield* Effect.promise(() =>
+              evalPostToolUse(
+                "mcp__t3-code__read_file",
+                { Path: "/workspace/foo.ts", StartLine: 1, EndLine: 140 },
+                largeCode,
+              ),
+            ),
+            {},
+          );
+
+          // Unranged Read uses 6,000-char threshold for code files, 3,000-char for logs/json.
+          assert.deepEqual(
+            yield* Effect.promise(() =>
+              evalPostToolUse("Read", { file_path: "/workspace/foo.ts" }, mediumCode),
+            ),
+            {},
+          );
+          const compressedCode = updatedOf(
+            yield* Effect.promise(() =>
+              evalPostToolUse("Read", { file_path: "/workspace/foo.ts" }, largeCode),
+            ),
+          );
+          assert.isString(compressedCode);
+          assert.include(compressedCode as string, "[T3 CCR:");
+
+          const mediumLog = Array.from(
+            { length: 90 },
+            (_, i) => `2026-11-13T01:00:00Z INFO line=${i} ok`,
+          ).join("\n");
+          assert.isAbove(mediumLog.length, 3_000);
+          assert.isBelow(mediumLog.length, 6_000);
+          const compressedReadLog = updatedOf(
+            yield* Effect.promise(() =>
+              evalPostToolUse("Read", { file_path: "/workspace/app.log" }, mediumLog),
+            ),
+          );
+          assert.isString(compressedReadLog);
+          assert.include(compressedReadLog as string, "[T3 CCR:");
+
+          // Python MCP uses 6,000-char threshold.
+          const mediumPythonOut = Array.from(
+            { length: 120 },
+            (_, i) => `row=${i} value=alpha_beta_gamma_delta_epsilon`,
+          ).join("\n");
+          assert.isAbove(mediumPythonOut.length, 3_000);
+          assert.isBelow(mediumPythonOut.length, 6_000);
+          assert.deepEqual(
+            yield* Effect.promise(() =>
+              evalPostToolUse("mcp__t3-code__python", { code: "print()" }, mediumPythonOut),
+            ),
+            {},
+          );
+          const largePythonOut = Array.from(
+            { length: 240 },
+            (_, i) => `row=${i} value=alpha_beta_gamma_delta_epsilon`,
+          ).join("\n");
+          assert.isAbove(largePythonOut.length, 6_000);
+          const compressedPythonOut = updatedOf(
+            yield* Effect.promise(() =>
+              evalPostToolUse("mcp__t3-code__python", { code: "print()" }, largePythonOut),
+            ),
+          );
+          assert.isString(compressedPythonOut);
+          assert.include(compressedPythonOut as string, "[T3 CCR:");
+
+          // run_command with CommandLine extracts git show/diff hint even when diff markers appear after 4 KiB.
+          const largeDiff = [
+            ...Array.from(
+              { length: 60 },
+              (_, i) => `Commit note line ${i}: describing release metadata without diff markers.`,
+            ),
+            "diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml",
+            "--- a/pnpm-lock.yaml",
+            "+++ b/pnpm-lock.yaml",
+            "@@ -1,80 +1,80 @@",
+            ...Array.from(
+              { length: 80 },
+              (_, i) => `+  package-${i}: { resolution: { integrity: sha512-${i} } }`,
+            ),
+          ].join("\n");
+          assert.isAbove(largeDiff.length, 6_000);
+          const compressedRunCommand = updatedOf(
+            yield* Effect.promise(() =>
+              evalPostToolUse("run_command", { CommandLine: "git show HEAD" }, largeDiff),
+            ),
+          );
+          assert.isString(compressedRunCommand);
+          assert.include(compressedRunCommand as string, "(diff):");
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+              ServerSettings.layerTest(),
+            ),
+          ),
+        ),
+    );
   });
 
   it.effect(

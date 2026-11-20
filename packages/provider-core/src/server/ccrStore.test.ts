@@ -4,7 +4,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { assert, describe, it } from "@effect/vitest";
 
-import { createCcrStore } from "./ccrStore.ts";
+import { createCcrStore, redactCcrSecrets } from "./ccrStore.ts";
 
 describe("createCcrStore", () => {
   it("stores entries with monotonic ccr_XXXX ids and retrieves exact 1-indexed line slices", () => {
@@ -281,5 +281,170 @@ describe("createCcrStore", () => {
     assert.equal(exactBoundary.truncated, true);
     assert.isFalse(exactBoundary.content.endsWith("--"));
     assert.equal(exactBoundary.endLine, 3);
+  });
+
+  it("redacts high-confidence secrets on put() in memory, retrieve(), and persisted disk cache without false positives", () => {
+    const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-ccr-redact-"));
+    try {
+      const persistPath = NodePath.join(tempDir, "ccr-cache.json");
+      const store = createCcrStore({ persistPath, debounceMs: 0 });
+
+      const secretPayload = [
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "MIIEpAIBAAKCAQEA1234567890abcdef",
+        "-----END RSA PRIVATE KEY-----",
+        "Authorization: Bearer super_secret_bearer_token_value_1234",
+        "ANTHROPIC=sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456",
+        "GITHUB=ghp_1234567890abcdefghijklmnopqrstuvwxyz",
+        "AWS=AKIAIOSFODNN7EXAMPLE123",
+        "OPENAI_API_KEY=my_real_secret_key_987654321",
+        'DB_PASSWORD="actual_db_password_999"',
+        "auth_token=real_cookie_auth_token_12345; ct0=real_ct0_csrf_token_67890",
+        "DUMMY_API_KEY=example_placeholder_value",
+        "TEMPLATE_SECRET=${MY_TEMPLATE_SECRET}",
+        "DOC_PASSWORD=<your-password>",
+        "uuid=550e8400-e29b-41d4-a716-446655440000",
+        "commit=4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+      ].join("\n");
+
+      const entry = store.put({ content: secretPayload, contentType: "logs", threadId: "t-sec" });
+      assert.equal(entry.redacted, true);
+      assert.notInclude(entry.content, "MIIEpAIBAAKCAQEA1234567890abcdef");
+      assert.notInclude(entry.content, "super_secret_bearer_token_value_1234");
+      assert.notInclude(entry.content, "sk-ant-api03-");
+      assert.notInclude(entry.content, "ghp_1234567890");
+      assert.notInclude(entry.content, "my_real_secret_key_987654321");
+      assert.notInclude(entry.content, "actual_db_password_999");
+      assert.notInclude(entry.content, "real_cookie_auth_token_12345");
+      assert.notInclude(entry.content, "real_ct0_csrf_token_67890");
+
+      assert.include(entry.content, "[REDACTED_PRIVATE_KEY]");
+      assert.include(entry.content, "Authorization: Bearer [REDACTED]");
+      assert.include(entry.content, "[REDACTED_TOKEN]");
+      assert.include(entry.content, "OPENAI_API_KEY=[REDACTED]");
+      assert.include(entry.content, 'DB_PASSWORD="[REDACTED]"');
+      assert.include(entry.content, "DUMMY_API_KEY=example_placeholder_value");
+      assert.include(entry.content, "TEMPLATE_SECRET=${MY_TEMPLATE_SECRET}");
+      assert.include(entry.content, "DOC_PASSWORD=<your-password>");
+      assert.include(entry.content, "uuid=550e8400-e29b-41d4-a716-446655440000");
+      assert.include(entry.content, "commit=4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+
+      const retrieved = store.retrieve({ ccrId: entry.ccrId, startLine: 1, endLine: 20 });
+      assert.equal(retrieved.redacted, true);
+      assert.notInclude(retrieved.content, "my_real_secret_key_987654321");
+
+      const persistedRaw = NodeFS.readFileSync(persistPath, "utf8");
+      assert.notInclude(persistedRaw, "my_real_secret_key_987654321");
+      assert.notInclude(persistedRaw, "MIIEpAIBAAKCAQEA1234567890abcdef");
+
+      const codeSnippet = [
+        "const password = getPasswordFromEnv();",
+        "const cfg = { CLIENT_SECRET: process.env.CLIENT_SECRET, api_key: options.apiKey };",
+        "plain uuid 550e8400-e29b-41d4-a716-446655440000",
+      ].join("\n");
+      const cleanResult = redactCcrSecrets(codeSnippet);
+      assert.equal(cleanResult.redacted, false);
+      assert.equal(cleanResult.text, codeSnippet);
+
+      const jsonAndLower = [
+        '{"password": "json_real_secret_value_99", "api_key": "lower_api_secret_1234"}',
+        "api_key=unquoted_lower_secret_5678",
+      ].join("\n");
+      const jsonRedacted = redactCcrSecrets(jsonAndLower);
+      assert.equal(jsonRedacted.redacted, true);
+      assert.notInclude(jsonRedacted.text, "json_real_secret_value_99");
+      assert.notInclude(jsonRedacted.text, "lower_api_secret_1234");
+      assert.notInclude(jsonRedacted.text, "unquoted_lower_secret_5678");
+      assert.include(jsonRedacted.text, '"password": "[REDACTED]"');
+      assert.include(jsonRedacted.text, '"api_key": "[REDACTED]"');
+      assert.include(jsonRedacted.text, "api_key=[REDACTED]");
+
+      const cleanEntry = store.put({ content: "clean log line", contentType: "logs" });
+      assert.isUndefined(cleanEntry.redacted);
+      assert.isUndefined(store.retrieve({ ccrId: cleanEntry.ccrId }).redacted);
+    } finally {
+      NodeFS.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("caps per-entry bytes cleanly without splitting UTF-8 multi-byte chars or evicting the whole store", () => {
+    const store = createCcrStore({ maxBytes: 1_000, maxEntryBytes: 120 });
+    const small = store.put({ content: "keep-me", contentType: "text" });
+    const giantUtf8 = "😀".repeat(60); // 240 UTF-8 bytes
+    const capped = store.put({ content: giantUtf8, contentType: "text" });
+
+    assert.isDefined(store.get(small.ccrId));
+    assert.isAtMost(capped.byteCount, 120);
+    assert.include(capped.content, "[... truncated to CCR entry byte cap ...]");
+    assert.isFalse(capped.content.includes("\uFFFD"));
+  });
+
+  it("rejects long or nested-quantifier ReDoS queries and falls back to literal matching", () => {
+    const store = createCcrStore();
+    const evilInput = `${"a".repeat(32)}!`;
+    const entry = store.put({
+      content: ["alpha", evilInput, "literal /(a+)+/ pattern", "omega"].join("\n"),
+      contentType: "text",
+    });
+
+    const nested = store.retrieve({ ccrId: entry.ccrId, query: "/(a+)+/" });
+    assert.equal(nested.found, true);
+    assert.equal(nested.matchedLines, 1);
+    assert.equal(nested.content, "L3: literal /(a+)+/ pattern");
+
+    const plainNested = store.retrieve({ ccrId: entry.ccrId, query: "([a-z]+)*" });
+    assert.equal(plainNested.found, true);
+    assert.equal(plainNested.matchedLines, 0);
+
+    const overlong = store.retrieve({ ccrId: entry.ccrId, query: "a".repeat(250) });
+    assert.equal(overlong.found, true);
+    assert.equal(overlong.matchedLines, 0);
+  });
+
+  it("purges all entries for a thread via purgeThread while preserving other threads and historical savings", () => {
+    const store = createCcrStore();
+    const a1 = store.put({ content: "thread-a-1", contentType: "text", threadId: "thread-a" });
+    const a2 = store.put({ content: "thread-a-2", contentType: "text", threadId: "thread-a" });
+    const b1 = store.put({ content: "thread-b-1", contentType: "text", threadId: "thread-b" });
+    store.recordCompression(2_000, 500, "thread-a");
+
+    const purgedCount = store.purgeThread("thread-a");
+    assert.equal(purgedCount, 2);
+    assert.equal(store.purgeThread("thread-a"), 0);
+    assert.isUndefined(store.get(a1.ccrId));
+    assert.isUndefined(store.get(a2.ccrId));
+    assert.isDefined(store.get(b1.ccrId));
+
+    const statsA = store.getStats("thread-a");
+    assert.equal(statsA.entriesCount, 0);
+    assert.equal(statsA.currentBytes, 0);
+    assert.equal(statsA.tokensSavedEst, 375);
+    assert.equal(store.getStats().entriesCount, 1);
+    assert.equal(store.getStats().currentBytes, b1.byteCount);
+  });
+
+  it("tracks retrieveCallsCount globally, per-thread, and across persistence hydration", () => {
+    const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-ccr-retrieve-count-"));
+    try {
+      const persistPath = NodePath.join(tempDir, "ccr-cache.json");
+      const writer = createCcrStore({ persistPath, debounceMs: 0 });
+      const entry = writer.put({ content: "line1\nline2", contentType: "text", threadId: "t1" });
+
+      writer.retrieve({ ccrId: entry.ccrId, threadId: "t1" });
+      writer.retrieve({ ccrId: entry.ccrId, startLine: 1, endLine: 1 });
+      writer.retrieve({ ccrId: "ccr_9999", threadId: "t2" });
+
+      assert.equal(writer.getStats("t1").retrieveCallsCount, 2);
+      assert.equal(writer.getStats("t2").retrieveCallsCount, 1);
+      assert.equal(writer.getStats().retrieveCallsCount, 3);
+
+      const reader = createCcrStore();
+      reader.configurePersistence(persistPath, { debounceMs: 0 });
+      assert.equal(reader.getStats("t1").retrieveCallsCount, 2);
+      assert.equal(reader.getStats("t2").retrieveCallsCount, 1);
+      assert.equal(reader.getStats().retrieveCallsCount, 3);
+    } finally {
+      NodeFS.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

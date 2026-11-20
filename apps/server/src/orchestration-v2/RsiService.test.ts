@@ -396,6 +396,65 @@ describe("RsiService", () => {
       }),
   );
 
+  it.effect(
+    "attributes thread-scoped CCR savings per thread even when concurrent runs finalize out of order",
+    () =>
+      Effect.gen(function* () {
+        const store = createCcrStore();
+        const rsi = yield* makeRsiService({ ccrStore: store });
+
+        store.recordCompression(5_000, 1_000, "thread-a"); // 4_000 saved chars => 1_000 tokens, 1 call
+        store.recordCompression(9_000, 1_000, "thread-b"); // 8_000 saved chars => 2_000 tokens, 1 call
+
+        const preThreadASummary = yield* rsi.getTelemetrySummary({ threadId: "thread-a" });
+        expect(preThreadASummary.totalTokensSavedEst).toBe(1_000);
+        expect(preThreadASummary.totalCompressedCalls).toBe(1);
+
+        const runB = yield* rsi.recordRunTelemetry({
+          threadId: "thread-b",
+          runId: "run-b-1",
+          provider: "claudeAgent",
+          model: "sonnet",
+          usedTokens: 3_000,
+          cachedInputTokens: 1_500,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 1_000,
+        });
+        expect(runB.tokensSavedEst).toBe(2_000);
+        expect(runB.compressedCallsCount).toBe(1);
+
+        // thread-a still retains its own unsynced delta after thread-b finalized.
+        const midThreadASummary = yield* rsi.getTelemetrySummary({ threadId: "thread-a" });
+        expect(midThreadASummary.totalTokensSavedEst).toBe(1_000);
+        expect(midThreadASummary.totalCompressedCalls).toBe(1);
+
+        const runA = yield* rsi.recordRunTelemetry({
+          threadId: "thread-a",
+          runId: "run-a-1",
+          provider: "claudeAgent",
+          model: "sonnet",
+          usedTokens: 2_000,
+          cachedInputTokens: 1_000,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 900,
+        });
+        expect(runA.tokensSavedEst).toBe(1_000);
+        expect(runA.compressedCallsCount).toBe(1);
+
+        const globalSummary = yield* rsi.getTelemetrySummary();
+        expect(globalSummary.totalTokensSavedEst).toBe(3_000);
+        expect(globalSummary.totalCompressedCalls).toBe(2);
+      }),
+  );
+
   it.effect("reads defaultCcrStore.getStats() by default in RsiService.layer", () =>
     Effect.gen(function* () {
       defaultCcrStore.clear();

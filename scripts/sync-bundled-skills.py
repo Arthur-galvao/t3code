@@ -11,7 +11,11 @@ for name, files in SKILLS.items():
     out += f"  {{\n    name: {json.dumps(name)},\n    files: {{\n"
     for file in files:
         text = (ROOT / ".agents/skills" / name / file).read_text(encoding="utf8")
-        out += f"      {json.dumps(file)}: {json.dumps(text, ensure_ascii=False)},\n"
+        lines = text.split("\n")
+        out += f"      {json.dumps(file)}: [\n"
+        for line in lines:
+            out += f"        {json.dumps(line, ensure_ascii=False)},\n"
+        out += '      ].join("\\n"),\n'
     out += "    },\n  },\n"
 out += "];\n"
 (ROOT / "apps/server/src/skills/bundledSkills.generated.ts").write_text(out, encoding="utf8", newline="\n")

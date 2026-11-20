@@ -22,17 +22,18 @@ Ordinary coding tasks need no T3 tools.
 
 - Answer data with a trend or comparison with a chart and show any visual the user asks for here: pass an HTML file path or inline HTML to \`html_preview\`, then \`html_render\`. A screenshot on disk or a text description doesn't show it. Never start a server for it. Page tools write only on user request. Never use them to show results. Asked for an image to post, send or use elsewhere: a \`.png\` file and its path, never \`html_render\`.
 - Never use \`preview_*\` unasked to verify or show your own edit. Use them when the current request asks for browser work, including recording edits, or names a page or tab. Don't repeat preview calls from an earlier turn. Public pages: web fetch or search unless browser work was asked; then preview tools only, no web fetch. Close a tab you opened before you reply, unless the user asked for it or uses it.`,
-  `### Model routing and advisor
+  `### Automatic workflow, routing, and advisor
 
-Subscription quota is the budget. Give each subtask to the cheapest model that can do it well; a model the user names always wins. Do a task yourself when it takes only a few tool calls, because a delegate starts cold.
+Quota and cache are the budget. Apply subagent routing automatically (Workflow stays ask-only): do tiny tasks yourself (<=5 tool calls, <=3 files); offload larger or noisy work so raw output stays out of your context. User-named models win.
 
-- Search, inventory, reading logs or files, classification, mechanical edits: Claude Haiku 5.5 (\`high\`), or an OpenCode free model when quality matters little.
-- Implementation from a clear spec, tests, routine fixes, scripts: Gemini 4 Hydrogen (\`high\`; its quota is generous and separate from Claude's), else Claude Sonnet 5.5.
-- UI and visual work, or very large inputs: Gemini 4 Neon (\`high\`).
-- Cross-cutting design, hard debugging, running a long multi-agent job: Claude Opus 5.5 (\`medium\`; \`high\` only once stuck).
-- Advisor: Claude Opus 5.5 (\`high\`); if you are already Claude Opus 5.5 or Claude is unavailable/rate-limited, use Gemini 4 Neon (\`high\`, separate Antigravity quota). Unless you are a delegated child, consult the advisor at three moments only: before committing to a plan that spans several files or is hard to undo, after two failed attempts at the same problem, and before handing back a non-trivial change. Use your native advisor tool when you have one; otherwise one \`delegate_task\` with \`role:"review"\` whose brief gives the goal, what you did or plan, the exact doubt and the relevant paths, and asks for a verdict under 200 words. It advises; it never implements. Trivial tasks get no advisor. That fallback switch to Gemini 4 Neon (\`high\`) is the one switch you may make unasked.
+- Search, logs, inventory, mechanical edits: Claude Haiku 5.5 (\`high\`), or OpenCode free if low-stakes.
+- Clear-spec impl, tests, scripts: Gemini 4 Hydrogen (\`high\`, separate quota), else Claude Sonnet 5.5.
+- Hardest debugging, tough design, UI/visuals, huge inputs: Gemini 4 Neon (\`high\`).
+- Cross-cutting refactors, complex reviews, long jobs (saves Gemini quota): Claude Opus 5.5 (\`medium\`; \`high\` if stuck).
+- Patterns: (1) Builder vs verifier: for diffs >~30 lines or >1 file, run a fresh read-only verifier (\`Haiku\` for spec/diff; Advisor if high-risk), fixing small findings yourself. (2) Disjoint lanes: parallelize independent areas with exclusive paths; never overlap writers or sequential planning. (3) Specialized reviewers: split sensitive reviews into fresh read-only lenses (edge cases, security, simplicity). (4) Eval-gated Best-of-N (\`Hydrogen\` worktrees) when tests pick winners; blind council (hide model names) for subjective design.
+- Advisor: Gemini 4 Neon (\`high\`), or Claude Opus 5.5 (\`high\`) if already Neon, saving Gemini quota, or Antigravity unavailable (only unasked switch). Top-level, skip trivial tasks: before multi-file/hard-to-undo plans, after 2 failed attempts, before handing back non-trivial work; native advisor tool or \`delegate_task\` (\`role:"review"\`, <=200 words; never implements).
 
-Write each delegate brief so it stands alone: goal, what done looks like, constraints, paths, and the shape of the report you want back.`,
+Briefs stand alone: goal, done, exclusive paths, constraints, report shape.`,
 ];
 
 export const T3_CODE_ORCHESTRATION_INSTRUCTIONS = `

@@ -185,8 +185,16 @@ describe("T3 device instructions", () => {
   it("routes UI and advisor roles to available models while keeping Codex section byte limits", () => {
     assert.notInclude(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Fable 5.2");
     assert.notInclude(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Gemini 4 Argon");
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Advisor: Claude Opus 5.5");
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Gemini 4 Neon");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Advisor: Gemini 4 Neon");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Claude Opus 5.5");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Apply subagent routing automatically");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Workflow stays ask-only");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Builder vs verifier");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Disjoint lanes");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Specialized reviewers");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "<=5 tool calls");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "native advisor tool");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "saves Gemini quota");
     for (const section of T3_CODE_ORCHESTRATION_SECTIONS) {
       assert.isBelow(Buffer.byteLength(section, "utf8"), 4_000);
     }

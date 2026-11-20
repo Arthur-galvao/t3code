@@ -523,6 +523,7 @@ const ContextRetrieveResult = Schema.Struct({
   startLine: Schema.optional(Schema.Number),
   endLine: Schema.optional(Schema.Number),
   truncated: Schema.Boolean,
+  redacted: Schema.optional(Schema.Boolean),
   content: Schema.String,
 });
 

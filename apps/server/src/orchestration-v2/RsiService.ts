@@ -10,7 +10,11 @@ import * as Semaphore from "effect/Semaphore";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
-import { type CcrStore, defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
+import {
+  type CcrStats,
+  type CcrStore,
+  defaultCcrStore,
+} from "@t3tools/provider-core/server/ccrStore";
 import { distillTechnicalPromptSpec } from "@t3tools/provider-core/server/orchestrationInstructions";
 
 export const MAX_LESSONS = 25;
@@ -19,6 +23,40 @@ const SIMILARITY_MERGE_THRESHOLD = 0.72;
 const TELEMETRY_SUMMARY_RECENT_LIMIT = 20;
 const CONFIDENCE_FLOOR = 0.15;
 const MAX_TRACKED_RUN_LESSONS = 500;
+const UNSCOPED_CCR_KEY = "__global__";
+
+interface SyncedCcrBaseline {
+  readonly tokensSavedEst: number;
+  readonly compressedCallsCount: number;
+}
+
+function computeCcrDelta(
+  stats: Pick<CcrStats, "tokensSavedEst" | "compressedCallsCount">,
+  synced: SyncedCcrBaseline | undefined,
+): { readonly tokens: number; readonly calls: number } {
+  const prevTokens = synced?.tokensSavedEst ?? 0;
+  const prevCalls = synced?.compressedCallsCount ?? 0;
+  const baseTokens = stats.tokensSavedEst < prevTokens ? 0 : prevTokens;
+  const baseCalls = stats.compressedCallsCount < prevCalls ? 0 : prevCalls;
+  return {
+    tokens: Math.max(0, stats.tokensSavedEst - baseTokens),
+    calls: Math.max(0, stats.compressedCallsCount - baseCalls),
+  };
+}
+
+function nextBaselineForKey(
+  stats: Pick<CcrStats, "tokensSavedEst" | "compressedCallsCount">,
+  prev: SyncedCcrBaseline | undefined,
+  syncTokens: boolean,
+  syncCalls: boolean,
+): SyncedCcrBaseline {
+  return {
+    tokensSavedEst: syncTokens ? stats.tokensSavedEst : (prev?.tokensSavedEst ?? 0),
+    compressedCallsCount: syncCalls
+      ? stats.compressedCallsCount
+      : (prev?.compressedCallsCount ?? 0),
+  };
+}
 
 export type RsiLessonScope = "global" | "glob";
 
@@ -1198,10 +1236,9 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   const telemetryRef = yield* Ref.make<ReadonlyArray<RsiRunTelemetryRecord>>([]);
   const recurrenceRef = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
   const injectedByRunRef = yield* Ref.make<ReadonlyMap<string, ReadonlyArray<string>>>(new Map());
-  const lastSyncedCcrRef = yield* Ref.make<{
-    readonly tokensSavedEst: number;
-    readonly compressedCallsCount: number;
-  }>({ tokensSavedEst: 0, compressedCallsCount: 0 });
+  const lastSyncedCcrByThreadRef = yield* Ref.make<ReadonlyMap<string, SyncedCcrBaseline>>(
+    new Map(),
+  );
   const hydratedRef = yield* Ref.make(false);
   const telemetryFileLinesRef = yield* Ref.make(0);
   const mutex = Semaphore.makeUnsafe(1);
@@ -1669,16 +1706,56 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       Effect.gen(function* () {
         yield* hydrateLocked();
 
-        const storeStats = ccrStore.getStats();
-        const lastSynced = yield* Ref.get(lastSyncedCcrRef);
-        const baseTokens =
-          storeStats.tokensSavedEst < lastSynced.tokensSavedEst ? 0 : lastSynced.tokensSavedEst;
-        const baseCalls =
-          storeStats.compressedCallsCount < lastSynced.compressedCallsCount
-            ? 0
-            : lastSynced.compressedCallsCount;
-        const deltaTokens = Math.max(0, storeStats.tokensSavedEst - baseTokens);
-        const deltaCalls = Math.max(0, storeStats.compressedCallsCount - baseCalls);
+        const syncTokens = telemetryInput.tokensSavedEst === undefined;
+        const syncCalls = telemetryInput.compressedCallsCount === undefined;
+
+        let deltaTokens = 0;
+        let deltaCalls = 0;
+        if (syncTokens || syncCalls) {
+          const syncedMap = yield* Ref.get(lastSyncedCcrByThreadRef);
+          const prevThread = syncedMap.get(telemetryInput.threadId);
+          const threadStats = ccrStore.getStats(telemetryInput.threadId);
+          const threadDelta = computeCcrDelta(threadStats, prevThread);
+
+          const isUnscopedThread = telemetryInput.threadId === UNSCOPED_CCR_KEY;
+          const prevUnscoped = isUnscopedThread ? undefined : syncedMap.get(UNSCOPED_CCR_KEY);
+          const unscopedStats = isUnscopedThread ? undefined : ccrStore.getStats(UNSCOPED_CCR_KEY);
+          const unscopedDelta =
+            unscopedStats === undefined
+              ? { tokens: 0, calls: 0 }
+              : computeCcrDelta(unscopedStats, prevUnscoped);
+
+          deltaTokens = threadDelta.tokens + unscopedDelta.tokens;
+          deltaCalls = threadDelta.calls + unscopedDelta.calls;
+
+          yield* Ref.update(lastSyncedCcrByThreadRef, (current) => {
+            const next = new Map(current);
+            if (
+              prevThread !== undefined ||
+              threadStats.tokensSavedEst > 0 ||
+              threadStats.compressedCallsCount > 0
+            ) {
+              next.set(
+                telemetryInput.threadId,
+                nextBaselineForKey(threadStats, prevThread, syncTokens, syncCalls),
+              );
+            }
+            if (
+              unscopedStats !== undefined &&
+              ((syncTokens && unscopedDelta.tokens > 0) ||
+                (syncCalls && unscopedDelta.calls > 0) ||
+                (prevUnscoped !== undefined &&
+                  (unscopedStats.tokensSavedEst < prevUnscoped.tokensSavedEst ||
+                    unscopedStats.compressedCallsCount < prevUnscoped.compressedCallsCount)))
+            ) {
+              next.set(
+                UNSCOPED_CCR_KEY,
+                nextBaselineForKey(unscopedStats, prevUnscoped, syncTokens, syncCalls),
+              );
+            }
+            return next;
+          });
+        }
 
         const resolvedTokensSavedEst =
           telemetryInput.tokensSavedEst !== undefined
@@ -1692,22 +1769,6 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
             : deltaCalls > 0
               ? deltaCalls
               : undefined;
-
-        if (
-          telemetryInput.tokensSavedEst === undefined ||
-          telemetryInput.compressedCallsCount === undefined
-        ) {
-          yield* Ref.set(lastSyncedCcrRef, {
-            tokensSavedEst:
-              telemetryInput.tokensSavedEst === undefined
-                ? storeStats.tokensSavedEst
-                : lastSynced.tokensSavedEst,
-            compressedCallsCount:
-              telemetryInput.compressedCallsCount === undefined
-                ? storeStats.compressedCallsCount
-                : lastSynced.compressedCallsCount,
-          });
-        }
 
         const sig = telemetryInput.failureSignature;
         const normalizedSafetyBlocks = Math.floor(
@@ -2115,12 +2176,12 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   const getTelemetrySummary: RsiServiceShape["getTelemetrySummary"] = Effect.fn(
     "RsiService.getTelemetrySummary",
   )(function* (summaryInput) {
-    const { allRows, lastSynced } = yield* mutex.withPermits(1)(
+    const { allRows, lastSyncedByThread } = yield* mutex.withPermits(1)(
       Effect.gen(function* () {
         yield* hydrateLocked();
         return {
           allRows: yield* Ref.get(telemetryRef),
-          lastSynced: yield* Ref.get(lastSyncedCcrRef),
+          lastSyncedByThread: yield* Ref.get(lastSyncedCcrByThreadRef),
         };
       }),
     );
@@ -2189,16 +2250,25 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       byProviderMap.set(row.provider, existing);
     }
 
-    if (summaryInput?.threadId === undefined && summaryInput?.provider === undefined) {
+    if (summaryInput?.threadId !== undefined && summaryInput?.provider === undefined) {
+      const threadStats = ccrStore.getStats(summaryInput.threadId);
+      const delta = computeCcrDelta(threadStats, lastSyncedByThread.get(summaryInput.threadId));
+      totalTokensSavedEst += delta.tokens;
+      totalCompressedCalls += delta.calls;
+    } else if (summaryInput?.threadId === undefined && summaryInput?.provider === undefined) {
       const storeStats = ccrStore.getStats();
-      const baseTokens =
-        storeStats.tokensSavedEst < lastSynced.tokensSavedEst ? 0 : lastSynced.tokensSavedEst;
-      const baseCalls =
-        storeStats.compressedCallsCount < lastSynced.compressedCallsCount
-          ? 0
-          : lastSynced.compressedCallsCount;
-      totalTokensSavedEst += Math.max(0, storeStats.tokensSavedEst - baseTokens);
-      totalCompressedCalls += Math.max(0, storeStats.compressedCallsCount - baseCalls);
+      let totalSyncedTokens = 0;
+      let totalSyncedCalls = 0;
+      for (const baseline of lastSyncedByThread.values()) {
+        totalSyncedTokens += baseline.tokensSavedEst;
+        totalSyncedCalls += baseline.compressedCallsCount;
+      }
+      const delta = computeCcrDelta(storeStats, {
+        tokensSavedEst: totalSyncedTokens,
+        compressedCallsCount: totalSyncedCalls,
+      });
+      totalTokensSavedEst += delta.tokens;
+      totalCompressedCalls += delta.calls;
     }
 
     // usedTokens is the context size of a run's last message, not spend: count each thread's latest run once.

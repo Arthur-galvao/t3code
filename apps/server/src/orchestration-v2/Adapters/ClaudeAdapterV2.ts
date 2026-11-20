@@ -2256,7 +2256,27 @@ const subagentDeviceInstructions: HookCallback = () =>
   });
 
 const CLAUDE_POST_TOOL_USE_MIN_CHARS = 3_000;
+const CLAUDE_CODE_READ_MIN_CHARS = 6_000;
+const CLAUDE_PYTHON_REPL_MIN_CHARS = 6_000;
 const CLAUDE_CCR_MARKER = "[T3 CCR:";
+const CLAUDE_RANGED_READ_KEYS = [
+  "offset",
+  "limit",
+  "start_line",
+  "end_line",
+  "StartLine",
+  "EndLine",
+  "line",
+  "lines",
+] as const;
+const CLAUDE_COMMAND_TOOL_NAMES = new Set([
+  "bash",
+  "powershell",
+  "pwsh",
+  "shell",
+  "run_command",
+  "terminal",
+]);
 
 function isContextRetrieveTool(toolName: string): boolean {
   return (
@@ -2264,6 +2284,54 @@ function isContextRetrieveTool(toolName: string): boolean {
     toolName === "mcp__t3-code__context_retrieve" ||
     toolName.endsWith("__context_retrieve")
   );
+}
+
+function isFileReadTool(toolName: string): boolean {
+  const lower = toolName.toLowerCase();
+  return lower === "read" || lower === "read_file" || lower.endsWith("__read_file");
+}
+
+function isRangedFileRead(toolName: string, toolInput: unknown): boolean {
+  if (!isFileReadTool(toolName)) {
+    return false;
+  }
+  if (typeof toolInput !== "object" || toolInput === null || Array.isArray(toolInput)) {
+    return false;
+  }
+  return CLAUDE_RANGED_READ_KEYS.some((key) => Reflect.get(toolInput, key) != null);
+}
+
+function isCommandTool(toolName: string): boolean {
+  const lower = toolName.toLowerCase();
+  return (
+    CLAUDE_COMMAND_TOOL_NAMES.has(lower) ||
+    (lower.startsWith("mcp__") && lower.endsWith("__run_command"))
+  );
+}
+
+function isPythonReplTool(toolName: string): boolean {
+  const lower = toolName.toLowerCase();
+  return lower === "python" || lower === "mcp__t3-code__python" || lower.endsWith("__python");
+}
+
+function resolveClaudePostToolUseMinChars(toolName: string, toolInput: unknown): number {
+  if (isPythonReplTool(toolName)) {
+    return CLAUDE_PYTHON_REPL_MIN_CHARS;
+  }
+  if (isFileReadTool(toolName)) {
+    const filePath = extractPathFromToolInput(toolInput);
+    const lowerPath = filePath?.trim().toLowerCase().split(/[?#]/)[0] ?? "";
+    if (
+      lowerPath.endsWith(".json") ||
+      lowerPath.endsWith(".jsonl") ||
+      lowerPath.endsWith(".ndjson") ||
+      lowerPath.endsWith(".log")
+    ) {
+      return CLAUDE_POST_TOOL_USE_MIN_CHARS;
+    }
+    return CLAUDE_CODE_READ_MIN_CHARS;
+  }
+  return CLAUDE_POST_TOOL_USE_MIN_CHARS;
 }
 
 function extractPathFromToolInput(toolInput: unknown): string | undefined {
@@ -2281,12 +2349,15 @@ function extractPathFromToolInput(toolInput: unknown): string | undefined {
 
 function extractCommandFromToolInput(toolName: string, toolInput: unknown): string | undefined {
   if (
-    toolName.toLowerCase() === "bash" &&
-    typeof toolInput === "object" &&
-    toolInput !== null &&
-    !Array.isArray(toolInput)
+    !isCommandTool(toolName) ||
+    typeof toolInput !== "object" ||
+    toolInput === null ||
+    Array.isArray(toolInput)
   ) {
-    const command = Reflect.get(toolInput, "command");
+    return undefined;
+  }
+  for (const key of ["command", "cmd", "CommandLine"] as const) {
+    const command = Reflect.get(toolInput, key);
     if (typeof command === "string" && command.trim().length > 0) {
       return command.trim();
     }
@@ -2348,15 +2419,12 @@ function evaluateClaudePostToolUseCompression(input: {
     return {};
   }
   const toolName = input.hookInput.tool_name;
-  if (isContextRetrieveTool(toolName)) {
+  if (isContextRetrieveTool(toolName) || isRangedFileRead(toolName, input.hookInput.tool_input)) {
     return {};
   }
   const text = extractClaudePostToolUseText(input.hookInput.tool_response);
-  if (
-    text === null ||
-    text.length <= CLAUDE_POST_TOOL_USE_MIN_CHARS ||
-    text.includes(CLAUDE_CCR_MARKER)
-  ) {
+  const minChars = resolveClaudePostToolUseMinChars(toolName, input.hookInput.tool_input);
+  if (text === null || text.length <= minChars || text.includes(CLAUDE_CCR_MARKER)) {
     return {};
   }
   const command = extractCommandFromToolInput(toolName, input.hookInput.tool_input);
@@ -2367,7 +2435,7 @@ function evaluateClaudePostToolUseCompression(input: {
     sourceLabel: toolName,
     ...(command === undefined ? {} : { command }),
     path: extractPathFromToolInput(input.hookInput.tool_input),
-    minChars: CLAUDE_POST_TOOL_USE_MIN_CHARS,
+    minChars,
     store: input.store ?? defaultCcrStore,
   });
   if (!result.compressed) {

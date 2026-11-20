@@ -981,6 +981,169 @@ describe("CursorAdapterV2", () => {
     ),
   );
 
+  it.effect(
+    "sends <runtime_info> once per native session and re-sends only on model switch, compaction, or new session",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "cursor-v2-runtime-info-",
+        });
+        const sentMessages: Array<string> = [];
+        let createdAgents = 0;
+        const instanceId = ProviderInstanceId.make("cursor");
+        const threadId = ThreadId.make("cursor-runtime-info-thread");
+        const initialModel = { instanceId, model: "composer-2.5" };
+        const switchedModel = { instanceId, model: "composer-3" };
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const adapter = yield* makeCursorAdapterV2({
+          instanceId,
+          environment: { HOME: workspace },
+        }).pipe(
+          Effect.provideService(CursorAgentSdk.CursorAgentSdkRunner, {
+            assertComplete: Effect.void,
+            open: (openInput) => {
+              const agentId = openInput.agentId ?? `native-cursor-runtime-${++createdAgents}`;
+              return Effect.succeed({
+                agentId,
+                listMessages: Effect.succeed([]),
+                close: Effect.void,
+                send: (input) =>
+                  Effect.sync(() => {
+                    sentMessages.push(
+                      typeof input.message === "string" ? input.message : input.message.text,
+                    );
+                    const runId = `native-cursor-runtime-run-${sentMessages.length}`;
+                    return {
+                      agentId,
+                      runId,
+                      wait: Effect.succeed({
+                        id: runId,
+                        requestId: `native-runtime-req-${sentMessages.length}`,
+                        status: "finished" as const,
+                        model: { id: "composer-2.5" },
+                        durationMs: 1,
+                      }),
+                      cancel: Effect.void,
+                    };
+                  }),
+              });
+            },
+          }),
+          Effect.provide(TestProviderHost.layer({ cwd: workspace })),
+        );
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("cursor-runtime-info-session"),
+          modelSelection: initialModel,
+          runtimePolicy,
+        });
+        let providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection: initialModel,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        const appThread = {
+          id: threadId,
+          projectId: ProjectId.make("cursor-runtime-info-project"),
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+          title: "Cursor runtime info",
+          providerInstanceId: instanceId,
+          modelSelection: initialModel,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId: providerThread.id,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+        };
+        let runOrdinal = 0;
+        const sendTurn = Effect.fnUntraced(function* (
+          modelSelection: typeof initialModel,
+          text = "Check runtime info.",
+        ) {
+          runOrdinal += 1;
+          yield* runtime.startTurn({
+            threadId,
+            providerThread,
+            modelSelection,
+            runtimePolicy,
+            runId: RunId.make(`cursor-runtime-run-${runOrdinal}`),
+            runOrdinal,
+            providerTurnOrdinal: runOrdinal,
+            attemptId: RunAttemptId.make(`cursor-runtime-attempt-${runOrdinal}`),
+            rootNodeId: NodeId.make(`cursor-runtime-root-${runOrdinal}`),
+            appThread,
+            message: {
+              messageId: MessageId.make(`cursor-runtime-message-${runOrdinal}`),
+              createdBy: "user" as const,
+              creationSource: "web" as const,
+              text,
+              attachments: [],
+            },
+          });
+          yield* runtime.events.pipe(
+            Stream.takeUntil((event) => event.type === "turn.terminal"),
+            Stream.runCollect,
+          );
+          return sentMessages.at(-1)!;
+        });
+
+        const turn1 = yield* sendTurn(initialModel);
+        assert.include(turn1, "<runtime_info>");
+        assert.include(turn1, "composer-2.5");
+
+        const turn2 = yield* sendTurn(initialModel);
+        assert.notInclude(turn2, "<runtime_info>");
+
+        const turn3 = yield* sendTurn(switchedModel);
+        assert.include(turn3, "<runtime_info>");
+        assert.include(turn3, "composer-3");
+
+        const turn4 = yield* sendTurn(switchedModel);
+        assert.notInclude(turn4, "<runtime_info>");
+
+        const compactMsg = yield* sendTurn(switchedModel, "/compress");
+        assert.strictEqual(compactMsg, "/compress");
+
+        const turn5AfterCompact = yield* sendTurn(switchedModel);
+        assert.include(turn5AfterCompact, "<runtime_info>");
+
+        const rolledBack = yield* runtime.rollbackThread({
+          providerThread,
+          target: {
+            type: "thread_start",
+            checkpointId: CheckpointId.make("cursor-runtime-checkpoint"),
+            appRunOrdinal: 0,
+          },
+          providerThreadTurns: [],
+        });
+        providerThread = rolledBack.providerThread;
+
+        const turn6NewSession = yield* sendTurn(switchedModel);
+        assert.include(turn6NewSession, "<runtime_info>");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+        ),
+      ),
+  );
+
   it.effect("carries a dropped prompt forward, and resumes a checkpointed one natively", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

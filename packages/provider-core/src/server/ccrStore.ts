@@ -13,6 +13,7 @@ export interface CcrEntry {
   readonly byteCount: number;
   readonly totalLines: number;
   readonly createdAtMs?: number | undefined;
+  readonly redacted?: boolean | undefined;
 }
 
 export interface CcrPutInput {
@@ -45,6 +46,7 @@ export interface CcrRetrieveResult {
   readonly startLine?: number | undefined;
   readonly endLine?: number | undefined;
   readonly truncated: boolean;
+  readonly redacted?: boolean | undefined;
   readonly content: string;
 }
 
@@ -52,6 +54,7 @@ export interface CcrStats {
   readonly entriesCount: number;
   readonly currentBytes: number;
   readonly compressedCallsCount: number;
+  readonly retrieveCallsCount: number;
   readonly totalOriginalChars: number;
   readonly totalCompressedChars: number;
   readonly totalSavedChars: number;
@@ -66,6 +69,7 @@ export interface CcrStorePersistenceOptions {
 export interface CcrStoreOptions {
   readonly maxEntries?: number | undefined;
   readonly maxBytes?: number | undefined;
+  readonly maxEntryBytes?: number | undefined;
   readonly maxEntriesPerThread?: number | undefined;
   readonly ttlMs?: number | undefined;
   readonly persistPath?: string | undefined;
@@ -73,10 +77,13 @@ export interface CcrStoreOptions {
   readonly now?: (() => number) | undefined;
 }
 
+export type CreateCcrStoreOptions = CcrStoreOptions;
+
 export interface CcrStore {
   readonly put: (input: CcrPutInput) => CcrEntry;
   readonly get: (ccrId: string, threadId?: string) => CcrEntry | undefined;
   readonly retrieve: (input: CcrRetrieveInput) => CcrRetrieveResult;
+  readonly purgeThread: (threadId: string) => number;
   readonly recordCompression: (
     originalChars: number,
     compressedChars: number,
@@ -94,15 +101,110 @@ export interface CcrStore {
 
 const DEFAULT_MAX_ENTRIES = 200;
 const DEFAULT_MAX_BYTES = 20_000_000;
+const DEFAULT_MAX_ENTRY_BYTES = 2_000_000;
 const DEFAULT_MAX_ENTRIES_PER_THREAD = 100;
 const MAX_CONTEXT_LINES = 20;
+const MAX_QUERY_REGEX_LENGTH = 200;
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_PERSIST_DEBOUNCE_MS = 250;
 const DEFAULT_RETRIEVE_MAX_CHARS = 12_000;
 const GLOBAL_THREAD_ID = "__global__";
+const ENTRY_BYTE_CAP_SUFFIX = "\n[... truncated to CCR entry byte cap ...]";
+
+const PLACEHOLDER_SECRET_VALUE_RE = /^(?:\[?REDACTED|example|dummy|changeme|your_|xxxx|<|\$\{)/i;
+
+export interface RedactCcrSecretsResult {
+  readonly text: string;
+  readonly redacted: boolean;
+}
+
+const JWT_SECRET_VALUE_RE = /^eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
+const CODE_EXPRESSION_VALUE_RE =
+  /[(){}[\]]|=>|^(?:process\.env\.|import\.meta\.|env\.|this\.|config\.|options\.|input\.|props\.|state\.|args\.)/;
+const DOTTED_IDENTIFIER_VALUE_RE = /^[a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z_$][a-zA-Z0-9_$]*)+$/;
+
+function isCodeExpressionOrPlaceholder(value: string): boolean {
+  if (PLACEHOLDER_SECRET_VALUE_RE.test(value)) {
+    return true;
+  }
+  if (JWT_SECRET_VALUE_RE.test(value)) {
+    return false;
+  }
+  if (CODE_EXPRESSION_VALUE_RE.test(value)) {
+    return true;
+  }
+  if (DOTTED_IDENTIFIER_VALUE_RE.test(value) && value.length < 64) {
+    return true;
+  }
+  return false;
+}
+
+export function redactCcrSecrets(text: string): RedactCcrSecretsResult {
+  const pemPrivateKeyRe =
+    /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
+  const authHeaderRe = /\b(Authorization\s*:\s*(?:Bearer|Basic)\s+)[^\s"'`]{12,}/gi;
+  const knownTokenRe =
+    /\b(?:sk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{24,}|(?:pk|sk)_live_[A-Za-z0-9]{20,})\b/g;
+  // Quoted literal values (JSON, YAML, JS/TS string literals, quoted .env assignments).
+  const quotedSecretAssignmentRe =
+    /((?:^|[\s{,&;([])["']?(?:[A-Za-z0-9_]*(?:secret|password|passwd|api_key|apikey|access_token|auth_token|private_key|client_secret|refresh_token)|auth_token|ct0|password)["']?\s*[:=]\s*)(["'])([^"'\r\n]{8,})(\2)/gi;
+  // Unquoted .env / printenv / query-string literal assignments (never match code expressions).
+  const envLiteralAssignmentRe =
+    /((?:^|(?:[&;\r\n][ \t]*))(?:export\s+)?(?:[A-Za-z0-9_]*(?:secret|password|passwd|api_key|apikey|access_token|auth_token|private_key|client_secret|refresh_token)|auth_token|ct0|password)\s*=\s*)([^\s"'&;,\r\n]{8,})/gim;
+
+  let next = text.replace(pemPrivateKeyRe, "[REDACTED_PRIVATE_KEY]");
+  next = next.replace(authHeaderRe, "$1[REDACTED]");
+  next = next.replace(knownTokenRe, "[REDACTED_TOKEN]");
+  next = next.replace(
+    quotedSecretAssignmentRe,
+    (fullMatch: string, prefix: string, quote: string, value: string) => {
+      if (PLACEHOLDER_SECRET_VALUE_RE.test(value)) {
+        return fullMatch;
+      }
+      return `${prefix}${quote}[REDACTED]${quote}`;
+    },
+  );
+  next = next.replace(
+    envLiteralAssignmentRe,
+    (fullMatch: string, prefix: string, value: string) => {
+      if (isCodeExpressionOrPlaceholder(value)) {
+        return fullMatch;
+      }
+      return `${prefix}[REDACTED]`;
+    },
+  );
+
+  return {
+    text: next,
+    redacted: next !== text,
+  };
+}
+
+function sliceUtf8Safe(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const buf = Buffer.from(text, "utf8");
+  let end = Math.min(buf.length, maxBytes);
+  while (end > 0 && ((buf[end] ?? 0) & 0b1100_0000) === 0b1000_0000) {
+    end -= 1;
+  }
+  return buf.subarray(0, end).toString("utf8");
+}
+
+function capEntryContentBytes(text: string, maxEntryBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxEntryBytes) {
+    return text;
+  }
+  const suffixBytes = Buffer.byteLength(ENTRY_BYTE_CAP_SUFFIX, "utf8");
+  if (maxEntryBytes > suffixBytes) {
+    return `${sliceUtf8Safe(text, maxEntryBytes - suffixBytes)}${ENTRY_BYTE_CAP_SUFFIX}`;
+  }
+  return sliceUtf8Safe(text, maxEntryBytes);
+}
 
 interface CompressionCounters {
   compressedCallsCount: number;
+  retrieveCallsCount: number;
   totalOriginalChars: number;
   totalCompressedChars: number;
   totalSavedChars: number;
@@ -119,6 +221,7 @@ interface PersistedCcrSnapshot {
 function createEmptyCounters(): CompressionCounters {
   return {
     compressedCallsCount: 0,
+    retrieveCallsCount: 0,
     totalOriginalChars: 0,
     totalCompressedChars: 0,
     totalSavedChars: 0,
@@ -142,11 +245,27 @@ function splitLines(content: string): ReadonlyArray<string> {
   return content.split(/\r?\n/);
 }
 
+function isSafeRegexPattern(pattern: string): boolean {
+  if (pattern.length > MAX_QUERY_REGEX_LENGTH) return false;
+  if (/\([^)]*[+*][^)]*\)[+*{]/.test(pattern)) return false;
+  if (/([+*?}]|\{\d+,?\d*\})\s*\)[^)]*[+*?{]/.test(pattern)) return false;
+  if (/\([^()]*\([^()]*[+*][^()]*\)[^()]*\)[+*{]/.test(pattern)) return false;
+  return true;
+}
+
+function buildLiteralMatcher(query: string): (line: string) => boolean {
+  const needle = query.toLowerCase();
+  return (line) => line.toLowerCase().includes(needle);
+}
+
 function buildLineMatcher(query: string): (line: string) => boolean {
   const trimmed = query.trim();
   if (trimmed.startsWith("/") && trimmed.lastIndexOf("/") > 0) {
     const lastSlash = trimmed.lastIndexOf("/");
     const pattern = trimmed.slice(1, lastSlash);
+    if (!isSafeRegexPattern(pattern)) {
+      return buildLiteralMatcher(query);
+    }
     const rawFlags = trimmed.slice(lastSlash + 1);
     const flags = rawFlags.replaceAll(/[gy]/g, "");
     const caseInsensitiveFlags = flags.includes("i") ? flags : `${flags}i`;
@@ -158,12 +277,15 @@ function buildLineMatcher(query: string): (line: string) => boolean {
     }
   }
 
+  if (!isSafeRegexPattern(query)) {
+    return buildLiteralMatcher(query);
+  }
+
   try {
     const regex = new RegExp(query, "i");
     return (line) => regex.test(line);
   } catch {
-    const needle = query.toLowerCase();
-    return (line) => line.toLowerCase().includes(needle);
+    return buildLiteralMatcher(query);
   }
 }
 
@@ -174,6 +296,7 @@ function sanitizeCounters(raw: unknown): CompressionCounters | undefined {
     typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
   return {
     compressedCallsCount: toNonNegInt(record.compressedCallsCount),
+    retrieveCallsCount: toNonNegInt(record.retrieveCallsCount),
     totalOriginalChars: toNonNegInt(record.totalOriginalChars),
     totalCompressedChars: toNonNegInt(record.totalCompressedChars),
     totalSavedChars: toNonNegInt(record.totalSavedChars),
@@ -183,6 +306,7 @@ function sanitizeCounters(raw: unknown): CompressionCounters | undefined {
 export function createCcrStore(options?: CcrStoreOptions): CcrStore {
   const maxEntries = Math.max(1, options?.maxEntries ?? DEFAULT_MAX_ENTRIES);
   const maxBytes = Math.max(1, options?.maxBytes ?? DEFAULT_MAX_BYTES);
+  const maxEntryBytes = Math.max(1, Math.floor(options?.maxEntryBytes ?? DEFAULT_MAX_ENTRY_BYTES));
   const maxEntriesPerThread = Math.max(
     1,
     options?.maxEntriesPerThread ?? DEFAULT_MAX_ENTRIES_PER_THREAD,
@@ -382,6 +506,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
         byteCount,
         totalLines: lines.length,
         ...(candidate.createdAtMs !== undefined ? { createdAtMs: candidate.createdAtMs } : {}),
+        ...(candidate.redacted === true ? { redacted: true } : {}),
       };
 
       evictOldestForThreadIfNeeded(entryThreadId);
@@ -397,7 +522,11 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
         : 1;
     nextSeq = Math.max(nextSeq, snapshotNextSeq, maxParsedSeq + 1);
 
-    if (globalCompression.compressedCallsCount === 0 && snapshot.globalCompression !== undefined) {
+    if (
+      globalCompression.compressedCallsCount === 0 &&
+      globalCompression.retrieveCallsCount === 0 &&
+      snapshot.globalCompression !== undefined
+    ) {
       const sanitizedGlobal = sanitizeCounters(snapshot.globalCompression);
       if (sanitizedGlobal !== undefined) {
         globalCompression = sanitizedGlobal;
@@ -444,19 +573,22 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
     const ccrId = `ccr_${String(nextSeq).padStart(4, "0")}`;
     nextSeq += 1;
 
-    const lines = splitLines(input.content);
-    const byteCount = Buffer.byteLength(input.content, "utf8");
+    const redaction = redactCcrSecrets(input.content);
+    const storedContent = capEntryContentBytes(redaction.text, maxEntryBytes);
+    const lines = splitLines(storedContent);
+    const byteCount = Buffer.byteLength(storedContent, "utf8");
     const entry: CcrEntry = {
       ccrId,
       threadId,
-      content: input.content,
+      content: storedContent,
       contentType: input.contentType,
       ...(input.sourceLabel !== undefined ? { sourceLabel: input.sourceLabel } : {}),
       ...(input.path !== undefined ? { path: input.path } : {}),
-      charCount: input.content.length,
+      charCount: storedContent.length,
       byteCount,
       totalLines: lines.length,
       createdAtMs: nowMs,
+      ...(redaction.redacted ? { redacted: true } : {}),
     };
 
     evictOldestForThreadIfNeeded(threadId);
@@ -471,8 +603,19 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
   const get = (ccrId: string, threadId?: string): CcrEntry | undefined =>
     findEntry(ccrId, threadId);
 
+  const recordRetrieveCall = (tid: string) => {
+    globalCompression.retrieveCallsCount += 1;
+    const existingThread = threadCompression.get(tid) ?? createEmptyCounters();
+    existingThread.retrieveCallsCount += 1;
+    threadCompression.set(tid, existingThread);
+    schedulePersist();
+  };
+
   const retrieve = (input: CcrRetrieveInput): CcrRetrieveResult => {
     const entry = findEntry(input.ccrId, input.threadId);
+    recordRetrieveCall(
+      entry !== undefined ? normalizeThreadId(entry.threadId) : normalizeThreadId(input.threadId),
+    );
     if (entry === undefined) {
       return {
         found: false,
@@ -499,6 +642,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
         totalLines: 0,
         matchedLines: 0,
         truncated: false,
+        ...(entry.redacted === true ? { redacted: true } : {}),
         content: "",
       };
     }
@@ -519,6 +663,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
         totalLines,
         matchedLines: 0,
         truncated: false,
+        ...(entry.redacted === true ? { redacted: true } : {}),
         content: "",
       };
     }
@@ -552,6 +697,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
         totalLines,
         matchedLines: 0,
         truncated: false,
+        ...(entry.redacted === true ? { redacted: true } : {}),
         content: "",
       };
     }
@@ -631,6 +777,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
       ...(firstIncludedLine !== undefined ? { startLine: firstIncludedLine } : {}),
       ...(lastIncludedLine !== undefined ? { endLine: lastIncludedLine } : {}),
       truncated,
+      ...(entry.redacted === true ? { redacted: true } : {}),
       content: outputLines.join("\n"),
     };
   };
@@ -656,6 +803,21 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
     schedulePersist();
   };
 
+  const purgeThread = (threadId: string): number => {
+    const tid = normalizeThreadId(threadId);
+    let removedCount = 0;
+    for (const [ccrId, entry] of entries) {
+      if (normalizeThreadId(entry.threadId) === tid) {
+        deleteEntry(ccrId);
+        removedCount += 1;
+      }
+    }
+    if (removedCount > 0) {
+      schedulePersist();
+    }
+    return removedCount;
+  };
+
   const getStats = (threadId?: string): CcrStats => {
     pruneExpired(now());
     if (threadId === undefined) {
@@ -663,6 +825,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
         entriesCount: entries.size,
         currentBytes,
         compressedCallsCount: globalCompression.compressedCallsCount,
+        retrieveCallsCount: globalCompression.retrieveCallsCount,
         totalOriginalChars: globalCompression.totalOriginalChars,
         totalCompressedChars: globalCompression.totalCompressedChars,
         totalSavedChars: globalCompression.totalSavedChars,
@@ -684,6 +847,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
       entriesCount: threadEntriesCount,
       currentBytes: threadBytes,
       compressedCallsCount: counters.compressedCallsCount,
+      retrieveCallsCount: counters.retrieveCallsCount,
       totalOriginalChars: counters.totalOriginalChars,
       totalCompressedChars: counters.totalCompressedChars,
       totalSavedChars: counters.totalSavedChars,
@@ -710,6 +874,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
     put,
     get,
     retrieve,
+    purgeThread,
     recordCompression,
     getStats,
     configurePersistence,

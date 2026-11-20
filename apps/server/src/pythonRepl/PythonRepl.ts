@@ -1,4 +1,6 @@
 import type { ThreadId } from "@t3tools/contracts";
+import { defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
+import { compressToolOutput } from "@t3tools/provider-core/server/contextCompressor";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveCommandPath } from "@t3tools/shared/shell";
@@ -72,6 +74,59 @@ const clip = (text: string, max: number) =>
   text.length <= max
     ? text
     : `${text.slice(0, max / 2)}\n[... ${text.length - max} characters omitted ...]\n${text.slice(-max / 2)}`;
+
+const formatReplCcrFooter = (ccrId: string, originalLen: number, finalLen: number): string => {
+  const tokensSavedEst = Math.max(0, Math.round((originalLen - finalLen) / 4));
+  return `[T3 CCR:${ccrId} (text): ${originalLen} -> ${finalLen} chars (~${tokensSavedEst} tok saved) | call context_retrieve(ccrId="${ccrId}") for exact lines/search]`;
+};
+
+const stripTrailingCcrFooter = (text: string): string =>
+  text.replace(/\n\n\[T3 CCR:ccr_\d+[^\n]*\]$/, "");
+
+const buildClippedCcrText = (bodySource: string, originalLen: number, ccrId: string): string => {
+  const clippedBody = clip(bodySource, MAX_OUTPUT_CHARS - 240);
+  let finalLen = clippedBody.length + 2 + 160;
+  let finalText = `${clippedBody}\n\n${formatReplCcrFooter(ccrId, originalLen, finalLen)}`;
+  for (let i = 0; i < 3 && finalText.length !== finalLen; i += 1) {
+    finalLen = finalText.length;
+    finalText = `${clippedBody}\n\n${formatReplCcrFooter(ccrId, originalLen, finalLen)}`;
+  }
+  return finalText;
+};
+
+const shapeReplText = (text: string, threadId: ThreadId, sourceLabel: string): string => {
+  if (text.length <= MAX_OUTPUT_CHARS) {
+    return text;
+  }
+  const compressed = compressToolOutput({
+    text,
+    threadId,
+    sourceLabel,
+    minChars: MAX_OUTPUT_CHARS,
+    store: defaultCcrStore,
+  });
+  if (compressed.compressed) {
+    if (compressed.text.length <= MAX_OUTPUT_CHARS) {
+      return compressed.text;
+    }
+    if (compressed.ccrId !== undefined) {
+      return buildClippedCcrText(
+        stripTrailingCcrFooter(compressed.text),
+        text.length,
+        compressed.ccrId,
+      );
+    }
+  }
+  const entry = defaultCcrStore.put({
+    content: text,
+    contentType: "text",
+    threadId,
+    sourceLabel,
+  });
+  const finalText = buildClippedCcrText(text, text.length, entry.ccrId);
+  defaultCcrStore.recordCompression(text.length, finalText.length, threadId);
+  return finalText;
+};
 
 interface Session {
   readonly cwd: string;
@@ -222,8 +277,10 @@ const make = Effect.gen(function* () {
           };
         }
         return {
-          output: clip(reply.value.output, MAX_OUTPUT_CHARS),
-          ...(reply.value.error === "" ? {} : { error: clip(reply.value.error, MAX_OUTPUT_CHARS) }),
+          output: shapeReplText(reply.value.output, input.threadId, "python:stdout"),
+          ...(reply.value.error === ""
+            ? {}
+            : { error: shapeReplText(reply.value.error, input.threadId, "python:stderr") }),
           ...(note === undefined ? {} : { note }),
         };
       }),

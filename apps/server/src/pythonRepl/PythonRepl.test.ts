@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ThreadId } from "@t3tools/contracts";
+import { defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -29,5 +30,49 @@ it.live("keeps variables, reports tracebacks, and restarts on reset or timeout",
 
     yield* run("y = 1");
     expect((yield* run("y", { reset: true })).error).toContain("NameError");
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.live("stores oversized output in thread-scoped CCR instead of lossy clipping", () =>
+  Effect.gen(function* () {
+    const repl = yield* PythonRepl.PythonRepl;
+    const ccrThreadId = ThreadId.make("thread-python-repl-ccr");
+    const result = yield* repl.run({
+      threadId: ccrThreadId,
+      cwd,
+      code: "for i in range(600): print(f'line-{i:04d}-' + ('x' * 50))",
+    });
+
+    expect(result.output).toContain("[T3 CCR:");
+    const match = /\[T3 CCR:(ccr_\d+)/.exec(result.output);
+    expect(match).not.toBeNull();
+    const ccrId = match![1]!;
+
+    const retrieved = defaultCcrStore.retrieve({
+      ccrId,
+      threadId: ccrThreadId,
+      startLine: 1,
+      endLine: 601,
+      maxChars: 100_000,
+    });
+    expect(retrieved.found).toBe(true);
+    expect(retrieved.threadId).toBe(ccrThreadId);
+    expect(retrieved.content).toContain("L1: line-0000-");
+    expect(retrieved.content).toContain("L300: line-0299-");
+    expect(retrieved.content).toContain("L600: line-0599-");
+    expect(defaultCcrStore.getStats(ccrThreadId).entriesCount).toBe(1);
+    expect(defaultCcrStore.getStats(ccrThreadId).compressedCallsCount).toBe(1);
+
+    // Output that compresses (>15% reduction) yet still exceeds MAX_OUTPUT_CHARS must not double-put or double-count.
+    const partialThreadId = ThreadId.make("thread-python-repl-ccr-partial");
+    const partialResult = yield* repl.run({
+      threadId: partialThreadId,
+      cwd,
+      code: "for i in range(450): print(f'ERROR item-{i:04d} ' + ('z' * 80))\nfor j in range(400): print('INFO noise line')",
+    });
+    expect(partialResult.output.length).toBeLessThanOrEqual(30_000);
+    expect(partialResult.output).toContain("[T3 CCR:");
+    expect(defaultCcrStore.getStats(partialThreadId).entriesCount).toBe(1);
+    expect(defaultCcrStore.getStats(partialThreadId).compressedCallsCount).toBe(1);
   }).pipe(Effect.provide(TestLayer)),
 );

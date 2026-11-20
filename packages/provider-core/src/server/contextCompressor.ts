@@ -149,15 +149,83 @@ function looksLikeLogs(sample: string): boolean {
   return logSignals >= 3;
 }
 
+const LINE_NUMBER_PREFIX_RE = /^\s*\d+(?:→|:\s|\t|\|\s?)/;
+const DATA_URI_BASE64_RE = /data:([a-zA-Z0-9.+/-]+);base64,([A-Za-z0-9+/=]{200,})/g;
+
+export function stripLineNumberPrefix(line: string): string {
+  return line.replace(LINE_NUMBER_PREFIX_RE, "");
+}
+
+export function normalizeTerminalText(text: string): string {
+  const lf = text.replaceAll("\r\n", "\n");
+  if (!lf.includes("\r")) {
+    return lf;
+  }
+  return lf
+    .split("\n")
+    .map((line) => {
+      if (!line.includes("\r")) return line;
+      const frames = line.split("\r");
+      for (let i = frames.length - 1; i >= 0; i -= 1) {
+        const frame = frames[i];
+        if (frame !== undefined && frame.length > 0) {
+          return frame;
+        }
+      }
+      return "";
+    })
+    .join("\n");
+}
+
+function isMinifiedOrBlobLine(line: string): boolean {
+  if (line.length <= 1_200) return false;
+  let whitespaceCount = 0;
+  let currentRun = 0;
+  let maxRun = 0;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line.charCodeAt(i);
+    const isWs = ch === 32 || ch === 9 || ch === 11 || ch === 12;
+    if (isWs) {
+      whitespaceCount += 1;
+      if (currentRun > maxRun) maxRun = currentRun;
+      currentRun = 0;
+    } else {
+      currentRun += 1;
+    }
+  }
+  if (currentRun > maxRun) maxRun = currentRun;
+  return whitespaceCount / line.length <= 0.12 || maxRun >= 160;
+}
+
+export function collapseBlobLines(text: string): string {
+  const collapsedDataUris = text.replace(
+    DATA_URI_BASE64_RE,
+    (_match, mime: string, payload: string) =>
+      `data:${mime};base64,[... ${payload.length} chars omitted ...]`,
+  );
+  const lines = collapsedDataUris.split("\n");
+  let changed = collapsedDataUris !== text;
+  const out = lines.map((line) => {
+    if (!isMinifiedOrBlobLine(line)) {
+      return line;
+    }
+    changed = true;
+    const omitted = line.length - 240;
+    return `${line.slice(0, 160)} [... ${omitted} chars omitted ...] ${line.slice(-80)}`;
+  });
+  return changed ? out.join("\n") : text;
+}
+
 function looksLikeCode(sample: string): boolean {
   const lines = sample.split(/\r?\n/).slice(0, 60);
   let codeSignals = 0;
   for (const line of lines) {
+    const normalized = stripLineNumberPrefix(line);
     if (
       /^\s*(?:import\s+|export\s+|function\s+|async\s+function\s+|class\s+|interface\s+|type\s+\w+|const\s+\w+|let\s+\w+|def\s+|async\s+def\s+|pub\s+fn\s+|fn\s+|package\s+)/.test(
-        line,
+        normalized,
       ) ||
-      /\bEffect\.fn\b/.test(line)
+      /\bEffect\.fn\b/.test(normalized)
     ) {
       codeSignals += 1;
     }
@@ -240,6 +308,12 @@ export function detectContentType(
       BUILD_INSTALL_CMD_RE.test(commandHint))
   ) {
     return "logs";
+  }
+  if (
+    commandHint !== undefined &&
+    (SEARCH_CMD_RE.test(commandHint) || DIR_LIST_CMD_RE.test(commandHint))
+  ) {
+    return "text";
   }
 
   if (looksLikeCode(sample)) {
@@ -435,9 +509,10 @@ function compressJson(text: string): string {
 }
 
 function compressLogs(text: string): string {
-  const lines = text.split("\n");
+  const prepared = collapseBlobLines(normalizeTerminalText(text));
+  const lines = prepared.split("\n");
   const len = lines.length;
-  if (len <= 12) return text;
+  if (len <= 12) return prepared;
 
   const criticalProtected = new Uint8Array(len);
   for (let i = 0; i < len; i += 1) {
@@ -545,6 +620,49 @@ function extractDiffSectionPath(sectionLines: ReadonlyArray<string>): string {
   return "unknown";
 }
 
+const DIFF_OVERSIZED_TOTAL_CHARS = 10_000;
+const DIFF_OVERSIZED_SECTION_LINES = 140;
+const DIFF_HEAD_LINES = 45;
+const DIFF_TAIL_LINES = 20;
+
+function computeDiffStats(section: ReadonlyArray<string>): {
+  readonly headerLines: Array<string>;
+  readonly added: number;
+  readonly removed: number;
+} {
+  const headerLines: Array<string> = [];
+  let added = 0;
+  let removed = 0;
+  let inHunk = false;
+  for (const line of section) {
+    if (!inHunk && (line.startsWith("@@") || line.startsWith("+") || line.startsWith("-"))) {
+      if (line.startsWith("+++ ") || line.startsWith("--- ")) {
+        headerLines.push(line);
+        continue;
+      }
+      inHunk = true;
+    }
+    if (!inHunk) {
+      headerLines.push(line);
+      continue;
+    }
+    if (line.startsWith("+") && !line.startsWith("+++")) added += 1;
+    else if (line.startsWith("-") && !line.startsWith("---")) removed += 1;
+  }
+  return { headerLines, added, removed };
+}
+
+function isDiffHeaderOrHunkLine(line: string): boolean {
+  return (
+    line.startsWith("diff --git ") ||
+    line.startsWith("index ") ||
+    line.startsWith("--- ") ||
+    line.startsWith("+++ ") ||
+    line.startsWith("@@ ") ||
+    line === "@@"
+  );
+}
+
 function compressDiff(text: string): string {
   const lines = text.split("\n");
   const sections: Array<Array<string>> = [];
@@ -562,32 +680,38 @@ function compressDiff(text: string): string {
     sections.push(current);
   }
 
+  const isOversizedDiff = text.length > DIFF_OVERSIZED_TOTAL_CHARS;
   const outSections: Array<string> = [];
   for (const section of sections) {
     const filePath = extractDiffSectionPath(section);
     const sectionTextLength = section.reduce((sum, l) => sum + l.length + 1, 0);
     if (isGeneratedOrLockfilePath(filePath) && (section.length > 15 || sectionTextLength > 500)) {
-      const headerLines: Array<string> = [];
-      let added = 0;
-      let removed = 0;
-      let inHunk = false;
-      for (const line of section) {
-        if (!inHunk && (line.startsWith("@@") || line.startsWith("+") || line.startsWith("-"))) {
-          if (line.startsWith("+++ ") || line.startsWith("--- ")) {
-            headerLines.push(line);
-            continue;
-          }
-          inHunk = true;
-        }
-        if (!inHunk) {
-          headerLines.push(line);
-          continue;
-        }
-        if (line.startsWith("+") && !line.startsWith("+++")) added += 1;
-        else if (line.startsWith("-") && !line.startsWith("---")) removed += 1;
-      }
+      const { headerLines, added, removed } = computeDiffStats(section);
       outSections.push(
         `${headerLines.join("\n")}\n[... generated/lockfile diff omitted for ${filePath}: +${added} -${removed} lines (${section.length} total lines) ...]`,
+      );
+    } else if (
+      (isOversizedDiff || section.length > DIFF_OVERSIZED_SECTION_LINES) &&
+      section.length > DIFF_HEAD_LINES + DIFF_TAIL_LINES
+    ) {
+      const { added, removed } = computeDiffStats(section);
+      const keep = new Uint8Array(section.length);
+      for (let i = 0; i < Math.min(DIFF_HEAD_LINES, section.length); i += 1) keep[i] = 1;
+      for (let i = Math.max(0, section.length - DIFF_TAIL_LINES); i < section.length; i += 1) {
+        keep[i] = 1;
+      }
+      for (let i = 0; i < section.length; i += 1) {
+        if (isDiffHeaderOrHunkLine(section[i] ?? "")) {
+          keep[i] = 1;
+        }
+      }
+      outSections.push(
+        collapseKeptLines(
+          section,
+          keep,
+          (omitted) =>
+            `[... ${omitted} diff lines omitted for ${filePath} (+${added} -${removed}) ...]`,
+        ),
       );
     } else {
       outSections.push(section.join("\n"));
@@ -620,15 +744,28 @@ function isTopLevelOrExportedDeclaration(line: string): boolean {
 function compressCode(text: string): string {
   const lines = text.split("\n");
   const len = lines.length;
-  if (len <= 30) return text;
+  if (len <= 30) {
+    let changed = false;
+    const processed = lines.map((line) => {
+      const isDecl = isTopLevelOrExportedDeclaration(stripLineNumberPrefix(line));
+      if (len > 3 && isDecl) {
+        return line;
+      }
+      const collapsed = collapseBlobLines(line);
+      if (collapsed !== line) changed = true;
+      return collapsed;
+    });
+    return changed ? processed.join("\n") : text;
+  }
 
   const keep = new Uint8Array(len);
   let inMultiLineImport = false;
   let inSignature = false;
 
   for (let i = 0; i < len; i += 1) {
-    const line = lines[i] ?? "";
-    const trimmed = line.trim();
+    const rawLine = lines[i] ?? "";
+    const strippedLine = stripLineNumberPrefix(rawLine);
+    const trimmed = strippedLine.trim();
 
     if (
       i === 0 &&
@@ -654,9 +791,13 @@ function compressCode(text: string): string {
       continue;
     }
 
-    if (isTopLevelOrExportedDeclaration(line)) {
+    if (isTopLevelOrExportedDeclaration(strippedLine)) {
       keep[i] = 1;
-      if (/^\s*import\b/.test(line) && !trimmed.includes(" from ") && !trimmed.endsWith(";")) {
+      if (
+        /^\s*import\b/.test(strippedLine) &&
+        !trimmed.includes(" from ") &&
+        !trimmed.endsWith(";")
+      ) {
         inMultiLineImport = true;
       } else if (
         trimmed.includes("(") &&
@@ -679,7 +820,7 @@ function compressCode(text: string): string {
       out.push(`  [... L${gapStart + 1}-L${gapEndInclusive + 1} (${gapLen} lines) omitted ...]`);
     } else {
       for (let j = gapStart; j <= gapEndInclusive; j += 1) {
-        out.push(`L${j + 1}: ${lines[j] ?? ""}`);
+        out.push(`L${j + 1}: ${collapseBlobLines(lines[j] ?? "")}`);
       }
     }
     gapStart = -1;
@@ -699,7 +840,8 @@ function compressCode(text: string): string {
 }
 
 function compressText(text: string): string {
-  const collapsedBlanks = text.replaceAll(/\n{3,}/g, "\n\n");
+  const collapsedBlobs = collapseBlobLines(text.replaceAll("\r\n", "\n"));
+  const collapsedBlanks = collapsedBlobs.replaceAll(/\n{3,}/g, "\n\n");
   const rawParagraphs = collapsedBlanks.split(/\n\n+/);
 
   if (rawParagraphs.length <= 6) {
@@ -784,13 +926,18 @@ function compressText(text: string): string {
 }
 
 const TEST_RUNNER_CMD_RE =
-  /\b(?:vitest|jest|pytest|unittest|cargo\s+test|go\s+test|bun\s+test|vp(?:\.cmd)?\s+test|(?:pnpm|npm|yarn)\s+(?:run\s+)?test)\b/i;
+  /\b(?:vitest|jest|pytest|unittest|playwright|cypress|cargo\s+test|go\s+test|bun\s+test|mvn\s+test|dotnet\s+test|vp(?:\.cmd)?\s+test|(?:pnpm(?:\.cmd)?|npm(?:\.cmd)?|yarn(?:\.cmd)?)\s+(?:run\s+)?test)\b/i;
 const TYPECHECK_LINT_CMD_RE =
-  /\b(?:tsc|tsgo|effect-tsgo|typecheck|eslint|oxlint|biome|ruff|mypy|vp(?:\.cmd)?\s+(?:lint|check)|(?:pnpm|npm|yarn)\s+(?:run\s+)?(?:typecheck|lint|check))\b/i;
+  /\b(?:tsc|tsgo|effect-tsgo|typecheck|eslint|oxlint|oxfmt|biome|ruff|mypy|knip|flake8|pylint|golangci-lint|vp(?:\.cmd)?\s+(?:lint|check|fmt)|(?:pnpm(?:\.cmd)?|npm(?:\.cmd)?|yarn(?:\.cmd)?)\s+(?:run\s+)?(?:typecheck|lint|check))\b/i;
 const GIT_STATUS_CMD_RE = /\bgit\s+status\b/i;
 const GIT_LOG_CMD_RE = /\bgit\s+log\b/i;
+const SEARCH_CMD_RE =
+  /(?:^|(?:&&|\|\||[;|])\s*)(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:cmd(?:\.exe)?\s+\/c|powershell(?:\.exe)?\s+-c(?:ommand)?|pwsh(?:\.exe)?\s+-c(?:ommand)?)\s+)?(?:[^\s"'\\/]+[\\/])*(?:rg|ripgrep|grep|git\s+grep|Select-String|ag|ack)(?:\.exe)?(?:\s|$)/i;
+const DIR_LIST_CMD_RE =
+  /(?:^|(?:&&|\|\||[;|])\s*)(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:cmd(?:\.exe)?\s+\/c|powershell(?:\.exe)?\s+-c(?:ommand)?|pwsh(?:\.exe)?\s+-c(?:ommand)?)\s+)?(?:[^\s"'\\/]+[\\/])*(?:ls|dir|find|tree|git\s+ls-files|Get-ChildItem|fd)(?:\.exe)?(?:\s|$)/i;
 const BUILD_INSTALL_CMD_RE =
-  /\b(?:pnpm|npm|yarn|bun)\s+(?:i|install|add|update|ci|build)\b|\b(?:cargo\s+build|vite\s+build|vp(?:\.cmd)?\s+build)\b/i;
+  /\b(?:pnpm(?:\.cmd)?|npm(?:\.cmd)?|yarn(?:\.cmd)?|bun)\s+(?:i|install|add|update|ci|build)\b|\b(?:cargo\s+build|vite\s+build|vp(?:\.cmd)?\s+build|pip|uv|poetry|docker\s+build|gh\s+(?:run|pr)|make|cmake)\b/i;
+const TEST_EXIT_CODE_LINE_RE = /\bexit(?:ed with)?\s+code\b/i;
 
 const PASSING_TEST_LINE_RE =
   /^\s*(?:✓|✔|PASS\b|PASSED\b|ok\s+\S+|\.\.\.\s+ok\b|test\s+\S+\s+\.\.\.\s+ok)/i;
@@ -869,11 +1016,11 @@ function compressTestRunnerOutput(lines: ReadonlyArray<string>): string {
 
   for (let i = 0; i < len; i += 1) {
     const line = lines[i] ?? "";
-    if (TEST_SUMMARY_LINE_RE.test(line)) {
+    if (TEST_SUMMARY_LINE_RE.test(line) || TEST_EXIT_CODE_LINE_RE.test(line)) {
       keep[i] = 1;
     }
     if (TEST_FAILURE_LINE_RE.test(line) || CRITICAL_LOG_RE.test(line)) {
-      markProtectedWindow(keep, i, 3);
+      markProtectedWindow(keep, i, 5);
     }
   }
 
@@ -970,45 +1117,322 @@ function compressTypecheckLintOutput(lines: ReadonlyArray<string>): string {
     idx = end;
   }
 
-  // Deduplicate identical diagnostic blocks while preserving order.
-  const dedupedBlocks: Array<{ readonly lines: Array<string>; count: number }> = [];
-  const blockIndexBySig = new Map<string, number>();
+  // Group repeated identical diagnostic messages (ignoring leading file:line:col / file(line,col): prefix)
+  // keeping first 5 occurrences so repetitive errors don't hide unique errors.
+  const MAX_OCCURRENCES_PER_DIAG_GROUP = 5;
+  const diagGroups: Array<{ readonly occurrences: Array<ReadonlyArray<string>> }> = [];
+  const groupIndexByKey = new Map<string, number>();
   for (const block of blocks) {
-    const sig = block.join("\n");
-    const existingIdx = blockIndexBySig.get(sig);
+    const key = normalizeDiagnosticKey(block);
+    const existingIdx = groupIndexByKey.get(key);
     if (existingIdx !== undefined) {
-      dedupedBlocks[existingIdx]!.count += 1;
+      diagGroups[existingIdx]!.occurrences.push(block);
     } else {
-      blockIndexBySig.set(sig, dedupedBlocks.length);
-      dedupedBlocks.push({ lines: block, count: 1 });
+      groupIndexByKey.set(key, diagGroups.length);
+      diagGroups.push({ occurrences: [block] });
     }
   }
 
-  const formatBlock = (entry: {
-    readonly lines: ReadonlyArray<string>;
-    readonly count: number;
+  const formatDiagGroup = (group: {
+    readonly occurrences: ReadonlyArray<ReadonlyArray<string>>;
   }) => {
-    if (entry.count === 1) return entry.lines.join("\n");
-    const [head, ...rest] = entry.lines;
-    return [`${head ?? ""} [x${entry.count}]`, ...rest].join("\n");
+    const kept = group.occurrences
+      .slice(0, MAX_OCCURRENCES_PER_DIAG_GROUP)
+      .map((occ) => occ.join("\n"));
+    if (group.occurrences.length > MAX_OCCURRENCES_PER_DIAG_GROUP) {
+      kept.push(`[+${group.occurrences.length - MAX_OCCURRENCES_PER_DIAG_GROUP} more occurrences]`);
+    }
+    return kept.join("\n");
   };
 
   const out: Array<string> = [...compactedPrefix];
-  if (dedupedBlocks.length > 40) {
-    for (const block of dedupedBlocks.slice(0, 30)) {
-      out.push(formatBlock(block));
+  if (diagGroups.length > 40) {
+    for (const group of diagGroups.slice(0, 30)) {
+      out.push(formatDiagGroup(group));
     }
-    out.push(`[... ${dedupedBlocks.length - 35} diagnostics omitted ...]`);
-    for (const block of dedupedBlocks.slice(-5)) {
-      out.push(formatBlock(block));
+    out.push(`[... ${diagGroups.length - 35} diagnostics omitted ...]`);
+    for (const group of diagGroups.slice(-5)) {
+      out.push(formatDiagGroup(group));
     }
   } else {
-    for (const block of dedupedBlocks) {
-      out.push(formatBlock(block));
+    for (const group of diagGroups) {
+      out.push(formatDiagGroup(group));
     }
   }
 
   out.push(...summaryLines);
+  return out.join("\n");
+}
+
+const DIAG_LOCATION_PREFIX_RE =
+  /^(?:(?:[A-Za-z]:)?[^(\r\n]+\(\d+,\d+\):\s*|(?:[A-Za-z]:)?[^:\r\n]+:\d+(?::\d+)?(?:\s*[-:])?\s*)/;
+
+function normalizeDiagnosticKey(block: ReadonlyArray<string>): string {
+  const head = block[0] ?? "";
+  const normalizedHead = head.replace(DIAG_LOCATION_PREFIX_RE, "").trim();
+  const keyHead = normalizedHead !== "" ? normalizedHead : head.trim();
+  return [keyHead, ...block.slice(1)].join("\n");
+}
+
+interface ParsedSearchLine {
+  readonly filePath: string;
+  readonly lineNum?: string | undefined;
+  readonly text: string;
+}
+
+const SEARCH_WITH_LINE_RE = /^((?:[A-Za-z]:)?[^:\r\n]+):(\d+):(.*)$/;
+const SEARCH_NO_LINE_RE = /^((?:[A-Za-z]:)?[^:\s][^:\r\n]*):(.*)$/;
+const SEARCH_TIMESTAMP_PREFIX_RE = /^\d{2}:\d{2}:\d{2}/;
+const SEARCH_DIAG_NOISE_RE = /\berror\s+TS\d+:/i;
+
+function looksLikeSearchFilePath(candidate: string): boolean {
+  const trimmed = candidate.trim();
+  if (trimmed === "" || /^\d+$/.test(trimmed)) return false;
+  if (/^(?:https?|ftp|file|mailto)$/i.test(trimmed)) return false;
+  if (/^(?:error|warn|warning|info|debug|trace|fatal)$/i.test(trimmed)) return false;
+  return trimmed.includes("/") || trimmed.includes("\\") || /\.[A-Za-z0-9]{1,10}$/.test(trimmed);
+}
+
+function parseSearchLine(line: string): ParsedSearchLine | undefined {
+  const trimmed = line.trim();
+  if (trimmed === "" || SEARCH_TIMESTAMP_PREFIX_RE.test(trimmed)) {
+    return undefined;
+  }
+  const withLine = SEARCH_WITH_LINE_RE.exec(line);
+  if (withLine !== null) {
+    const filePath = withLine[1]?.trim() ?? "";
+    const lineNum = withLine[2];
+    const text = withLine[3] ?? "";
+    if (looksLikeSearchFilePath(filePath)) {
+      return {
+        filePath,
+        ...(lineNum !== undefined ? { lineNum } : {}),
+        text,
+      };
+    }
+  }
+  const noLine = SEARCH_NO_LINE_RE.exec(line);
+  if (noLine !== null) {
+    const filePath = noLine[1]?.trim() ?? "";
+    const text = noLine[2] ?? "";
+    if (!text.startsWith("//") && looksLikeSearchFilePath(filePath)) {
+      return {
+        filePath,
+        text,
+      };
+    }
+  }
+  return undefined;
+}
+
+function looksLikeSearchOutput(lines: ReadonlyArray<string>): boolean {
+  const nonEmpty = lines.filter((line) => line.trim() !== "");
+  if (nonEmpty.length < 8) return false;
+  let matchCount = 0;
+  for (const line of nonEmpty.slice(0, 60)) {
+    if (DIAG_HEADER_LINE_RE.test(line) || SEARCH_DIAG_NOISE_RE.test(line)) {
+      continue;
+    }
+    const parsed = parseSearchLine(line);
+    if (parsed !== undefined && parsed.lineNum !== undefined) {
+      matchCount += 1;
+    }
+  }
+  const sampled = Math.min(nonEmpty.length, 60);
+  return matchCount >= 8 && matchCount / sampled >= 0.6;
+}
+
+function compressSearchOutput(lines: ReadonlyArray<string>): string {
+  const MAX_SEARCH_FILES = 40;
+  const MAX_MATCHES_BEFORE_COLLAPSE = 5;
+  const nonEmpty = lines.filter((line) => line.trim() !== "");
+  if (nonEmpty.length <= 12) return lines.join("\n");
+
+  const fileOrder: Array<string> = [];
+  const byFile = new Map<string, Array<ParsedSearchLine>>();
+  const extraLines: Array<string> = [];
+
+  for (const line of nonEmpty) {
+    const parsed = parseSearchLine(line);
+    if (parsed !== undefined) {
+      let bucket = byFile.get(parsed.filePath);
+      if (bucket === undefined) {
+        bucket = [];
+        byFile.set(parsed.filePath, bucket);
+        fileOrder.push(parsed.filePath);
+      }
+      bucket.push(parsed);
+    } else if (
+      CRITICAL_LOG_RE.test(line) ||
+      /\b(?:error|warning|permission denied)\b/i.test(line)
+    ) {
+      extraLines.push(line);
+    }
+  }
+
+  if (fileOrder.length === 0) {
+    return lines.join("\n");
+  }
+
+  const formatMatch = (match: ParsedSearchLine): string =>
+    match.lineNum !== undefined ? `  ${match.lineNum}: ${match.text}` : `  ${match.text}`;
+
+  const out: Array<string> = [];
+  for (const filePath of fileOrder.slice(0, MAX_SEARCH_FILES)) {
+    const matches = byFile.get(filePath)!;
+    out.push(`${filePath} (${matches.length} ${matches.length === 1 ? "match" : "matches"})`);
+    if (matches.length > MAX_MATCHES_BEFORE_COLLAPSE) {
+      for (const match of matches.slice(0, 4)) {
+        out.push(formatMatch(match));
+      }
+      const omitted = matches.length - 5;
+      out.push(`  ... (+${omitted} more matches)`);
+      out.push(formatMatch(matches[matches.length - 1]!));
+    } else {
+      for (const match of matches) {
+        out.push(formatMatch(match));
+      }
+    }
+  }
+
+  if (fileOrder.length > MAX_SEARCH_FILES) {
+    const remainingFiles = fileOrder.slice(MAX_SEARCH_FILES);
+    let remainingMatches = 0;
+    for (const filePath of remainingFiles) {
+      remainingMatches += byFile.get(filePath)?.length ?? 0;
+    }
+    out.push(`[... +${remainingFiles.length} more files (${remainingMatches} total matches) ...]`);
+  }
+
+  if (extraLines.length > 0) {
+    out.push(...extraLines.slice(0, 10));
+  }
+
+  return out.join("\n");
+}
+
+const DIR_ERROR_LINE_RE =
+  /\b(?:error|warning|cannot access|permission denied|no such file|access is denied|not found)\b/i;
+
+function compressDirectoryListing(lines: ReadonlyArray<string>): string {
+  const nonEmpty = lines.filter((line) => line.trim() !== "");
+  if (nonEmpty.length <= 25) return lines.join("\n");
+
+  const errorLines: Array<string> = [];
+  const dirOrder: Array<string> = [];
+  const byDir = new Map<string, Array<string>>();
+  const otherLines: Array<string> = [];
+  let currentDir: string | undefined;
+
+  const pushFile = (dirKey: string, fileName: string) => {
+    let bucket = byDir.get(dirKey);
+    if (bucket === undefined) {
+      bucket = [];
+      byDir.set(dirKey, bucket);
+      dirOrder.push(dirKey);
+    }
+    bucket.push(fileName);
+  };
+
+  for (const rawLine of nonEmpty) {
+    const line = rawLine.trim();
+    if (CRITICAL_LOG_RE.test(line) || DIR_ERROR_LINE_RE.test(line)) {
+      errorLines.push(rawLine);
+      continue;
+    }
+    const gciDirMatch = /^Directory:\s+(.+)$/i.exec(line);
+    if (gciDirMatch?.[1] !== undefined) {
+      currentDir = `${gciDirMatch[1].trim().replaceAll("\\", "/").replace(/\/+$/, "")}/`;
+      continue;
+    }
+    if (line.endsWith(":") && !line.includes(" ")) {
+      currentDir = `${line.slice(0, -1).replaceAll("\\", "/").replace(/\/+$/, "")}/`;
+      continue;
+    }
+    const lsLongMatch =
+      /^[d\-lcbps][rwxstST-]{9}[.+@]?\s+\d+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(.+)$/.exec(line);
+    if (lsLongMatch?.[1] !== undefined) {
+      const entryName = lsLongMatch[1].trim();
+      if (entryName !== "." && entryName !== "..") {
+        pushFile(currentDir ?? "./", entryName);
+      }
+      continue;
+    }
+    const gciRowMatch =
+      /^[dlarhs-]{5,6}\s+\d{1,2}\/\d{1,2}\/\d{2,4}\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s+(?:\S+\s+)?(.+)$/i.exec(
+        line,
+      );
+    if (gciRowMatch?.[1] !== undefined) {
+      pushFile(currentDir ?? "./", gciRowMatch[1].trim());
+      continue;
+    }
+    if (
+      /^total\s+\d+$/i.test(line) ||
+      /^Mode\s+LastWriteTime/i.test(line) ||
+      /^-+\s+-+/.test(line)
+    ) {
+      continue;
+    }
+    if (/^[│├└─\s]+/.test(rawLine) && (rawLine.includes("├──") || rawLine.includes("└──"))) {
+      otherLines.push(rawLine);
+      continue;
+    }
+    if (!line.includes("\t")) {
+      const normalized = line.replaceAll("\\", "/");
+      if (normalized.endsWith("/")) {
+        continue;
+      }
+      const lastSlash = normalized.lastIndexOf("/");
+      const dirKey = lastSlash >= 0 ? normalized.slice(0, lastSlash + 1) : (currentDir ?? "./");
+      const fileName = lastSlash >= 0 ? normalized.slice(lastSlash + 1) : normalized;
+      if (fileName !== "") {
+        pushFile(dirKey, fileName);
+        continue;
+      }
+    }
+    otherLines.push(rawLine);
+  }
+
+  if (
+    dirOrder.length === 0 ||
+    (otherLines.length > nonEmpty.length * 0.5 && otherLines.length > 25)
+  ) {
+    const head = nonEmpty.slice(0, 20);
+    const tail = nonEmpty.slice(-5);
+    const omitted = nonEmpty.length - 25;
+    return [...head, `[... ${omitted} directory entries omitted ...]`, ...tail, ...errorLines].join(
+      "\n",
+    );
+  }
+
+  const MAX_DIRS = 40;
+  const MAX_FILES_PER_DIR = 4;
+  const out: Array<string> = [];
+  for (const dir of dirOrder.slice(0, MAX_DIRS)) {
+    const files = byDir.get(dir)!;
+    const countLabel = `${files.length} ${files.length === 1 ? "file" : "files"}`;
+    if (files.length > MAX_FILES_PER_DIR) {
+      out.push(
+        `${dir} (${countLabel}): ${files.slice(0, MAX_FILES_PER_DIR).join(", ")} (+${files.length - MAX_FILES_PER_DIR} more)`,
+      );
+    } else {
+      out.push(`${dir} (${countLabel}): ${files.join(", ")}`);
+    }
+  }
+
+  if (dirOrder.length > MAX_DIRS) {
+    const remainingDirs = dirOrder.slice(MAX_DIRS);
+    let remainingFiles = 0;
+    for (const dir of remainingDirs) {
+      remainingFiles += byDir.get(dir)?.length ?? 0;
+    }
+    out.push(`[... +${remainingDirs.length} more directories (${remainingFiles} files) ...]`);
+  }
+
+  if (errorLines.length > 0) {
+    out.push(...errorLines);
+  }
+
   return out.join("\n");
 }
 
@@ -1135,7 +1559,7 @@ function compressBuildInstallOutput(lines: ReadonlyArray<string>): string {
 }
 
 function compressCliOutput(rawText: string, commandHint?: string): string | undefined {
-  const cleaned = stripAnsi(rawText).replace(/\r\n/g, "\n");
+  const cleaned = collapseBlobLines(normalizeTerminalText(stripAnsi(rawText)));
   const lines = cleaned.split("\n");
 
   if (commandHint !== undefined) {
@@ -1151,6 +1575,12 @@ function compressCliOutput(rawText: string, commandHint?: string): string | unde
     if (GIT_LOG_CMD_RE.test(commandHint)) {
       return compressGitLogOutput(lines);
     }
+    if (SEARCH_CMD_RE.test(commandHint)) {
+      return compressSearchOutput(lines);
+    }
+    if (DIR_LIST_CMD_RE.test(commandHint)) {
+      return compressDirectoryListing(lines);
+    }
     if (BUILD_INSTALL_CMD_RE.test(commandHint)) {
       return compressBuildInstallOutput(lines);
     }
@@ -1158,6 +1588,9 @@ function compressCliOutput(rawText: string, commandHint?: string): string | unde
 
   if (looksLikeTestRunnerOutput(lines)) {
     return compressTestRunnerOutput(lines);
+  }
+  if (looksLikeSearchOutput(lines)) {
+    return compressSearchOutput(lines);
   }
   return undefined;
 }

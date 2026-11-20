@@ -1060,6 +1060,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
           readonly agent: string;
           readonly orchestration: boolean;
           readonly device: boolean;
+          readonly runtimeSignature?: string | undefined;
         } | null>(null);
         // Cursor drops a run cancelled before its first checkpoint, so the next message carries its prompt.
         const interruptedPrompt = yield* Ref.make<{
@@ -2619,12 +2620,16 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
           mcpServers: Record<string, McpServerConfig> | undefined,
           hasDeviceTools: boolean,
-          delivered: { readonly orchestration: boolean; readonly device: boolean },
+          delivered: {
+            readonly orchestration: boolean;
+            readonly device: boolean;
+            readonly runtimeSignature?: string | undefined;
+          },
           interrupted: string | undefined,
         ) {
           const rawText = turnInput.message.text;
           if (rawText.trim() === "/compress" && turnInput.message.attachments.length === 0) {
-            return { message: "/compress", prompt: undefined };
+            return { message: "/compress", prompt: undefined, runtimeSignature: undefined };
           }
           const newText = t3OrchestrationPrompt({
             prompt: yield* providerMessageTextWithAttachmentPaths({
@@ -2685,14 +2690,19 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
               Effect.map((settings) => settings.pythonReplMode),
               Effect.orElseSucceed(() => false),
             )) && (yield* mcpSessions.read(turnInput.threadId)) !== undefined;
-          const text = `${userText}\n\n${buildRuntimeInstructions({
-            harness: "Cursor",
-            model: turnInput.modelSelection.model,
-            ...(pythonRepl ? { pythonRepl: "alongside" as const } : {}),
-          })}`;
+          const runtimeSignature = `${turnInput.modelSelection.model}|${pythonRepl ? "repl" : "no-repl"}`;
+          const text =
+            delivered.runtimeSignature === runtimeSignature
+              ? userText
+              : `${userText}\n\n${buildRuntimeInstructions({
+                  harness: "Cursor",
+                  model: turnInput.modelSelection.model,
+                  ...(pythonRepl ? { pythonRepl: "alongside" as const } : {}),
+                })}`;
           return {
             message: images.length === 0 ? text : ({ text, images } satisfies SDKUserMessage),
             prompt: userText,
+            runtimeSignature,
           };
         });
 
@@ -2727,6 +2737,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 : {
                     orchestration: turnInput.nativeThreadHasTurns ?? turnInput.runOrdinal > 1,
                     device: false,
+                    runtimeSignature: undefined,
                   };
             const interrupted = yield* Ref.get(interruptedPrompt);
             const runCheckpointed = (runId?: string) =>
@@ -2754,11 +2765,19 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 providerThreadId: turnInput.providerThread.id,
               });
             }
-            const { message, prompt } =
+            const { message, prompt, runtimeSignature } =
               resume === "native"
-                ? { message: "", prompt: undefined }
+                ? {
+                    message: "",
+                    prompt: undefined,
+                    runtimeSignature: delivered.runtimeSignature,
+                  }
                 : resume === "replay"
-                  ? { message: dropped!.message, prompt: dropped!.text }
+                  ? {
+                      message: dropped!.message,
+                      prompt: dropped!.text,
+                      runtimeSignature: delivered.runtimeSignature,
+                    }
                   : yield* resolveUserMessage(
                       turnInput,
                       mcpServers,
@@ -2806,6 +2825,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 agent: agent.nativeThreadId,
                 orchestration: !compacted && (delivered.orchestration || mcpServers !== undefined),
                 device: !compacted && hasDeviceTools,
+                runtimeSignature: compacted ? undefined : runtimeSignature,
               });
             }
             if (!compacted && resume !== "native") {
@@ -3272,7 +3292,12 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
               // The kept turns may predate a compaction, so the instructions are sent again.
               const forgetConversation = (agent: string) =>
                 Effect.all([
-                  Ref.set(told, { agent, orchestration: false, device: false }),
+                  Ref.set(told, {
+                    agent,
+                    orchestration: false,
+                    device: false,
+                    runtimeSignature: undefined,
+                  }),
                   Ref.set(interruptedPrompt, null),
                   Ref.set(resumedAgent, null),
                 ]);
