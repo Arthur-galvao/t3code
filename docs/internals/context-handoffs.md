@@ -17,3 +17,8 @@ Legacy v1 continuation uses a separate algorithm. It considers only user and ass
 walks backward from the newest message, and builds a transcript suffix within a 32,000-character
 budget. Do not describe that migration budget as the limit for portable handoffs, and do not describe
 the 240-character prefix as a migration rule.
+
+Fork (Arthur-galvao/t3code): user, assistant, prior-handoff and error items still cap at 240
+characters, but text of 1,200 characters or more first goes through the CCR compressor
+(`compressHandoffDeltaText` in `ContextHandoffService.ts`), keeping error/traceback lines. The
+primary objective and plans cap at 500, compacted summaries at 360, and critical log lines at 480.
