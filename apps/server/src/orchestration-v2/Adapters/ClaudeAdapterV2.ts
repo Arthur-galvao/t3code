@@ -2415,8 +2415,8 @@ function evaluateClaudePostToolUseCompression(input: {
     return {};
   }
   const toolName = input.hookInput.tool_name;
-  // The REPL caps and CCR-compresses its own output for every provider (PythonRepl.ts); the agent
-  // chose what to print, so a second, Claude-only pass would only cut the part it asked for.
+  // PythonRepl compresses its own output from 6k for every provider (PythonRepl.ts); a second,
+  // Claude-only pass here would only cut it again.
   if (
     isContextRetrieveTool(toolName) ||
     isPythonReplTool(toolName) ||

@@ -6263,7 +6263,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.isString(compressedReadLog);
           assert.include(compressedReadLog as string, "[T3 CCR:");
 
-          // Python REPL output is left to PythonRepl's own 30k cap, even above 6k chars.
+          // Python REPL output is shaped by PythonRepl itself (6k, for every provider), not this hook.
           const largePythonOut = Array.from(
             { length: 240 },
             (_, i) => `row=${i} value=alpha_beta_gamma_delta_epsilon`,

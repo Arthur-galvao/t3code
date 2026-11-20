@@ -20,6 +20,9 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 export const DEFAULT_TIMEOUT_SECONDS = 600;
 const MAX_OUTPUT_CHARS = 30_000;
+// Measured on 981 REPL calls: below ~6k chars a CCR stub made agents re-fetch 30-43% of the time
+// (vs ~10% uncompressed), which costs more than the tokens saved; above 6k the excess fell to ~10%.
+const COMPRESS_MIN_CHARS = 6_000;
 
 // fd 0 and 1 move to private handles so user code and its children cannot corrupt the protocol.
 const DRIVER = String.raw`
@@ -95,14 +98,14 @@ const buildClippedCcrText = (bodySource: string, originalLen: number, ccrId: str
 };
 
 const shapeReplText = (text: string, threadId: ThreadId, sourceLabel: string): string => {
-  if (text.length <= MAX_OUTPUT_CHARS) {
+  if (text.length <= COMPRESS_MIN_CHARS) {
     return text;
   }
   const compressed = compressToolOutput({
     text,
     threadId,
     sourceLabel,
-    minChars: MAX_OUTPUT_CHARS,
+    minChars: COMPRESS_MIN_CHARS,
     store: defaultCcrStore,
   });
   if (compressed.compressed) {
@@ -116,6 +119,9 @@ const shapeReplText = (text: string, threadId: ThreadId, sourceLabel: string): s
         compressed.ccrId,
       );
     }
+  }
+  if (text.length <= MAX_OUTPUT_CHARS) {
+    return text;
   }
   const entry = defaultCcrStore.put({
     content: text,

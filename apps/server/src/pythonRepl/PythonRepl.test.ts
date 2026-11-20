@@ -76,3 +76,28 @@ it.live("stores oversized output in thread-scoped CCR instead of lossy clipping"
     expect(defaultCcrStore.getStats(partialThreadId).compressedCallsCount).toBe(1);
   }).pipe(Effect.provide(TestLayer)),
 );
+
+it.live("leaves output up to 6k chars alone and compresses it above that", () =>
+  Effect.gen(function* () {
+    const repl = yield* PythonRepl.PythonRepl;
+    const threadId = ThreadId.make("thread-python-repl-threshold");
+    // ~5.4k chars: agents re-fetch stubs this small too often, so it stays verbatim.
+    const small = yield* repl.run({
+      threadId,
+      cwd,
+      code: "for i in range(90): print(f'row-{i:03d}-' + ('y' * 50))",
+    });
+    expect(small.output).not.toContain("[T3 CCR:");
+    expect(small.output).toContain("row-045-");
+    // ~7.2k chars: compressed into a line-aware stub with a CCR id.
+    const large = yield* repl.run({
+      threadId,
+      cwd,
+      code: "for i in range(120): print(f'row-{i:03d}-' + ('y' * 50))",
+    });
+    expect(large.output).toContain("[T3 CCR:");
+    expect(large.output).toContain("row-000-");
+    expect(large.output).toContain("row-119-");
+    expect(large.output.length).toBeLessThan(3_000);
+  }).pipe(Effect.provide(TestLayer)),
+);
