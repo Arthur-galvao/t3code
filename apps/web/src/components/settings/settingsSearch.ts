@@ -1397,6 +1397,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "t3-account-sync",
+    title: msg("Sync customizations"),
+    to: "/settings/account",
+    targetId: "t3-account-sync",
+    searchTerms: [
+      msg("sync backup restore settings theme preferences cloud account customizations"),
+    ],
+  },
+  {
     id: "t3-connect",
     localEnvironmentOnly: true,
     title: msg("T3 Connect"),

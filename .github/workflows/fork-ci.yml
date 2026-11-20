@@ -70,7 +70,7 @@ jobs:
 
       - name: Test web unit logic
         working-directory: apps/web
-        run: ../../node_modules/.bin/vp test run src/components/settings/settingsSearch.test.ts src/components/settings/SettingsPanels.logic.test.ts src/components/settings/ConnectionsSettings.logic.test.ts src/state/rsi.test.ts src/cloud/publicConfig.test.ts
+        run: ../../node_modules/.bin/vp test run src/components/settings/settingsSearch.test.ts src/components/settings/SettingsPanels.logic.test.ts src/components/settings/ConnectionsSettings.logic.test.ts src/state/rsi.test.ts src/cloud/publicConfig.test.ts src/cloud/accountCustomizationSync.test.ts
 
       - name: Test scripts
         working-directory: scripts

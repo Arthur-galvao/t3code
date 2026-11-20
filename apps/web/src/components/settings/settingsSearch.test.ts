@@ -109,6 +109,13 @@ describe("searchSettings", () => {
       id: "t3-account",
       to: "/settings/account",
     });
+    expect(searchSettings("sync customizations")).toContainEqual(
+      expect.objectContaining({
+        id: "t3-account-sync",
+        to: "/settings/account",
+        targetId: "t3-account-sync",
+      }),
+    );
   });
 
   it("matches normalized title substrings", () => {

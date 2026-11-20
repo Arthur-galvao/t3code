@@ -3,6 +3,8 @@ import { AuthAccessWriteScope, AuthRelayReadScope, AuthRelayWriteScope } from "@
 import { Link } from "@tanstack/react-router";
 import { T, useGT } from "gt-react";
 import {
+  CloudDownloadIcon,
+  CloudUploadIcon,
   LogInIcon,
   LogOutIcon,
   MessageSquareIcon,
@@ -14,6 +16,12 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 
+import {
+  requestAccountSyncRestore,
+  requestAccountSyncSave,
+  updateAccountAutoSyncEnabled,
+  useAccountSyncState,
+} from "../../cloud/accountCustomizationSync";
 import { useManagedTunnelUsage } from "../../cloud/managedRelayState";
 import { useEnvironmentScope } from "../../state/session";
 import { TunnelUsageMeter } from "../cloud/TunnelUsage";
@@ -22,6 +30,7 @@ import { CloudLinkRow } from "../settings/SavedEnvironmentRows";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "../settings/settingsLayout";
 import { useAccessEnvironment } from "../settings/useAccessEnvironment";
 import { Button } from "../ui/button";
+import { Switch } from "../ui/switch";
 import { toastManager } from "../ui/toast";
 import { retryClerkLoad, useClerkLoadFailed } from "./clerkLoadFailure";
 import { useT3ConnectAccountPage } from "./T3ConnectAccountPages";
@@ -36,6 +45,7 @@ export function AccountSettingsContent() {
   const { openAuthPrompt } = useT3ConnectAuthPrompt();
   const accountPage = useT3ConnectAccountPage();
   const usage = useManagedTunnelUsage();
+  const syncState = useAccountSyncState();
   const [isSigningOut, setIsSigningOut] = useState(false);
 
   const { environment: accessEnvironment } = useAccessEnvironment(null);
@@ -197,6 +207,74 @@ export function AccountSettingsContent() {
             </>
           )}
         </SettingsSection>
+
+        {isLoaded && isSignedIn ? (
+          <SettingsSection id="t3-account-sync" title={gt("Customization sync")}>
+            <SettingsRow
+              title={gt("Auto-sync customizations")}
+              description={gt(
+                "Automatically restore and sync theme, appearance, fonts, editor/chat preferences, and portable fork settings whenever you sign in. Secrets, local paths, custom CSS, and security toggles are never uploaded.",
+              )}
+              control={
+                <Switch
+                  aria-label={gt("Auto-sync customizations")}
+                  checked={syncState.autoSyncEnabled}
+                  onCheckedChange={(checked) => void updateAccountAutoSyncEnabled(Boolean(checked))}
+                />
+              }
+            />
+            <SettingsRow
+              title={gt("Account backup")}
+              description={
+                syncState.status === "syncing"
+                  ? gt("Saving portable customizations to your T3 Code account…")
+                  : syncState.status === "restoring"
+                    ? gt("Restoring customizations from your T3 Code account…")
+                    : syncState.hasCloudBackup && syncState.cloudUpdatedAt
+                      ? syncState.cloudDeviceLabel
+                        ? gt("Last synced {timestamp} from {device}.", {
+                            timestamp: new Date(syncState.cloudUpdatedAt).toLocaleString(),
+                            device: syncState.cloudDeviceLabel,
+                          })
+                        : gt("Last synced {timestamp}.", {
+                            timestamp: new Date(syncState.cloudUpdatedAt).toLocaleString(),
+                          })
+                      : gt("No customization backup is stored on this account yet.")
+              }
+              status={
+                syncState.lastError ? (
+                  <span className="text-destructive">{syncState.lastError}</span>
+                ) : null
+              }
+              control={
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={syncState.status === "syncing" || syncState.status === "restoring"}
+                    onClick={() => void requestAccountSyncSave()}
+                  >
+                    <CloudUploadIcon className="size-3.5" />
+                    <T>Save to account</T>
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={
+                      !syncState.hasCloudBackup ||
+                      syncState.status === "syncing" ||
+                      syncState.status === "restoring"
+                    }
+                    onClick={() => void requestAccountSyncRestore()}
+                  >
+                    <CloudDownloadIcon className="size-3.5" />
+                    <T>Restore from account</T>
+                  </Button>
+                </div>
+              }
+            />
+          </SettingsSection>
+        ) : null}
 
         <SettingsSection id="t3-account-connect" title={gt("T3 Connect on this machine")}>
           {accessEnvironmentId !== null && (canReadRelay || canManageRelay) ? (

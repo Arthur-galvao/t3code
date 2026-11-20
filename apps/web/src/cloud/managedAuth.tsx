@@ -16,6 +16,7 @@ import { useEffect, type ReactNode } from "react";
 import { environmentCatalog } from "../connection/catalog";
 import { runtime } from "../lib/runtime";
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import { AccountCustomizationSyncCoordinator } from "../components/clerk/AccountCustomizationSyncCoordinator";
 import { resolveRelayClerkTokenOptions } from "./publicConfig";
 
 export function deactivateManagedRelayAuthentication(): void {
@@ -70,5 +71,10 @@ export function ManagedRelayAuthProvider({ children }: { readonly children: Reac
   const clerk = useClerk();
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- attaches the Clerk instance to the managed relay account service for the provider's lifetime
   useEffect(() => managedRelayAccountService.attach(clerk), [clerk]);
-  return children;
+  return (
+    <>
+      <AccountCustomizationSyncCoordinator />
+      {children}
+    </>
+  );
 }
