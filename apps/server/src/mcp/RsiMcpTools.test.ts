@@ -1,12 +1,15 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, describe, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 
+import * as ServerConfig from "../config.ts";
 import * as RsiService from "../orchestration-v2/RsiService.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -191,5 +194,86 @@ describe("RSI MCP tools", () => {
         ),
       ),
     ),
+  );
+});
+
+describe("memory MCP tools scoped to the caller's project", () => {
+  const projectId = "project:memory-mcp";
+  const scopeFor = (threadId: string): McpInvocationScope => ({
+    environmentId: EnvironmentId.make("environment:memory-mcp"),
+    requestNamespace: `provider-session:${threadId}`,
+    thread: {
+      threadId: ThreadId.make(threadId),
+      providerSessionId: `provider-session:${threadId}`,
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+    },
+    client: undefined,
+    capabilities: new Set(["orchestration"]),
+    issuedAt: 1,
+  });
+
+  it.effect("writes notes with the caller's project root and hides them from other projects", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-memory-mcp-" });
+      const roots: Record<string, string> = {
+        "thread:repo-a": path.join(stateDir, "repo-a"),
+        "thread:repo-b": path.join(stateDir, "repo-b"),
+      };
+      const projectsByThread = new Map(
+        Object.entries(roots).map(([threadId, root]) => [threadId, root] as const),
+      );
+      const layer = OrchestratorMcpService.layer.pipe(
+        Layer.provideMerge(
+          RsiService.RsiService.makeLayer({ persistCcr: false }).pipe(
+            Layer.provide(ServerConfig.layerTest(stateDir, stateDir)),
+          ),
+        ),
+        Layer.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            NodeCrypto.layer,
+            ServerSettings.layerTest(),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadShell: (threadId) =>
+                Effect.succeed({ id: threadId, projectId: `${projectId}:${threadId}` } as never),
+            }),
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+            Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+              list: () => Effect.succeed([]),
+            }),
+            Layer.mock(ProjectService.ProjectService)({
+              getById: (id) =>
+                Effect.succeed(
+                  Option.fromNullishOr(
+                    projectsByThread.get(String(id).slice(projectId.length + 1)),
+                  ).pipe(Option.map((workspaceRoot) => ({ workspaceRoot }) as never)),
+                ),
+            }),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          ),
+        ),
+      );
+
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const written = yield* service.memoryWrite(scopeFor("thread:repo-a"), {
+          title: "Deploy steps",
+          content: "Deploy with the release workflow.",
+        });
+        expect(yield* fs.readFileString(written.path)).toContain(
+          `projectRoot: ${JSON.stringify(roots["thread:repo-a"])}`,
+        );
+        const fromA = yield* service.memorySearch(scopeFor("thread:repo-a"), { query: "deploy" });
+        expect(fromA.hits.map((hit) => hit.title)).toEqual(["Deploy steps"]);
+        const fromB = yield* service.memorySearch(scopeFor("thread:repo-b"), { query: "deploy" });
+        expect(fromB.hits).toEqual([]);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
