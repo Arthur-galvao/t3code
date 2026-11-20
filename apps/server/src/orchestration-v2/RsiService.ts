@@ -585,6 +585,43 @@ function isSameOrInsidePath(candidateCwd: string | null | undefined, projectRoot
 // shortcut: distilled lessons that took a failure signature's rationaleTrace are not recognized and are kept.
 const AUTO_DISTILL_RATIONALE = /^(?:Auto-distilled|Post-success)/;
 
+const GENERIC_ERROR_SIGNATURES = new Set([
+  "failed",
+  "failure",
+  "error",
+  "errored",
+  "unknown",
+  "timeout",
+  "timed out",
+  "cancelled",
+  "canceled",
+  "interrupted",
+  "safety_block",
+]);
+
+/**
+ * True when a scrubbed error carries enough detail to teach something. Bare statuses
+ * ("failed", "run_failed", "loop_interrupted") produce lessons like "Inspect error "failed"".
+ */
+/**
+ * Lessons come from agents (`rsi_record_lesson`) and hand-edited Obsidian notes, and are
+ * injected into every provider's prompt: keep each one a single line with no tag-like markup
+ * that could close the `<t3_code_rsi_lessons>` block or open a new instruction block.
+ */
+export function sanitizePromptLessonText(raw: string): string {
+  return raw
+    .replace(/<\/?[a-zA-Z_][\w:.-]*(?:\s[^<>]*)?\/?>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function isActionableErrorSignature(scrubbed: string): boolean {
+  const text = scrubbed.trim().toLowerCase();
+  if (text === "" || GENERIC_ERROR_SIGNATURES.has(text)) return false;
+  if (/^(?:run|loop)_[a-z_]+$/.test(text)) return false;
+  return text.length >= 12 && /\S\s+\S/.test(text);
+}
+
 function isLegacyUnscopedAutoLesson(
   lesson: Pick<RsiLesson, "id" | "scope" | "projectRoot" | "rationaleTrace">,
 ): boolean {
@@ -1973,7 +2010,10 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
             return copy;
           });
 
-          if (record.loopTripped || updatedCount >= 2) {
+          if (
+            (record.loopTripped || updatedCount >= 2) &&
+            isActionableErrorSignature(failureErrorSignature)
+          ) {
             distilledForSignature = true;
             const rawTitle =
               sig?.title ??
@@ -2128,7 +2168,10 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           } else if (
             record.toolErrorCount > 0 &&
             !distilledForSignature &&
-            (normalizedCommands.length > 0 || editedFiles.length > 0 || sig !== undefined)
+            // Without a concrete verify command, only a detailed error is worth a lesson.
+            ((normalizedCommands.length > 0 &&
+              normalizedCommands[0]!.length <= MAX_DISPLAY_COMMAND_CHARS) ||
+              isActionableErrorSignature(scrubErrorText(sig?.errorSignature ?? "")))
           ) {
             const recoveryTool = sig?.tool ?? "recovery";
             const recoveryCmd =
@@ -2430,7 +2473,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         let currentLength = header.length;
 
         for (const lesson of eligible) {
-          const line = `- ${lesson.title}: ${lesson.guidance}`;
+          const line = `- ${sanitizePromptLessonText(lesson.title)}: ${sanitizePromptLessonText(lesson.guidance)}`;
           const nextLength = currentLength + 1 + line.length;
           if (nextLength <= lessonBudget) {
             lines.push(line);
