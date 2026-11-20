@@ -848,9 +848,18 @@ interface PersistenceHandles {
 function parseLessonsFileWithStats(raw: string): {
   readonly lessons: ReadonlyArray<RsiLesson>;
   readonly droppedLegacy: boolean;
+  /** The file had content but was not a readable lessons payload; callers must not overwrite it. */
+  readonly corrupt: boolean;
 } {
   try {
     const parsed: unknown = JSON.parse(raw);
+    const isPayload =
+      Array.isArray(parsed) ||
+      (parsed !== null &&
+        typeof parsed === "object" &&
+        "lessons" in parsed &&
+        Array.isArray((parsed as { readonly lessons: unknown }).lessons));
+    if (!isPayload) return { lessons: [], droppedLegacy: false, corrupt: true };
     const list: unknown = Array.isArray(parsed)
       ? parsed
       : parsed !== null &&
@@ -859,7 +868,7 @@ function parseLessonsFileWithStats(raw: string): {
           Array.isArray((parsed as { readonly lessons: unknown }).lessons)
         ? (parsed as { readonly lessons: unknown[] }).lessons
         : [];
-    if (!Array.isArray(list)) return { lessons: [], droppedLegacy: false };
+    if (!Array.isArray(list)) return { lessons: [], droppedLegacy: false, corrupt: true };
     const valid: Array<RsiLesson> = [];
     let droppedLegacy = false;
     for (const entry of list) {
@@ -904,9 +913,9 @@ function parseLessonsFileWithStats(raw: string): {
         valid.push(lesson);
       }
     }
-    return { lessons: valid.slice(0, MAX_LESSONS), droppedLegacy };
+    return { lessons: valid.slice(0, MAX_LESSONS), droppedLegacy, corrupt: false };
   } catch {
-    return { lessons: [], droppedLegacy: false };
+    return { lessons: [], droppedLegacy: false, corrupt: true };
   }
 }
 
@@ -1242,6 +1251,13 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   const hydratedRef = yield* Ref.make(false);
   const telemetryFileLinesRef = yield* Ref.make(0);
   const mutex = Semaphore.makeUnsafe(1);
+  // Obsidian notes this process wrote (or found identical to what it would write), by file name.
+  // A note whose content still matches is untouched by the user: safe to delete, nothing to import.
+  const ownedObsidianNotesRef = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+  // Which note file holds each lesson, so a user-created note keeps its own file name.
+  const obsidianNoteFileByLessonIdRef = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+  // Last content imported per note, so an unchanged user note is merged once, not on every write.
+  const importedObsidianNotesRef = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
 
   const persistence = input?.persistence;
   const isAutoDistillEnabled = input?.isAutoDistillEnabled ?? (() => Effect.succeed(true));
@@ -1260,9 +1276,12 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     const lessonsDir = persistence.path.join(brainDir, "Lessons");
     yield* Effect.gen(function* () {
       yield* persistence.fs.makeDirectory(lessonsDir, { recursive: true });
+      const owned = new Map(yield* Ref.get(ownedObsidianNotesRef));
+      const fileByLessonId = new Map(yield* Ref.get(obsidianNoteFileByLessonIdRef));
       const expectedFiles = new Set<string>();
       for (const lesson of lessons) {
-        const fileName = obsidianLessonFileName(lesson.id);
+        const fileName = fileByLessonId.get(lesson.id) ?? obsidianLessonFileName(lesson.id);
+        fileByLessonId.set(lesson.id, fileName);
         expectedFiles.add(fileName);
         const filePath = persistence.path.join(lessonsDir, fileName);
         const nextContent = formatObsidianLessonMarkdown(lesson);
@@ -1272,18 +1291,31 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         if (existingContent !== nextContent) {
           yield* persistence.fs.writeFileString(filePath, nextContent);
         }
+        owned.set(fileName, nextContent);
       }
 
+      // Only remove notes this process wrote and nobody edited since; anything else is the user's.
       const existingEntries = yield* persistence.fs
         .readDirectory(lessonsDir)
         .pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<string>));
       for (const entry of existingEntries) {
-        if (entry.endsWith(".md") && !expectedFiles.has(entry)) {
-          yield* persistence.fs
-            .remove(persistence.path.join(lessonsDir, entry), { force: true })
-            .pipe(Effect.ignore);
+        if (!entry.endsWith(".md") || expectedFiles.has(entry)) continue;
+        const ownedContent = owned.get(entry);
+        if (ownedContent === undefined) continue;
+        const entryPath = persistence.path.join(lessonsDir, entry);
+        const content = yield* persistence.fs
+          .readFileString(entryPath)
+          .pipe(Effect.orElseSucceed(() => null as string | null));
+        if (content === ownedContent) {
+          yield* persistence.fs.remove(entryPath, { force: true }).pipe(Effect.ignore);
         }
+        owned.delete(entry);
       }
+      for (const [lessonId, fileName] of fileByLessonId) {
+        if (!expectedFiles.has(fileName)) fileByLessonId.delete(lessonId);
+      }
+      yield* Ref.set(ownedObsidianNotesRef, owned);
+      yield* Ref.set(obsidianNoteFileByLessonIdRef, fileByLessonId);
 
       const mocPath = persistence.path.join(brainDir, "00-MOC-Memory.md");
       const mocMarkdown = formatObsidianMocMarkdown(lessons, latestLessonUpdatedAt(lessons));
@@ -1323,13 +1355,20 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       const nowMs = Number.isFinite(parsedNowMs) ? parsedNowMs : undefined;
       let next = [...currentLessons];
       let changed = false;
+      const owned = yield* Ref.get(ownedObsidianNotesRef);
+      const imported = new Map(yield* Ref.get(importedObsidianNotesRef));
+      const fileByLessonId = new Map(yield* Ref.get(obsidianNoteFileByLessonIdRef));
       for (const fileName of markdownEntries) {
         const raw = yield* persistence.fs
           .readFileString(persistence.path.join(lessonsDir, fileName))
           .pipe(Effect.orElseSucceed(() => ""));
         if (raw.trim() === "") continue;
+        // Untouched since this process wrote it: no user change, and a deleted lesson stays deleted.
+        if (owned.get(fileName) === raw || imported.get(fileName) === raw) continue;
+        imported.set(fileName, raw);
         const parsed = parseObsidianLessonMarkdown(raw, fileName, nowIso);
         if (parsed === null || isLegacyUnscopedAutoLesson(parsed)) continue;
+        if (!fileByLessonId.has(parsed.id)) fileByLessonId.set(parsed.id, fileName);
 
         const existingIdx = next.findIndex(
           (lesson) =>
@@ -1380,6 +1419,8 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         }
       }
 
+      yield* Ref.set(obsidianNoteFileByLessonIdRef, fileByLessonId);
+      yield* Ref.set(importedObsidianNotesRef, imported);
       if (changed) {
         next.sort((a, b) => lessonUtilityScore(b, nowMs) - lessonUtilityScore(a, nowMs));
       }
@@ -1397,7 +1438,23 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       const parsedLessons =
         lessonsRaw.trim() !== ""
           ? parseLessonsFileWithStats(lessonsRaw)
-          : { lessons: [], droppedLegacy: false };
+          : { lessons: [], droppedLegacy: false, corrupt: false };
+      if (parsedLessons.corrupt) {
+        // Keep the unreadable file for recovery instead of overwriting it with an empty store.
+        const asidePath = `${persistence.lessonsPath}.corrupt-${nowIso.replace(/[:.]/g, "-")}`;
+        yield* persistence.fs.rename(persistence.lessonsPath, asidePath).pipe(
+          Effect.andThen(
+            Effect.logWarning("RsiService: lessons.json was unreadable; moved aside", {
+              asidePath,
+            }),
+          ),
+          Effect.catch((cause) =>
+            Effect.logWarning("RsiService: failed to move unreadable lessons.json aside", {
+              cause,
+            }),
+          ),
+        );
+      }
       let loadedLessons = parsedLessons.lessons;
       const imported = yield* importObsidianLessonsLocked(loadedLessons, nowIso);
       if (imported.changed) {
@@ -1456,10 +1513,25 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       .makeDirectory(persistence.rsiDir, { recursive: true })
       .pipe(Effect.ignore);
     const payload = encodeLessonsPayload(lessons);
-    yield* persistence.fs
-      .writeFileString(persistence.lessonsPath, payload)
-      .pipe(Effect.catch((cause) => Effect.logWarning("Failed to write RSI lessons", { cause })));
+    // tmp + rename: a crash mid-write must never leave a truncated lessons.json behind.
+    const tmpPath = `${persistence.lessonsPath}.tmp`;
+    yield* persistence.fs.writeFileString(tmpPath, payload).pipe(
+      Effect.andThen(persistence.fs.rename(tmpPath, persistence.lessonsPath)),
+      Effect.catch((cause) => Effect.logWarning("Failed to write RSI lessons", { cause })),
+    );
     yield* syncObsidianBrainLocked(lessons);
+  });
+
+  /** Before a write, merge notes the user edited or created in Obsidian since the last sync. */
+  const hydrateForWriteLocked = Effect.fn("RsiService.hydrateForWriteLocked")(function* () {
+    yield* hydrateLocked();
+    if (persistence === undefined) return;
+    const nowIso = DateTime.formatIso(yield* DateTime.now);
+    const current = yield* Ref.get(lessonsRef);
+    const imported = yield* importObsidianLessonsLocked(current, nowIso);
+    if (!imported.changed) return;
+    yield* Ref.set(lessonsRef, imported.lessons);
+    yield* persistLessonsLocked(imported.lessons);
   });
 
   const appendTelemetryLocked = Effect.fn("RsiService.appendTelemetryLocked")(function* (
@@ -1527,7 +1599,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       const nowIso = DateTime.formatIso(yield* DateTime.now);
       return yield* mutex.withPermits(1)(
         Effect.gen(function* () {
-          yield* hydrateLocked();
+          yield* hydrateForWriteLocked();
           return yield* recordLessonLocked(lessonInput, nowIso);
         }),
       );
@@ -1620,7 +1692,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           : 0.15;
       return yield* mutex.withPermits(1)(
         Effect.gen(function* () {
-          yield* hydrateLocked();
+          yield* hydrateForWriteLocked();
           const result = yield* demoteLessonLocked(
             new Set([demoteInput.id.trim()]),
             effectiveDelta,
@@ -1644,7 +1716,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       const targetId = deleteInput.id.trim();
       return yield* mutex.withPermits(1)(
         Effect.gen(function* () {
-          yield* hydrateLocked();
+          yield* hydrateForWriteLocked();
           const current = yield* Ref.get(lessonsRef);
           const next = current.filter(
             (lesson) => lesson.id !== targetId && lesson.key !== targetId,
@@ -1704,7 +1776,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
 
     return yield* mutex.withPermits(1)(
       Effect.gen(function* () {
-        yield* hydrateLocked();
+        yield* hydrateForWriteLocked();
 
         const syncTokens = telemetryInput.tokensSavedEst === undefined;
         const syncCalls = telemetryInput.compressedCallsCount === undefined;

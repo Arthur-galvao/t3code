@@ -1700,3 +1700,115 @@ describe("RsiService", () => {
       }).pipe(Effect.provide(RsiService.layer)),
   );
 });
+
+describe("RsiService Obsidian sync safety", () => {
+  const setup = Effect.fn("setup")(function* (prefix: string) {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix });
+    const rsiDir = path.join(tempRoot, "rsi");
+    const brainDir = path.join(tempRoot, "vault", "T3-Brain");
+    const lessonsDir = path.join(brainDir, "Lessons");
+    const persistence = {
+      fs,
+      path,
+      rsiDir,
+      lessonsPath: path.join(rsiDir, "lessons.json"),
+      telemetryPath: path.join(rsiDir, "telemetry.jsonl"),
+      resolveObsidianBrainDir: () => Effect.succeed(brainDir),
+    };
+    const make = () => makeRsiService({ persistence });
+    return { fs, path, rsiDir, lessonsDir, persistence, make };
+  });
+
+  it.effect("never deletes user notes in the Lessons folder across writes and restarts", () =>
+    Effect.gen(function* () {
+      const { fs, path, lessonsDir, make } = yield* setup("t3-rsi-foreign-");
+      yield* fs.makeDirectory(lessonsDir, { recursive: true });
+      const foreignPath = path.join(lessonsDir, "my-own-note.md");
+      yield* fs.writeFileString(foreignPath, "# Not a lesson\n\nJust my notes.\n");
+
+      const rsi = yield* make();
+      yield* rsi.recordLesson({ key: "manual::a", title: "Rule A", guidance: "Do A." });
+      yield* rsi.recordLesson({ key: "manual::b", title: "Rule B", guidance: "Do B." });
+      // Any note in Lessons/ is imported as a lesson by design; it must keep its file and text.
+      expect(yield* fs.readFileString(foreignPath)).toContain("Just my notes.");
+
+      // A fresh process cannot prove a stale lesson-looking note is its own, so it keeps it.
+      const stalePath = path.join(lessonsDir, "rsi_lesson_from_old_session.md");
+      yield* fs.writeFileString(stalePath, '---\nid: "x"\n---\n\nleftover\n');
+      const restarted = yield* make();
+      yield* restarted.recordLesson({ key: "manual::c", title: "Rule C", guidance: "Do C." });
+      expect(yield* fs.exists(foreignPath)).toBe(true);
+      expect(yield* fs.exists(stalePath)).toBe(true);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("removes the untouched note of a deleted lesson and does not resurrect it", () =>
+    Effect.gen(function* () {
+      const { fs, path, lessonsDir, make } = yield* setup("t3-rsi-delete-");
+      const rsi = yield* make();
+      const doomed = yield* rsi.recordLesson({
+        key: "manual::doomed",
+        title: "Doomed rule",
+        guidance: "Delete me.",
+      });
+      const notePath = path.join(lessonsDir, `${doomed.id}.md`);
+      expect(yield* fs.exists(notePath)).toBe(true);
+
+      expect((yield* rsi.deleteLesson({ id: doomed.id })).deleted).toBe(true);
+      expect(yield* fs.exists(notePath)).toBe(false);
+
+      yield* rsi.recordLesson({ key: "manual::other", title: "Other rule", guidance: "Stay." });
+      const lessons = yield* rsi.queryLessons();
+      expect(lessons.map((lesson) => lesson.id)).not.toContain(doomed.id);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("merges a mid-session Obsidian edit on the next write instead of overwriting it", () =>
+    Effect.gen(function* () {
+      const { fs, path, lessonsDir, make } = yield* setup("t3-rsi-edit-");
+      const rsi = yield* make();
+      const edited = yield* rsi.recordLesson({
+        key: "manual::edited",
+        title: "Edited rule",
+        guidance: "Original guidance.",
+      });
+      const notePath = path.join(lessonsDir, `${edited.id}.md`);
+      const original = yield* fs.readFileString(notePath);
+      yield* fs.writeFileString(
+        notePath,
+        original.replace("Original guidance.", "Guidance edited in Obsidian."),
+      );
+
+      yield* rsi.recordLesson({ key: "manual::trigger", title: "Trigger", guidance: "Write." });
+
+      expect(yield* fs.readFileString(notePath)).toContain("Guidance edited in Obsidian.");
+      const lessons = yield* rsi.queryLessons();
+      expect(lessons.find((lesson) => lesson.id === edited.id)?.guidance).toBe(
+        "Guidance edited in Obsidian.",
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("moves an unreadable lessons.json aside instead of overwriting it", () =>
+    Effect.gen(function* () {
+      const { fs, path, rsiDir, persistence, make } = yield* setup("t3-rsi-corrupt-");
+      yield* fs.makeDirectory(rsiDir, { recursive: true });
+      yield* fs.writeFileString(persistence.lessonsPath, '{"version":1,"lessons":[{"id":');
+
+      const rsi = yield* make();
+      yield* rsi.recordLesson({ key: "manual::fresh", title: "Fresh", guidance: "New." });
+
+      const aside = (yield* fs.readDirectory(rsiDir)).filter((name) =>
+        name.startsWith("lessons.json.corrupt-"),
+      );
+      expect(aside).toHaveLength(1);
+      expect(yield* fs.readFileString(path.join(rsiDir, aside[0]!))).toBe(
+        '{"version":1,"lessons":[{"id":',
+      );
+      expect(yield* fs.readFileString(persistence.lessonsPath)).toContain("manual::fresh");
+      expect(yield* fs.exists(`${persistence.lessonsPath}.tmp`)).toBe(false);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+});
