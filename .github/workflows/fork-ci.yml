@@ -1,0 +1,139 @@
+name: Fork CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check_linux:
+    name: Linux checks and core tests
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if ! git fetch --no-tags --depth=1 origin "${{ github.sha }}"; then
+            git fetch --no-tags --depth=1 origin "${{ github.ref }}"
+          fi
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout --detach FETCH_HEAD
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install
+
+      - name: Check formatting
+        run: ./node_modules/.bin/vp run fmt:check
+
+      - name: Lint
+        run: ./node_modules/.bin/vp run lint
+
+      - name: Check unused code
+        run: ./node_modules/.bin/vp run knip:check
+
+      - name: Typecheck
+        run: ./node_modules/.bin/vp run -r --cache --concurrency-limit 4 typecheck
+
+      - name: Test contracts
+        working-directory: packages/contracts
+        run: ../../node_modules/.bin/vp test run --config ../../vite.config.ts --dir .
+
+      - name: Test provider-core
+        working-directory: packages/provider-core
+        run: ../../node_modules/.bin/vp test run --config ../../vite.config.ts --dir .
+
+      - name: Test web unit logic
+        working-directory: apps/web
+        run: ../../node_modules/.bin/vp test run src/components/settings/settingsSearch.test.ts src/components/settings/SettingsPanels.logic.test.ts src/components/settings/ConnectionsSettings.logic.test.ts src/state/rsi.test.ts src/cloud/publicConfig.test.ts
+
+      - name: Test scripts
+        working-directory: scripts
+        run: ../node_modules/.bin/vp test run --config ../vite.config.ts --dir . lib/public-config.test.ts
+
+      - name: Test server fork suites
+        working-directory: apps/server
+        run: |
+          ../../node_modules/.bin/vp test run \
+            src/cloud/publicConfig.test.ts \
+            src/provider/antigravityUsageLimits.test.ts \
+            src/provider/AgentContextBudget.test.ts \
+            src/mcp/ContextCompressionMcp.test.ts \
+            src/mcp/McpToolAccess.test.ts \
+            src/mcp/RsiMcpTools.test.ts \
+            src/orchestration-v2/RsiService.test.ts \
+            src/orchestration-v2/VerificationGate.test.ts \
+            src/orchestration-v2/LoopCircuitBreaker.test.ts \
+            src/pythonRepl/PythonRepl.test.ts \
+            src/skills/installBundledSkills.test.ts
+
+  check_windows:
+    name: Windows regression tests
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if ! git fetch --no-tags --depth=1 origin "${{ github.sha }}"; then
+            git fetch --no-tags --depth=1 origin "${{ github.ref }}"
+          fi
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout --detach FETCH_HEAD
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install
+
+      - name: Test server on Windows
+        working-directory: apps/server
+        shell: pwsh
+        run: ..\..\node_modules\.bin\vp.cmd test run src/orchestration-v2/ProviderTurnStartService.test.ts src/provider/antigravityUsageLimits.test.ts src/pythonRepl/PythonRepl.test.ts src/skills/installBundledSkills.test.ts
+
+      - name: Test ACP client terminals on Windows
+        working-directory: packages/provider-acp
+        shell: pwsh
+        run: ..\..\node_modules\.bin\vp.cmd test run --config ../../vite.config.ts --dir . src/server/clientTerminals.test.ts
+
+      - name: Test scripts on Windows
+        working-directory: scripts
+        shell: pwsh
+        run: ..\node_modules\.bin\vp.cmd test run --config ../vite.config.ts --dir . lib/public-config.test.ts
