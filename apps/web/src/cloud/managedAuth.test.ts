@@ -18,6 +18,11 @@ vi.mock("../lib/runtime", () => ({
   },
 }));
 
+// Fork: the provider mounts the customization sync coordinator, which pulls in the real runtime.
+vi.mock("../components/clerk/AccountCustomizationSyncCoordinator", () => ({
+  AccountCustomizationSyncCoordinator: () => null,
+}));
+
 vi.mock("../connection/catalog", () => ({
   environmentCatalog: {
     removeRelayEnvironments: {},
