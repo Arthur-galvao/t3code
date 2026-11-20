@@ -453,6 +453,7 @@ const makeFinalizationIntegrationFixture = (input: {
   readonly key: string;
   readonly turnItems: ReadonlyArray<OrchestrationV2TurnItem>;
   readonly status?: OrchestrationV2Run["status"];
+  readonly turnTokenUsage?: OrchestrationV2ProviderTurn["turnTokenUsage"];
 }) =>
   Effect.gen(function* () {
     const now = yield* DateTime.now;
@@ -519,7 +520,7 @@ const makeFinalizationIntegrationFixture = (input: {
         cachedInputTokens: 900,
         updatedAt: DateTime.formatIso(now),
       },
-      turnTokenUsage: {
+      turnTokenUsage: input.turnTokenUsage ?? {
         usageScope: "main_agent",
         usageStatus: "complete",
         inputTokens: 1000,
@@ -839,4 +840,16 @@ Mode LastWriteTime Length Name`,
       assert.isFalse((recorded?.failureSignature?.guidance ?? "").includes("C:\\Users\\Arthur"));
       assert.isFalse((recorded?.failureSignature?.guidance ?? "").includes("\n"));
     }),
+);
+
+it.effect("leaves spentTokens unset when the provider reported no usage counters", () =>
+  Effect.gen(function* () {
+    const result = yield* makeFinalizationIntegrationFixture({
+      key: "spend_unavailable",
+      turnItems: [],
+      turnTokenUsage: { usageScope: "main_agent", usageStatus: "unavailable", hasSubagents: false },
+    });
+    assert.strictEqual(result.telemetryInputs.length, 1);
+    assert.isUndefined(result.telemetryInputs[0]?.spentTokens);
+  }),
 );

@@ -134,7 +134,7 @@ export interface RsiRunTelemetryInput {
   readonly wastedReads: number;
   readonly outcome: string;
   readonly durationMs: number;
-  /** Input + output tokens billed across every provider turn of the run (usedTokens is context size). */
+  /** Input (incl. cache reads) + output tokens processed across the run's turns; usedTokens is context size. */
   readonly spentTokens?: number | undefined;
   readonly tokensSavedEst?: number | undefined;
   readonly compressedCallsCount?: number | undefined;
@@ -611,12 +611,13 @@ const GENERIC_ERROR_SIGNATURES = new Set([
  */
 /**
  * Lessons come from agents (`rsi_record_lesson`) and hand-edited Obsidian notes, and are
- * injected into every provider's prompt: keep each one a single line with no tag-like markup
- * that could close the `<t3_code_rsi_lessons>` block or open a new instruction block.
+ * injected into every provider's prompt: keep each one a single line, and turn tag-like markup
+ * into ‹tag› so it cannot close the `<t3_code_rsi_lessons>` block or open a new instruction block.
  */
 export function sanitizePromptLessonText(raw: string): string {
+  // Neutralize instead of delete, so `Array<string>` and `<path>` placeholders stay readable.
   return raw
-    .replace(/<\/?[a-zA-Z_][\w:.-]*(?:\s[^<>]*)?\/?>/g, " ")
+    .replace(/<(\/?[a-zA-Z_][\w:.-]*(?:\s[^<>]*)?\/?)>/g, "\u2039$1\u203a")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -1331,6 +1332,14 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         const existingContent = yield* persistence.fs
           .readFileString(filePath)
           .pipe(Effect.orElseSucceed(() => null as string | null));
+        // A note T3 did not write (or one the user edited since) is the user's: read it, never rewrite it.
+        if (
+          existingContent !== null &&
+          existingContent !== nextContent &&
+          owned.get(fileName) !== existingContent
+        ) {
+          continue;
+        }
         if (existingContent !== nextContent) {
           yield* persistence.fs.writeFileString(filePath, nextContent);
         }
@@ -1398,7 +1407,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       const nowMs = Number.isFinite(parsedNowMs) ? parsedNowMs : undefined;
       let next = [...currentLessons];
       let changed = false;
-      const owned = yield* Ref.get(ownedObsidianNotesRef);
+      const owned = new Map(yield* Ref.get(ownedObsidianNotesRef));
       const imported = new Map(yield* Ref.get(importedObsidianNotesRef));
       const fileByLessonId = new Map(yield* Ref.get(obsidianNoteFileByLessonIdRef));
       for (const fileName of markdownEntries) {
@@ -1412,6 +1421,13 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         const parsed = parseObsidianLessonMarkdown(raw, fileName, nowIso);
         if (parsed === null || isLegacyUnscopedAutoLesson(parsed)) continue;
         if (!fileByLessonId.has(parsed.id)) fileByLessonId.set(parsed.id, fileName);
+        // Byte-identical to what T3 writes for the stored lesson: an untouched T3 note (e.g. after
+        // a restart), so T3 may keep updating or removing it.
+        const stored = next.find((lesson) => lesson.id === parsed.id);
+        if (stored !== undefined && formatObsidianLessonMarkdown(stored) === raw) {
+          owned.set(fileName, raw);
+          continue;
+        }
 
         const existingIdx = next.findIndex(
           (lesson) =>
@@ -1464,6 +1480,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
 
       yield* Ref.set(obsidianNoteFileByLessonIdRef, fileByLessonId);
       yield* Ref.set(importedObsidianNotesRef, imported);
+      yield* Ref.set(ownedObsidianNotesRef, owned);
       if (changed) {
         next.sort((a, b) => lessonUtilityScore(b, nowMs) - lessonUtilityScore(a, nowMs));
       }

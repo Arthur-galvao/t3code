@@ -197,12 +197,17 @@ function summarizeRunTelemetry(input: {
       (latestTurn?.turnTokenUsage?.outputTokens ?? 0);
   const cachedInputTokens =
     latestTurn?.tokenUsage?.cachedInputTokens ?? latestTurn?.turnTokenUsage?.cachedInputTokens ?? 0;
-  // Spend, not context size: every turn of this attempt (Codex goals span several), incl. subagents.
+  // Tokens processed, not context size: every turn of this attempt (Codex goals span several),
+  // including subagents. Input counts cache reads, so this is work done, not a bill.
   let spentTokens: number | undefined;
   for (const turn of input.providerTurns) {
     const usage = turn.turnTokenUsage;
     if (usage === undefined || usage.localCommand === true) continue;
-    if (turn.runAttemptId !== input.run.activeAttemptId) continue;
+    if (input.run.activeAttemptId === null || turn.runAttemptId !== input.run.activeAttemptId) {
+      continue;
+    }
+    // "unavailable" (or a partial turn with no counters) is unknown, not zero.
+    if (usage.inputTokens === undefined && usage.outputTokens === undefined) continue;
     spentTokens =
       (spentTokens ?? 0) +
       (usage.inputTokens ?? 0) +
