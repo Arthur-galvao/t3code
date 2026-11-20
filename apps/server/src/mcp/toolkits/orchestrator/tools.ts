@@ -501,6 +501,45 @@ const RsiTelemetrySummaryTool = Tool.make("rsi_telemetry_summary", {
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true);
 
+const MemorySearchTool = Tool.make("memory_search", {
+  description:
+    "Search saved memory for this project and global notes: memory_write notes, Claude memory, RSI lessons.",
+  parameters: Schema.Struct({ query: Schema.String, limit: Schema.optional(Schema.Int) }),
+  success: Schema.Struct({
+    hits: Schema.Array(
+      Schema.Struct({
+        source: Schema.String,
+        title: Schema.String,
+        snippet: Schema.String,
+        path: Schema.optional(Schema.String),
+      }),
+    ),
+  }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Search memory")
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
+const MemoryWriteTool = Tool.make("memory_write", {
+  description:
+    "Save or update a durable fact as a markdown note (same title updates it). global:true for all projects.",
+  parameters: Schema.Struct({
+    title: Schema.String,
+    content: Schema.String,
+    global: Schema.optional(Schema.Boolean),
+  }),
+  success: Schema.Struct({ path: Schema.String, title: Schema.String }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Write memory note")
+  .annotate(Tool.Destructive, false);
+
 const ContextRetrieveInput = Schema.Struct({
   ccrId: Schema.String,
   threadId: Schema.optional(Schema.String),
@@ -565,5 +604,7 @@ export const OrchestratorToolkit = Toolkit.make(
   RsiQueryLessonsTool,
   RsiRecordLessonTool,
   RsiTelemetrySummaryTool,
+  MemorySearchTool,
+  MemoryWriteTool,
   ContextRetrieveTool,
 );

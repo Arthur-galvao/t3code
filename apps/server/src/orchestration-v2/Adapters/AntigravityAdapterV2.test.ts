@@ -2552,6 +2552,7 @@ describe("AntigravityAdapterV2 session system prompt", () => {
           assert.include(sent, "<pull_request_linking>");
         }
         assert.include(sent, "<output_shaper>");
+        assert.include(sent, "memory_search");
       }).pipe(Effect.provide(layerSession)),
   );
 

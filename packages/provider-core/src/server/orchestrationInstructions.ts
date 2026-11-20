@@ -69,7 +69,7 @@ export const T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH = deviceToolInstr
 
 /** Session-invariant terseness, prompt-distillation, and Tailscale preview instructions when output shaper is enabled. */
 export const T3_CODE_OUTPUT_SHAPER_INSTRUCTIONS = `<output_shaper>
-Lead with answer/diff; no filler; terse bullets + file:line. Spec vague/non-English prompts in English (reply in user's lang); <=3 short Qs if unclear. Call \`context_retrieve\` for \`[T3 CCR:...]\`. If Tailscale up, publish previews via \`tailscale serve --bg --https=<p> http://127.0.0.1:<p>\` (never 443, never \`funnel\`), verify & send \`.ts.net\` URL.
+Lead with answer/diff; no filler; terse bullets + file:line. Spec vague/non-English prompts in English (reply in user's lang); <=3 Qs if unclear. \`context_retrieve\` for \`[T3 CCR:...]\`; \`memory_search\`/\`memory_write\` for facts. Tailscale up: preview via \`tailscale serve --bg --https=<p> http://127.0.0.1:<p>\` (not 443, never \`funnel\`), verify, send \`.ts.net\` URL.
 </output_shaper>`;
 
 export interface TechnicalPromptSpec {

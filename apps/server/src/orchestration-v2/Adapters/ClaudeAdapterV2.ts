@@ -2799,6 +2799,7 @@ export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
   "mcp__t3-code__t3_environment_links",
   "mcp__t3-code__rsi_query_lessons",
   "mcp__t3-code__rsi_telemetry_summary",
+  "mcp__t3-code__memory_search",
   "mcp__t3-code__context_retrieve",
   "mcp__t3-code__t3_theme_read",
   "mcp__t3-code__html_preview",

@@ -124,6 +124,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import type { MemoryHit } from "../memory/MemoryNotes.ts";
 import * as RsiService from "../orchestration-v2/RsiService.ts";
 import {
   clientModeCeiling,
@@ -258,6 +259,18 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: CcrRetrieveInput,
   ) => Effect.Effect<CcrRetrieveResult, OrchestratorMcpFailure>;
+  readonly memorySearch: (
+    scope: McpInvocationScope,
+    input: { readonly query: string; readonly limit?: number | undefined },
+  ) => Effect.Effect<{ readonly hits: ReadonlyArray<MemoryHit> }, OrchestratorMcpFailure>;
+  readonly memoryWrite: (
+    scope: McpInvocationScope,
+    input: {
+      readonly title: string;
+      readonly content: string;
+      readonly global?: boolean | undefined;
+    },
+  ) => Effect.Effect<{ readonly path: string; readonly title: string }, OrchestratorMcpFailure>;
 }
 
 export class OrchestratorMcpService extends Context.Service<
@@ -1436,6 +1449,27 @@ const make = Effect.gen(function* () {
       },
     } as const;
   });
+
+  // Memory is scoped to the caller thread's project root (not its worktree, so worktrees share it).
+  const callerProjectRoot = (scope: McpInvocationScope) =>
+    scope.thread === undefined
+      ? Effect.undefined
+      : threadManagement.getThreadShell(scope.thread.threadId).pipe(
+          Effect.flatMap((shell) =>
+            shell === null || shell.projectId === undefined
+              ? Effect.undefined
+              : projects
+                  .getById(shell.projectId)
+                  .pipe(
+                    Effect.map((project) =>
+                      Option.getOrUndefined(
+                        Option.map(project, ({ workspaceRoot }) => workspaceRoot),
+                      ),
+                    ),
+                  ),
+          ),
+          Effect.orElseSucceed(() => undefined),
+        );
 
   const loadThreadCaller = Effect.fn("OrchestratorMcpService.loadThreadCaller")(function* (
     scope: McpInvocationScope,
@@ -3828,6 +3862,22 @@ const make = Effect.gen(function* () {
         return yield* rsi.getTelemetrySummary(input);
       },
     ),
+    memorySearch: Effect.fn("OrchestratorMcpService.memorySearch")(function* (scope, input) {
+      if (input.query.trim() === "") {
+        return yield* failure("invalid_request", "Memory query must be non-empty.");
+      }
+      const rsi = yield* resolveRsiService();
+      const projectRoot = yield* callerProjectRoot(scope);
+      const hits = yield* rsi.searchMemory({ query: input.query, limit: input.limit, projectRoot });
+      return { hits };
+    }),
+    memoryWrite: Effect.fn("OrchestratorMcpService.memoryWrite")(function* (scope, input) {
+      const rsi = yield* resolveRsiService();
+      const projectRoot = input.global === true ? undefined : yield* callerProjectRoot(scope);
+      return yield* rsi
+        .writeMemory({ title: input.title, content: input.content, projectRoot })
+        .pipe(Effect.mapError((error) => failure("invalid_request", error.message)));
+    }),
     contextRetrieve: Effect.fn("OrchestratorMcpService.contextRetrieve")(function* (scope, input) {
       if (input.ccrId.trim() === "") {
         return yield* failure("invalid_request", "CCR ID must be non-empty.");

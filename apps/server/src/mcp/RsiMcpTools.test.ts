@@ -47,6 +47,8 @@ describe("RSI MCP tools", () => {
     assert.isDefined(OrchestratorToolkit.tools.rsi_query_lessons);
     assert.isDefined(OrchestratorToolkit.tools.rsi_record_lesson);
     assert.isDefined(OrchestratorToolkit.tools.rsi_telemetry_summary);
+    assert.isDefined(OrchestratorToolkit.tools.memory_search);
+    assert.isDefined(OrchestratorToolkit.tools.memory_write);
   });
 
   const threadManagementMock = Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -134,6 +136,23 @@ describe("RSI MCP tools", () => {
         .rsiRecordLesson(scope, { title: "   ", guidance: "   " })
         .pipe(Effect.flip);
       assert.equal(failure.code, "invalid_request");
+
+      // memory_search ranks RSI lessons alongside notes even without a notes folder.
+      const memoryOpt = yield* Stream.runHead(
+        yield* toolkit.handle("memory_search", { query: "schema budget" }),
+      );
+      assert.isTrue(Option.isSome(memoryOpt));
+      if (Option.isNone(memoryOpt)) return;
+      assert.isFalse(memoryOpt.value.isFailure);
+      const memoryResult = memoryOpt.value.result;
+      assert.isTrue("hits" in memoryResult);
+      if (!("hits" in memoryResult)) return;
+      assert.equal(memoryResult.hits[0]?.title, "Keep MCP tool schemas concise");
+      assert.equal(memoryResult.hits[0]?.source, "rsi-lesson");
+      const writeFailure = yield* service
+        .memoryWrite(scope, { title: "x", content: "y" })
+        .pipe(Effect.flip);
+      assert.equal(writeFailure.code, "invalid_request");
     }).pipe(
       Effect.provide(
         McpToolAccess.HandlersLayer.layer(OrchestratorHandlers.layer).pipe(

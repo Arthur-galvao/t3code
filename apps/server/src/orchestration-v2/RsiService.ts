@@ -8,7 +8,10 @@ import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 
+import * as HostProcess from "@t3tools/shared/HostProcess";
+
 import * as ServerConfig from "../config.ts";
+import * as MemoryNotes from "../memory/MemoryNotes.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import {
   type CcrStats,
@@ -263,6 +266,20 @@ export interface RsiServiceShape {
   readonly getAppliedLessonIds: (
     input: RsiAppliedLessonsLookupInput,
   ) => Effect.Effect<ReadonlyArray<string>>;
+  /** Notes, the project's Claude memory and RSI lessons, ranked together (MemoryNotes.ts). */
+  readonly searchMemory: (input: {
+    readonly query: string;
+    readonly limit?: number | undefined;
+    readonly projectRoot?: string | undefined;
+  }) => Effect.Effect<ReadonlyArray<MemoryNotes.MemoryHit>>;
+  readonly writeMemory: (input: {
+    readonly title: string;
+    readonly content: string;
+    readonly projectRoot?: string | undefined;
+  }) => Effect.Effect<
+    { readonly path: string; readonly title: string },
+    MemoryNotes.MemoryWriteError
+  >;
 }
 
 function clampConfidence(value: number): number {
@@ -887,6 +904,8 @@ interface PersistenceHandles {
   readonly lessonsPath: string;
   readonly telemetryPath: string;
   readonly resolveObsidianBrainDir?: () => Effect.Effect<string | null>;
+  /** `~/.claude/projects`; the caller project's `<encoded cwd>/memory` is searched read-only. */
+  readonly claudeProjectsDir?: string | undefined;
 }
 
 function parseLessonsFileWithStats(raw: string): {
@@ -2569,7 +2588,79 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     return yield* resolveTrackedLessonIds(lookupInput, false);
   });
 
+  const memoryNotesDir = Effect.fn("RsiService.memoryNotesDir")(function* () {
+    if (persistence === undefined) return undefined;
+    const brainDir = yield* persistence.resolveObsidianBrainDir?.() ?? Effect.succeed(null);
+    // A sibling of Lessons/: notes there are recalled on demand, never injected into prompts.
+    return brainDir === null || brainDir.trim() === ""
+      ? persistence.path.join(persistence.rsiDir, "memory")
+      : persistence.path.join(brainDir, "Memory");
+  });
+
+  const searchMemory: RsiServiceShape["searchMemory"] = Effect.fn("RsiService.searchMemory")(
+    function* (memoryInput) {
+      const lessons = yield* queryLessons({ cwd: memoryInput.projectRoot, limit: MAX_LESSONS });
+      const docs: Array<MemoryNotes.MemoryDoc> = lessons.map((lesson) => ({
+        source: "rsi-lesson",
+        title: lesson.title,
+        body: `${lesson.guidance}\n${lesson.triggerCondition}`,
+      }));
+      const notesDir = yield* memoryNotesDir();
+      if (persistence !== undefined && notesDir !== undefined) {
+        const claudeMemoryDir =
+          persistence.claudeProjectsDir === undefined || memoryInput.projectRoot === undefined
+            ? undefined
+            : persistence.path.join(
+                persistence.claudeProjectsDir,
+                MemoryNotes.claudeProjectDirName(memoryInput.projectRoot),
+                "memory",
+              );
+        docs.push(
+          ...(yield* MemoryNotes.collectMemoryDocs({
+            fs: persistence.fs,
+            path: persistence.path,
+            notesDir,
+            claudeMemoryDir,
+            projectRoot: memoryInput.projectRoot,
+          })),
+        );
+      }
+      return MemoryNotes.searchMemoryDocs(docs, memoryInput.query, memoryInput.limit);
+    },
+  );
+
+  const writeMemory: RsiServiceShape["writeMemory"] = Effect.fn("RsiService.writeMemory")(
+    function* (memoryInput) {
+      const notesDir = yield* memoryNotesDir();
+      if (persistence === undefined || notesDir === undefined) {
+        return yield* new MemoryNotes.MemoryWriteError({
+          message: "Memory notes are unavailable.",
+        });
+      }
+      return yield* MemoryNotes.writeMemoryNote({
+        fs: persistence.fs,
+        path: persistence.path,
+        notesDir,
+        title: memoryInput.title,
+        content: memoryInput.content,
+        projectRoot: memoryInput.projectRoot,
+        nowIso: DateTime.formatIso(yield* DateTime.now),
+      }).pipe(
+        Effect.catchTags({
+          PlatformError: (cause) =>
+            Effect.fail(
+              new MemoryNotes.MemoryWriteError({
+                message: `Could not write the memory note: ${cause.message}`,
+              }),
+            ),
+        }),
+      );
+    },
+  );
+
   return {
+    searchMemory,
+    writeMemory,
     recordRunTelemetry,
     queryLessons,
     recordLesson,
@@ -2589,6 +2680,8 @@ const makeLayerEffect = Effect.fn("RsiService.makeLayer")(function* (options?: {
   const fsOpt = yield* Effect.serviceOption(FileSystem.FileSystem);
   const pathOpt = yield* Effect.serviceOption(Path.Path);
   const settingsOpt = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
+  const homeDirectory = yield* HostProcess.HomeDirectory;
+  const claudeConfigDir = (yield* HostProcess.Environment).CLAUDE_CONFIG_DIR?.trim();
 
   const persistence: PersistenceHandles | undefined =
     Option.isSome(configOpt) &&
@@ -2631,6 +2724,10 @@ const makeLayerEffect = Effect.fn("RsiService.makeLayer")(function* (options?: {
             lessonsPath: pathOpt.value.join(rsiDir, "lessons.json"),
             telemetryPath: pathOpt.value.join(rsiDir, "telemetry.jsonl"),
             resolveObsidianBrainDir,
+            claudeProjectsDir: pathOpt.value.join(
+              claudeConfigDir || pathOpt.value.join(homeDirectory, ".claude"),
+              "projects",
+            ),
           };
         })()
       : undefined;

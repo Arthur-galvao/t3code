@@ -259,6 +259,20 @@ const handlers = {
       return yield* service.rsiTelemetrySummary(scope, input);
     }),
   ),
+  memory_search: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      return yield* service.memorySearch(scope, input);
+    }),
+  ),
+  memory_write: McpToolAccess.writes((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      return yield* service.memoryWrite(scope, input);
+    }),
+  ),
   context_retrieve: McpToolAccess.reads((input) =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;
