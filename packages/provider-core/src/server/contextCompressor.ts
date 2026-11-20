@@ -1620,7 +1620,60 @@ function formatCcrFooter(input: {
   return `[T3 CCR:${input.ccrId} (${input.contentType}): ${input.originalChars} -> ${input.compressedChars} chars (~${tokensSavedEst} tok saved) | call context_retrieve(ccrId="${input.ccrId}") for exact lines/search]`;
 }
 
+/**
+ * MCP tools often return `{"output": "<multi-line text>"}` or `[{"type":"text","text":...}]`.
+ * Compressed as JSON, that is one long string cut mid-line; return the text inside when it is
+ * nearly the whole payload, so heads/tails and line-ranged retrieval stay line-aware.
+ */
+export function unwrapJsonTextPayload(text: string): string | undefined {
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+  let inner: string | undefined;
+  if (Array.isArray(parsed)) {
+    const texts = parsed.map((block) =>
+      block !== null &&
+      typeof block === "object" &&
+      (block as { type?: unknown }).type === "text" &&
+      typeof (block as { text?: unknown }).text === "string"
+        ? (block as { text: string }).text
+        : undefined,
+    );
+    if (texts.length > 0 && texts.every((value) => value !== undefined)) inner = texts.join("\n");
+  } else if (parsed !== null && typeof parsed === "object") {
+    const strings = Object.values(parsed).filter((value) => typeof value === "string");
+    inner = strings.length === 1 ? strings[0] : undefined;
+  }
+  if (inner === undefined || !inner.includes("\n")) return undefined;
+  return inner.length >= text.length * 0.8 ? inner : undefined;
+}
+
 export function compressToolOutput(input: CompressToolOutputInput): CompressToolOutputResult {
+  const inner = unwrapJsonTextPayload(input.text);
+  if (inner !== undefined) {
+    const innerResult = compressToolOutput({ ...input, text: inner, contentTypeHint: undefined });
+    if (!innerResult.compressed) {
+      // The text inside is small or incompressible; cutting the JSON around it would only lose it.
+      return {
+        ...innerResult,
+        text: input.text,
+        originalChars: input.text.length,
+        compressedChars: input.text.length,
+      };
+    }
+    const savedChars = input.text.length - innerResult.compressedChars;
+    return {
+      ...innerResult,
+      originalChars: input.text.length,
+      savedChars,
+      tokensSavedEst: Math.round(savedChars / 4),
+    };
+  }
   const originalChars = input.text.length;
   const minChars = input.minChars ?? DEFAULT_MIN_CHARS;
   const commandHint = resolveCommandHint(input.command, input.sourceLabel);

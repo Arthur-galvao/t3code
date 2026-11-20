@@ -8,6 +8,7 @@ import {
   normalizeTerminalText,
   stripAnsi,
   stripLineNumberPrefix,
+  unwrapJsonTextPayload,
 } from "./contextCompressor.ts";
 
 describe("detectContentType", () => {
@@ -633,5 +634,42 @@ describe("compressToolOutput", () => {
       store,
     });
     assert.notInclude(pnpmLsRes.text, "files):");
+  });
+});
+
+describe("JSON-wrapped text payloads", () => {
+  const lines = Array.from(
+    { length: 120 },
+    (_, i) => `row ${i}: value=${i * 7} status=ok path=apps/server/src/file${i}.ts`,
+  );
+
+  it("unwraps a dominant string field or MCP text blocks, and nothing else", () => {
+    const body = `${lines.join("\n")}\n`;
+    assert.equal(unwrapJsonTextPayload(JSON.stringify({ output: body })), body);
+    assert.equal(unwrapJsonTextPayload(JSON.stringify([{ type: "text", text: body }])), body);
+    assert.isUndefined(unwrapJsonTextPayload(JSON.stringify({ a: body, b: "x" })));
+    assert.isUndefined(unwrapJsonTextPayload(JSON.stringify({ rows: lines })));
+    assert.isUndefined(unwrapJsonTextPayload("plain text\nwith lines"));
+  });
+
+  it("compresses the text inside line-by-line and stores it for line retrieval", () => {
+    const store = createCcrStore();
+    const text = JSON.stringify({ output: `${lines.join("\n")}\n` });
+    const result = compressToolOutput({ text, sourceLabel: "mcp__x__tool", minChars: 3000, store });
+    assert.isTrue(result.compressed);
+    assert.equal(result.contentType, "text");
+    assert.equal(result.originalChars, text.length);
+    assert.include(result.text, "row 0: value=0 status=ok");
+    assert.include(result.text, "row 119: value=833 status=ok");
+    assert.notInclude(result.text, "\\n");
+    const entry = store.retrieve({ ccrId: result.ccrId!, startLine: 60, endLine: 60 });
+    assert.include(JSON.stringify(entry), "row 59: value=413");
+  });
+
+  it("leaves a JSON payload alone when the text inside is below the threshold", () => {
+    const small = JSON.stringify({ output: `${lines.slice(0, 30).join("\n")}\n` });
+    const result = compressToolOutput({ text: small, minChars: 3000, store: createCcrStore() });
+    assert.isFalse(result.compressed);
+    assert.equal(result.text, small);
   });
 });
