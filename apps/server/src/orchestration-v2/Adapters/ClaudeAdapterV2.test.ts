@@ -6134,7 +6134,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     );
 
     it.effect(
-      "exempts ranged Read calls, extracts CommandLine hints, and applies 6k thresholds to code Read and python",
+      "exempts ranged Read calls, extracts CommandLine hints, and applies 6k thresholds to code Read and leaves python to the REPL",
       () =>
         Effect.gen(function* () {
           const harness = yield* makeWakeHarness;
@@ -6263,31 +6263,18 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.isString(compressedReadLog);
           assert.include(compressedReadLog as string, "[T3 CCR:");
 
-          // Python MCP uses 6,000-char threshold.
-          const mediumPythonOut = Array.from(
-            { length: 120 },
-            (_, i) => `row=${i} value=alpha_beta_gamma_delta_epsilon`,
-          ).join("\n");
-          assert.isAbove(mediumPythonOut.length, 3_000);
-          assert.isBelow(mediumPythonOut.length, 6_000);
-          assert.deepEqual(
-            yield* Effect.promise(() =>
-              evalPostToolUse("mcp__t3-code__python", { code: "print()" }, mediumPythonOut),
-            ),
-            {},
-          );
+          // Python REPL output is left to PythonRepl's own 30k cap, even above 6k chars.
           const largePythonOut = Array.from(
             { length: 240 },
             (_, i) => `row=${i} value=alpha_beta_gamma_delta_epsilon`,
           ).join("\n");
           assert.isAbove(largePythonOut.length, 6_000);
-          const compressedPythonOut = updatedOf(
+          assert.deepEqual(
             yield* Effect.promise(() =>
               evalPostToolUse("mcp__t3-code__python", { code: "print()" }, largePythonOut),
             ),
+            {},
           );
-          assert.isString(compressedPythonOut);
-          assert.include(compressedPythonOut as string, "[T3 CCR:");
 
           // run_command with CommandLine extracts git show/diff hint even when diff markers appear after 4 KiB.
           const largeDiff = [

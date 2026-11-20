@@ -2257,7 +2257,6 @@ const subagentDeviceInstructions: HookCallback = () =>
 
 const CLAUDE_POST_TOOL_USE_MIN_CHARS = 3_000;
 const CLAUDE_CODE_READ_MIN_CHARS = 6_000;
-const CLAUDE_PYTHON_REPL_MIN_CHARS = 6_000;
 const CLAUDE_CCR_MARKER = "[T3 CCR:";
 const CLAUDE_RANGED_READ_KEYS = [
   "offset",
@@ -2315,9 +2314,6 @@ function isPythonReplTool(toolName: string): boolean {
 }
 
 function resolveClaudePostToolUseMinChars(toolName: string, toolInput: unknown): number {
-  if (isPythonReplTool(toolName)) {
-    return CLAUDE_PYTHON_REPL_MIN_CHARS;
-  }
   if (isFileReadTool(toolName)) {
     const filePath = extractPathFromToolInput(toolInput);
     const lowerPath = filePath?.trim().toLowerCase().split(/[?#]/)[0] ?? "";
@@ -2419,7 +2415,13 @@ function evaluateClaudePostToolUseCompression(input: {
     return {};
   }
   const toolName = input.hookInput.tool_name;
-  if (isContextRetrieveTool(toolName) || isRangedFileRead(toolName, input.hookInput.tool_input)) {
+  // The REPL caps and CCR-compresses its own output for every provider (PythonRepl.ts); the agent
+  // chose what to print, so a second, Claude-only pass would only cut the part it asked for.
+  if (
+    isContextRetrieveTool(toolName) ||
+    isPythonReplTool(toolName) ||
+    isRangedFileRead(toolName, input.hookInput.tool_input)
+  ) {
     return {};
   }
   const text = extractClaudePostToolUseText(input.hookInput.tool_response);
