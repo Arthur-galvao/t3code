@@ -227,6 +227,9 @@ export function t3OrchestrationPrompt(input: {
   readonly orchestrationDelivered: boolean;
   readonly deviceInstructionsDelivered: boolean;
   readonly rsiPrefix?: string | undefined;
+  /** Guidance for this provider's own tools, sent until `providerInstructionsDelivered`. */
+  readonly providerInstructions?: string;
+  readonly providerInstructionsDelivered?: boolean;
 }): string {
   if (!input.hasT3Mcp) {
     return withSessionRsiLessonsPrefix({
@@ -235,17 +238,19 @@ export function t3OrchestrationPrompt(input: {
       isNewSession: !input.orchestrationDelivered,
     });
   }
-  if (!input.orchestrationDelivered) {
-    const rsiBlock = formatRsiLessonsBlock(input.rsiPrefix);
-    const instructions =
-      rsiBlock === undefined
-        ? orchestrationInstructions(input.hasDeviceTools)
-        : `${orchestrationInstructions(input.hasDeviceTools).trim()}\n\n${rsiBlock}`;
-    return prependT3OrchestrationInstructions(input.prompt, instructions);
-  }
-  return input.hasDeviceTools && !input.deviceInstructionsDelivered
-    ? prependT3OrchestrationInstructions(input.prompt, T3_CODE_DEVICE_TOOL_INSTRUCTIONS)
-    : input.prompt;
+  const instructions = [
+    !input.orchestrationDelivered
+      ? orchestrationInstructions(input.hasDeviceTools)
+      : input.hasDeviceTools && !input.deviceInstructionsDelivered
+        ? T3_CODE_DEVICE_TOOL_INSTRUCTIONS
+        : undefined,
+    // Session-start RSI lessons ride with the first orchestration delivery (KV-cache safe).
+    input.orchestrationDelivered ? undefined : formatRsiLessonsBlock(input.rsiPrefix),
+    input.providerInstructionsDelivered === true ? undefined : input.providerInstructions,
+  ].flatMap((part) => (part === undefined ? [] : [part.trim()]));
+  return instructions.length === 0
+    ? input.prompt
+    : prependT3OrchestrationInstructions(input.prompt, instructions.join("\n\n"));
 }
 
 export function t3OrchestrationSystemPrompt(
