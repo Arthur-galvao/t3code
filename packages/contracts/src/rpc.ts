@@ -2289,6 +2289,7 @@ export const RsiRunTelemetryRecord = Schema.Struct({
   wastedReads: Schema.Number,
   outcome: Schema.String,
   durationMs: Schema.Number,
+  spentTokens: Schema.optional(Schema.Number),
   tokensSavedEst: Schema.optional(Schema.Number),
   compressedCallsCount: Schema.optional(Schema.Number),
   timestamp: Schema.String,
@@ -2302,6 +2303,7 @@ export const RsiProviderTelemetryBreakdown = Schema.Struct({
   loopTrips: Schema.Number,
   safetyBlocks: Schema.Number,
   avgCacheHitRate: Schema.Number,
+  avgSpentTokens: Schema.optional(Schema.Number),
 });
 export type RsiProviderTelemetryBreakdown = typeof RsiProviderTelemetryBreakdown.Type;
 
@@ -2317,6 +2319,7 @@ export const RsiTelemetrySummary = Schema.Struct({
   totalCachedInputTokens: Schema.Number,
   totalTokensSavedEst: Schema.Number,
   totalCompressedCalls: Schema.Number,
+  totalSpentTokens: Schema.optional(Schema.Number),
   avgCacheHitRate: Schema.Number,
   avgDurationMs: Schema.Number,
   byProvider: Schema.Array(RsiProviderTelemetryBreakdown),

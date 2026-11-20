@@ -962,6 +962,7 @@ function RsiObservabilityDiagnostics({
               gt("Failures"),
               gt("Trips / Blocks"),
               gt("Cache Hit Rate"),
+              gt("Avg Tokens / Run"),
             ]}
           >
             {telemetry.byProvider.map((entry) => (
@@ -978,8 +979,11 @@ function RsiObservabilityDiagnostics({
                 <td className="px-4 py-2.5 align-middle font-mono tabular-nums">
                   {formatCount(entry.loopTrips)} / {formatCount(entry.safetyBlocks)}
                 </td>
-                <td className="px-4 py-2.5 align-middle font-mono tabular-nums last:sm:pr-5">
+                <td className="px-4 py-2.5 align-middle font-mono tabular-nums">
                   {formatPercent(entry.avgCacheHitRate, 1)}
+                </td>
+                <td className="px-4 py-2.5 align-middle font-mono tabular-nums last:sm:pr-5">
+                  {entry.avgSpentTokens === undefined ? "n/a" : formatTokens(entry.avgSpentTokens)}
                 </td>
               </tr>
             ))}

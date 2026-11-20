@@ -197,6 +197,19 @@ function summarizeRunTelemetry(input: {
       (latestTurn?.turnTokenUsage?.outputTokens ?? 0);
   const cachedInputTokens =
     latestTurn?.tokenUsage?.cachedInputTokens ?? latestTurn?.turnTokenUsage?.cachedInputTokens ?? 0;
+  // Spend, not context size: every turn of this attempt (Codex goals span several), incl. subagents.
+  let spentTokens: number | undefined;
+  for (const turn of input.providerTurns) {
+    const usage = turn.turnTokenUsage;
+    if (usage === undefined || usage.localCommand === true) continue;
+    if (turn.runAttemptId !== input.run.activeAttemptId) continue;
+    spentTokens =
+      (spentTokens ?? 0) +
+      (usage.inputTokens ?? 0) +
+      (usage.outputTokens ?? 0) +
+      (usage.otherUsage?.inputTokens ?? 0) +
+      (usage.otherUsage?.outputTokens ?? 0);
+  }
 
   let toolErrorCount = 0;
   let safetyBlockedCount = 0;
@@ -321,6 +334,7 @@ function summarizeRunTelemetry(input: {
     wastedReads,
     outcome: input.run.status,
     durationMs,
+    ...(spentTokens !== undefined ? { spentTokens } : {}),
     ...(input.cwd !== undefined && input.cwd.trim() !== "" ? { cwd: input.cwd.trim() } : {}),
     ...(failureSignature !== undefined ? { failureSignature } : {}),
     ...(editedFiles.length > 0 ? { editedFiles } : {}),

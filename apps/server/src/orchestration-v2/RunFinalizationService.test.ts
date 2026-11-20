@@ -519,6 +519,14 @@ const makeFinalizationIntegrationFixture = (input: {
         cachedInputTokens: 900,
         updatedAt: DateTime.formatIso(now),
       },
+      turnTokenUsage: {
+        usageScope: "main_agent",
+        usageStatus: "complete",
+        inputTokens: 1000,
+        outputTokens: 200,
+        hasSubagents: true,
+        otherUsage: { inputTokens: 50, outputTokens: 5 },
+      },
       model: "gpt-5.4",
     };
 
@@ -626,6 +634,8 @@ it.effect(
       assert.strictEqual(result.telemetryInputs.length, 1);
       assert.strictEqual(result.telemetryInputs[0]?.cwd, "/repo");
       assert.strictEqual(result.telemetryInputs[0]?.usedTokens, 1200);
+      // Spend counts the main agent plus subagents, separately from context size.
+      assert.strictEqual(result.telemetryInputs[0]?.spentTokens, 1255);
       assert.strictEqual(result.telemetryInputs[0]?.cachedInputTokens, 900);
       assert.strictEqual(result.telemetryInputs[0]?.durationMs, 2000);
       assert.strictEqual(result.telemetryInputs[0]?.outcome, "completed");

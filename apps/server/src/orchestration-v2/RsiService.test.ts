@@ -1883,3 +1883,33 @@ describe("RsiService lesson quality", () => {
     }),
   );
 });
+
+describe("RsiService spend telemetry", () => {
+  it.effect("averages spent tokens per provider only over runs that reported spend", () =>
+    Effect.gen(function* () {
+      const rsi = yield* makeRsiService();
+      const base = {
+        threadId: "t-spend",
+        model: "m",
+        usedTokens: 500_000,
+        cachedInputTokens: 0,
+        toolErrorCount: 0,
+        loopTripped: false,
+        safetyBlockedCount: 0,
+        wastedReads: 0,
+        outcome: "completed",
+        durationMs: 1,
+      };
+      yield* rsi.recordRunTelemetry({ ...base, runId: "s1", provider: "a", spentTokens: 1000 });
+      yield* rsi.recordRunTelemetry({ ...base, runId: "s2", provider: "a", spentTokens: 3000 });
+      yield* rsi.recordRunTelemetry({ ...base, runId: "s3", provider: "a" });
+      yield* rsi.recordRunTelemetry({ ...base, runId: "s4", provider: "b" });
+      const summary = yield* rsi.getTelemetrySummary();
+      expect(summary.totalSpentTokens).toBe(4000);
+      const byProvider = new Map(summary.byProvider.map((entry) => [entry.provider, entry]));
+      expect(byProvider.get("a")?.avgSpentTokens).toBe(2000);
+      expect(byProvider.get("b")?.avgSpentTokens).toBeUndefined();
+      expect(summary.recentRuns.find((row) => row.runId === "s1")?.spentTokens).toBe(1000);
+    }),
+  );
+});

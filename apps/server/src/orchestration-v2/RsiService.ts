@@ -134,6 +134,8 @@ export interface RsiRunTelemetryInput {
   readonly wastedReads: number;
   readonly outcome: string;
   readonly durationMs: number;
+  /** Input + output tokens billed across every provider turn of the run (usedTokens is context size). */
+  readonly spentTokens?: number | undefined;
   readonly tokensSavedEst?: number | undefined;
   readonly compressedCallsCount?: number | undefined;
   readonly failureSignature?: RsiRunFailureSignature | undefined;
@@ -159,6 +161,7 @@ export interface RsiRunTelemetryRecord {
   readonly wastedReads: number;
   readonly outcome: string;
   readonly durationMs: number;
+  readonly spentTokens?: number | undefined;
   readonly tokensSavedEst?: number | undefined;
   readonly compressedCallsCount?: number | undefined;
   readonly failureKey?: string | undefined;
@@ -172,6 +175,8 @@ export interface RsiProviderTelemetryBreakdown {
   readonly loopTrips: number;
   readonly safetyBlocks: number;
   readonly avgCacheHitRate: number;
+  /** Mean spentTokens over this provider's runs that reported it; absent when none did. */
+  readonly avgSpentTokens?: number;
 }
 
 export interface RsiTelemetrySummaryInput {
@@ -192,6 +197,7 @@ export interface RsiTelemetrySummary {
   readonly totalCachedInputTokens: number;
   readonly totalTokensSavedEst: number;
   readonly totalCompressedCalls: number;
+  readonly totalSpentTokens: number;
   readonly avgCacheHitRate: number;
   readonly avgDurationMs: number;
   readonly byProvider: ReadonlyArray<RsiProviderTelemetryBreakdown>;
@@ -1935,6 +1941,9 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           wastedReads: Math.floor(clampNonNegativeNumber(telemetryInput.wastedReads)),
           outcome: telemetryInput.outcome,
           durationMs: Math.round(clampNonNegativeNumber(telemetryInput.durationMs)),
+          ...(telemetryInput.spentTokens !== undefined
+            ? { spentTokens: Math.round(clampNonNegativeNumber(telemetryInput.spentTokens)) }
+            : {}),
           ...(resolvedTokensSavedEst !== undefined
             ? { tokensSavedEst: resolvedTokensSavedEst }
             : {}),
@@ -2325,6 +2334,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     let totalCompressedCalls = 0;
     let cacheHitRateSum = 0;
     let durationSum = 0;
+    let totalSpentTokens = 0;
 
     const byProviderMap = new Map<
       string,
@@ -2334,6 +2344,8 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         loopTrips: number;
         safetyBlocks: number;
         cacheRateSum: number;
+        spentSum: number;
+        spentRuns: number;
       }
     >();
 
@@ -2356,8 +2368,15 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         loopTrips: 0,
         safetyBlocks: 0,
         cacheRateSum: 0,
+        spentSum: 0,
+        spentRuns: 0,
       };
       existing.runs += 1;
+      if (row.spentTokens !== undefined) {
+        existing.spentSum += row.spentTokens;
+        existing.spentRuns += 1;
+        totalSpentTokens += row.spentTokens;
+      }
       if (isFailureOutcome(row.outcome)) existing.failures += 1;
       if (row.loopTripped) existing.loopTrips += 1;
       existing.safetyBlocks += row.safetyBlockedCount;
@@ -2405,6 +2424,9 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       safetyBlocks: stats.safetyBlocks,
       avgCacheHitRate:
         stats.runs > 0 ? Math.round((stats.cacheRateSum / stats.runs) * 10_000) / 10_000 : 0,
+      ...(stats.spentRuns > 0
+        ? { avgSpentTokens: Math.round(stats.spentSum / stats.spentRuns) }
+        : {}),
     }));
 
     return {
@@ -2419,6 +2441,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       totalCachedInputTokens,
       totalTokensSavedEst,
       totalCompressedCalls,
+      totalSpentTokens,
       avgCacheHitRate:
         totalRuns > 0 ? Math.round((cacheHitRateSum / totalRuns) * 10_000) / 10_000 : 0,
       avgDurationMs: totalRuns > 0 ? Math.round(durationSum / totalRuns) : 0,
