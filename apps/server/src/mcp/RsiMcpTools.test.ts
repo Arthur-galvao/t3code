@@ -9,6 +9,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ServerConfig from "../config.ts";
 import * as RsiService from "../orchestration-v2/RsiService.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
@@ -267,13 +268,13 @@ describe("memory MCP tools scoped to the caller's project", () => {
           content: "Deploy with the release workflow.",
         });
         expect(yield* fs.readFileString(written.path)).toContain(
-          `projectRoot: ${JSON.stringify(roots["thread:repo-a"])}`,
+          `  projectRoot: ${JSON.stringify(roots["thread:repo-a"])}`,
         );
         const fromA = yield* service.memorySearch(scopeFor("thread:repo-a"), { query: "deploy" });
-        expect(fromA.hits.map((hit) => hit.title)).toEqual(["Deploy steps"]);
+        expect(fromA.hits.map((hit) => hit.title)).toEqual(["deploy-steps"]);
         const fromB = yield* service.memorySearch(scopeFor("thread:repo-b"), { query: "deploy" });
         expect(fromB.hits).toEqual([]);
-      }).pipe(Effect.provide(layer));
+      }).pipe(Effect.provide(layer), Effect.provideService(HostProcess.HomeDirectory, stateDir));
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

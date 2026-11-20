@@ -266,7 +266,7 @@ export interface RsiServiceShape {
   readonly getAppliedLessonIds: (
     input: RsiAppliedLessonsLookupInput,
   ) => Effect.Effect<ReadonlyArray<string>>;
-  /** Notes, the project's Claude memory and RSI lessons, ranked together (MemoryNotes.ts). */
+  /** The shared ~/.agents/memory folder and RSI lessons, ranked together (MemoryNotes.ts). */
   readonly searchMemory: (input: {
     readonly query: string;
     readonly limit?: number | undefined;
@@ -904,8 +904,8 @@ interface PersistenceHandles {
   readonly lessonsPath: string;
   readonly telemetryPath: string;
   readonly resolveObsidianBrainDir?: () => Effect.Effect<string | null>;
-  /** `~/.claude/projects`; the caller project's `<encoded cwd>/memory` is searched read-only. */
-  readonly claudeProjectsDir?: string | undefined;
+  /** Shared agent memory (`~/.agents/memory`): Claude's autoMemoryDirectory, read by Antigravity. */
+  readonly memoryDir?: string | undefined;
 }
 
 function parseLessonsFileWithStats(raw: string): {
@@ -2588,15 +2588,6 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     return yield* resolveTrackedLessonIds(lookupInput, false);
   });
 
-  const memoryNotesDir = Effect.fn("RsiService.memoryNotesDir")(function* () {
-    if (persistence === undefined) return undefined;
-    const brainDir = yield* persistence.resolveObsidianBrainDir?.() ?? Effect.succeed(null);
-    // A sibling of Lessons/: notes there are recalled on demand, never injected into prompts.
-    return brainDir === null || brainDir.trim() === ""
-      ? persistence.path.join(persistence.rsiDir, "memory")
-      : persistence.path.join(brainDir, "Memory");
-  });
-
   const searchMemory: RsiServiceShape["searchMemory"] = Effect.fn("RsiService.searchMemory")(
     function* (memoryInput) {
       const lessons = yield* queryLessons({ cwd: memoryInput.projectRoot, limit: MAX_LESSONS });
@@ -2605,22 +2596,12 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         title: lesson.title,
         body: `${lesson.guidance}\n${lesson.triggerCondition}`,
       }));
-      const notesDir = yield* memoryNotesDir();
-      if (persistence !== undefined && notesDir !== undefined) {
-        const claudeMemoryDir =
-          persistence.claudeProjectsDir === undefined || memoryInput.projectRoot === undefined
-            ? undefined
-            : persistence.path.join(
-                persistence.claudeProjectsDir,
-                MemoryNotes.claudeProjectDirName(memoryInput.projectRoot),
-                "memory",
-              );
+      if (persistence?.memoryDir !== undefined) {
         docs.push(
           ...(yield* MemoryNotes.collectMemoryDocs({
             fs: persistence.fs,
             path: persistence.path,
-            notesDir,
-            claudeMemoryDir,
+            memoryDir: persistence.memoryDir,
             projectRoot: memoryInput.projectRoot,
           })),
         );
@@ -2631,16 +2612,13 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
 
   const writeMemory: RsiServiceShape["writeMemory"] = Effect.fn("RsiService.writeMemory")(
     function* (memoryInput) {
-      const notesDir = yield* memoryNotesDir();
-      if (persistence === undefined || notesDir === undefined) {
-        return yield* new MemoryNotes.MemoryWriteError({
-          message: "Memory notes are unavailable.",
-        });
+      if (persistence?.memoryDir === undefined) {
+        return yield* new MemoryNotes.MemoryWriteError({ message: "Memory is unavailable." });
       }
       return yield* MemoryNotes.writeMemoryNote({
         fs: persistence.fs,
         path: persistence.path,
-        notesDir,
+        memoryDir: persistence.memoryDir,
         title: memoryInput.title,
         content: memoryInput.content,
         projectRoot: memoryInput.projectRoot,
@@ -2650,7 +2628,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           PlatformError: (cause) =>
             Effect.fail(
               new MemoryNotes.MemoryWriteError({
-                message: `Could not write the memory note: ${cause.message}`,
+                message: `Could not write the memory: ${cause.message}`,
               }),
             ),
         }),
@@ -2681,7 +2659,6 @@ const makeLayerEffect = Effect.fn("RsiService.makeLayer")(function* (options?: {
   const pathOpt = yield* Effect.serviceOption(Path.Path);
   const settingsOpt = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
   const homeDirectory = yield* HostProcess.HomeDirectory;
-  const claudeConfigDir = (yield* HostProcess.Environment).CLAUDE_CONFIG_DIR?.trim();
 
   const persistence: PersistenceHandles | undefined =
     Option.isSome(configOpt) &&
@@ -2724,10 +2701,7 @@ const makeLayerEffect = Effect.fn("RsiService.makeLayer")(function* (options?: {
             lessonsPath: pathOpt.value.join(rsiDir, "lessons.json"),
             telemetryPath: pathOpt.value.join(rsiDir, "telemetry.jsonl"),
             resolveObsidianBrainDir,
-            claudeProjectsDir: pathOpt.value.join(
-              claudeConfigDir || pathOpt.value.join(homeDirectory, ".claude"),
-              "projects",
-            ),
+            memoryDir: pathOpt.value.join(homeDirectory, ".agents", "memory"),
           };
         })()
       : undefined;

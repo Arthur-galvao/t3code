@@ -7,13 +7,11 @@ import type * as Path from "effect/Path";
 import { redactCcrSecrets } from "@t3tools/provider-core/server/ccrStore";
 
 /**
- * Unified agent memory: markdown notes written through `memory_write`, the Claude auto-memory
- * folder of the caller's project (read-only) and RSI lessons, searched together with an
- * in-memory SQLite FTS5 index. Notes are files, not database rows, so the user can read and
- * edit them in Obsidian and nothing touches T3's own database schema.
+ * Shared `~/.agents/memory/` (Claude auto-memory + Antigravity GEMINI.md) and RSI lessons,
+ * searched via in-memory SQLite FTS5; `memory_write` writes frontmatter + a `MEMORY.md` line.
  */
 
-export type MemorySource = "note" | "claude-memory" | "rsi-lesson";
+export type MemorySource = "memory" | "rsi-lesson";
 
 export interface MemoryDoc {
   readonly source: MemorySource;
@@ -31,10 +29,8 @@ export interface MemoryHit {
 
 const MAX_MEMORY_NOTE_CHARS = 8_000;
 const MAX_TITLE_CHARS = 120;
-const T3_MEMORY_MARKER = "t3_memory: true";
-
-/** Claude Code stores per-project state under ~/.claude/projects/<cwd with non-alphanumerics as "-">. */
-export const claudeProjectDirName = (cwd: string): string => cwd.replace(/[^a-zA-Z0-9]/g, "-");
+const INDEX_FILE = "MEMORY.md";
+let atomicWriteSeq = 0;
 
 /** Case- and slash-insensitive on Windows drive paths, so `C:\x` and `c:/x/` are one project. */
 const normalizeRoot = (root: string): string => {
@@ -43,6 +39,9 @@ const normalizeRoot = (root: string): string => {
 };
 
 const unquote = (value: string): string => {
+  if (value.startsWith("'") && value.endsWith("'") && value.length >= 2) {
+    return value.slice(1, -1).replaceAll("''", "'");
+  }
   if (!value.startsWith('"')) return value;
   try {
     const parsed: unknown = JSON.parse(value);
@@ -52,6 +51,7 @@ const unquote = (value: string): string => {
   }
 };
 
+/** Flat key/value view of the frontmatter; nested `metadata:` keys are read like top-level ones. */
 const splitFrontmatter = (raw: string): { meta: Map<string, string>; body: string } => {
   const meta = new Map<string, string>();
   const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(raw.trimStart());
@@ -64,60 +64,39 @@ const splitFrontmatter = (raw: string): { meta: Map<string, string>; body: strin
   return { meta, body: match[2] ?? "" };
 };
 
-const readMarkdownDir = Effect.fn("MemoryNotes.readMarkdownDir")(function* (
-  fs: FileSystem.FileSystem,
-  path: Path.Path,
-  dir: string,
-) {
-  const entries = yield* fs.readDirectory(dir).pipe(Effect.orElseSucceed(() => []));
-  const files: Array<{ readonly filePath: string; readonly raw: string }> = [];
-  for (const entry of entries) {
-    if (!entry.toLowerCase().endsWith(".md")) continue;
-    const filePath = path.join(dir, entry);
-    const raw = yield* fs.readFileString(filePath).pipe(Effect.orElseSucceed(() => ""));
-    if (raw.trim() !== "") files.push({ filePath, raw });
-  }
-  return files;
-});
-
 /**
- * Notes of the project (or global ones, without projectRoot) plus the project's Claude memory.
- * shortcut: rescans the folders on every search, fine for hundreds of notes; cache by mtime when slower.
+ * Memories of the caller's project (or without a projectRoot) from the shared folder.
+ * shortcut: rescans the folder on every search, fine for hundreds of files; cache by mtime when slower.
  */
 export const collectMemoryDocs = Effect.fn("MemoryNotes.collectMemoryDocs")(function* (input: {
   readonly fs: FileSystem.FileSystem;
   readonly path: Path.Path;
-  readonly notesDir: string;
-  readonly claudeMemoryDir?: string | undefined;
+  readonly memoryDir: string;
   readonly projectRoot?: string | undefined;
 }) {
-  const docs: Array<MemoryDoc> = [];
   const project = input.projectRoot === undefined ? undefined : normalizeRoot(input.projectRoot);
-  for (const { filePath, raw } of yield* readMarkdownDir(input.fs, input.path, input.notesDir)) {
+  const entries = yield* input.fs
+    .readDirectory(input.memoryDir)
+    .pipe(Effect.orElseSucceed(() => []));
+  const docs: Array<MemoryDoc> = [];
+  for (const entry of entries) {
+    // MEMORY.md is only the index of the other files.
+    if (!entry.toLowerCase().endsWith(".md") || entry.toUpperCase() === INDEX_FILE.toUpperCase()) {
+      continue;
+    }
+    const filePath = input.path.join(input.memoryDir, entry);
+    const raw = yield* input.fs.readFileString(filePath).pipe(Effect.orElseSucceed(() => ""));
+    if (raw.trim() === "") continue;
     const { meta, body } = splitFrontmatter(raw);
     const noteRoot = meta.get("projectRoot");
     if (noteRoot !== undefined && noteRoot !== "" && normalizeRoot(noteRoot) !== project) continue;
-    const title = meta.get("title") || input.path.basename(filePath, ".md");
-    docs.push({ source: "note", title, body, path: filePath });
-  }
-  if (input.claudeMemoryDir !== undefined) {
-    for (const { filePath, raw } of yield* readMarkdownDir(
-      input.fs,
-      input.path,
-      input.claudeMemoryDir,
-    )) {
-      // MEMORY.md is only the index of the other files.
-      if (input.path.basename(filePath).toUpperCase() === "MEMORY.MD") continue;
-      const { meta, body } = splitFrontmatter(raw);
-      const title = meta.get("name") || input.path.basename(filePath, ".md");
-      const description = meta.get("description");
-      docs.push({
-        source: "claude-memory",
-        title,
-        body: description === undefined ? body : `${description}\n${body}`,
-        path: filePath,
-      });
-    }
+    const description = meta.get("description");
+    docs.push({
+      source: "memory",
+      title: meta.get("name") || meta.get("title") || input.path.basename(filePath, ".md"),
+      body: description === undefined ? body : `${description}\n${body}`,
+      path: filePath,
+    });
   }
   return docs;
 });
@@ -176,45 +155,62 @@ export class MemoryWriteError extends Schema.TaggedError<MemoryWriteError>()("Me
   message: Schema.String,
 }) {}
 
+const oneLine = (text: string, max: number): string => {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length <= max ? line : `${line.slice(0, max - 3).trimEnd()}...`;
+};
+
 const formatMemoryNote = (input: {
-  readonly title: string;
+  readonly slug: string;
+  readonly description: string;
   readonly body: string;
   readonly projectRoot?: string | undefined;
   readonly nowIso: string;
 }): string =>
   [
     "---",
-    T3_MEMORY_MARKER,
-    `title: ${JSON.stringify(input.title)}`,
+    `name: ${input.slug}`,
+    `description: ${JSON.stringify(input.description)}`,
+    "metadata:",
+    `  type: ${input.projectRoot === undefined ? "reference" : "project"}`,
+    "  t3_memory: true",
     ...(input.projectRoot === undefined
       ? []
-      : [`projectRoot: ${JSON.stringify(input.projectRoot)}`]),
-    `updatedAt: ${JSON.stringify(input.nowIso)}`,
+      : [`  projectRoot: ${JSON.stringify(input.projectRoot)}`]),
+    `  modified: ${input.nowIso}`,
     "---",
-    "",
-    `# ${input.title}`,
     "",
     input.body,
     "",
   ].join("\n");
 
+/** MEMORY.md keeps one `- [title](file) - hook` line per memory; replace ours or append it. */
+const upsertIndexLine = (index: string, fileName: string, line: string): string => {
+  const lines = index.replace(/(?:\r?\n)+$/, "").split(/\r?\n/);
+  if (lines.length === 1 && lines[0]?.trim() === "") lines.length = 0;
+  const at = lines.findIndex((existing) => existing.includes(`](${fileName})`));
+  if (at >= 0) lines[at] = line;
+  else lines.push(line);
+  return `${lines.join("\n")}\n`;
+};
+
 /**
- * Writes (or updates) one note in notesDir. Agents call this, so: strict slug file names inside
- * notesDir only, size cap, secrets redacted, tmp + rename, and a file T3 did not write is never
- * overwritten (the note goes to a "-2" sibling instead).
+ * Writes (or updates) one memory in the shared folder and its MEMORY.md line. Agents call this,
+ * so: strict slug file names inside the folder only, size cap, secrets redacted, tmp + rename,
+ * and a file T3 did not write is never overwritten (the memory goes to a "-2" sibling instead).
  */
 export const writeMemoryNote = Effect.fn("MemoryNotes.writeMemoryNote")(function* (input: {
   readonly fs: FileSystem.FileSystem;
   readonly path: Path.Path;
-  readonly notesDir: string;
+  readonly memoryDir: string;
   readonly title: string;
   readonly content: string;
   readonly projectRoot?: string | undefined;
   readonly nowIso: string;
 }) {
   const title = input.title.replace(/\s+/g, " ").trim().slice(0, MAX_TITLE_CHARS);
-  const slug = slugifyMemoryTitle(title);
-  if (slug === "") return yield* new MemoryWriteError({ message: "Memory title is empty." });
+  const baseSlug = slugifyMemoryTitle(title);
+  if (baseSlug === "") return yield* new MemoryWriteError({ message: "Memory title is empty." });
   const content = input.content.trim();
   if (content === "") return yield* new MemoryWriteError({ message: "Memory content is empty." });
   if (content.length > MAX_MEMORY_NOTE_CHARS) {
@@ -222,26 +218,48 @@ export const writeMemoryNote = Effect.fn("MemoryNotes.writeMemoryNote")(function
       message: `Memory content exceeds ${MAX_MEMORY_NOTE_CHARS} characters.`,
     });
   }
-  const note = formatMemoryNote({
-    title,
-    body: redactCcrSecrets(content).text,
-    projectRoot: input.projectRoot,
-    nowIso: input.nowIso,
-  });
+  const body = redactCcrSecrets(content).text;
 
-  yield* input.fs.makeDirectory(input.notesDir, { recursive: true });
-  let filePath = input.path.join(input.notesDir, `${slug}.md`);
+  yield* input.fs.makeDirectory(input.memoryDir, { recursive: true });
+  let slug = baseSlug;
   for (let suffix = 2; ; suffix += 1) {
     const existing = yield* input.fs
-      .readFileString(filePath)
+      .readFileString(input.path.join(input.memoryDir, `${slug}.md`))
       .pipe(Effect.orElseSucceed(() => null as string | null));
     if (existing === null || splitFrontmatter(existing).meta.get("t3_memory") === "true") break;
-    if (suffix > 50)
-      return yield* new MemoryWriteError({ message: "Too many notes with this title." });
-    filePath = input.path.join(input.notesDir, `${slug}-${suffix}.md`);
+    if (suffix > 50) {
+      return yield* new MemoryWriteError({ message: "Too many memories with this title." });
+    }
+    slug = `${baseSlug}-${suffix}`;
   }
-  const tmpPath = `${filePath}.tmp`;
-  yield* input.fs.writeFileString(tmpPath, note);
-  yield* input.fs.rename(tmpPath, filePath);
+  const fileName = `${slug}.md`;
+  const filePath = input.path.join(input.memoryDir, fileName);
+  const writeAtomic = (target: string, text: string) => {
+    const tmp = `${target}.${process.pid}.${(atomicWriteSeq += 1)}.tmp`;
+    return input.fs.writeFileString(tmp, text).pipe(
+      Effect.andThen(input.fs.rename(tmp, target)),
+      Effect.tapError(() => input.fs.remove(tmp).pipe(Effect.ignore)),
+    );
+  };
+  yield* writeAtomic(
+    filePath,
+    formatMemoryNote({
+      slug,
+      description: title,
+      body,
+      projectRoot: input.projectRoot,
+      nowIso: input.nowIso,
+    }),
+  );
+  const indexPath = input.path.join(input.memoryDir, INDEX_FILE);
+  const index = yield* input.fs.readFileString(indexPath).pipe(Effect.orElseSucceed(() => ""));
+  yield* writeAtomic(
+    indexPath,
+    upsertIndexLine(
+      index,
+      fileName,
+      `- [${oneLine(title, 60)}](${fileName}) - ${oneLine(body, 100)}`,
+    ),
+  );
   return { path: filePath, title };
 });

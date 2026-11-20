@@ -503,7 +503,7 @@ const RsiTelemetrySummaryTool = Tool.make("rsi_telemetry_summary", {
 
 const MemorySearchTool = Tool.make("memory_search", {
   description:
-    "Search saved memory for this project and global notes: memory_write notes, Claude memory, RSI lessons.",
+    "Search shared agent memory (~/.agents/memory, also Claude's and Antigravity's) and RSI lessons.",
   parameters: Schema.Struct({ query: Schema.String, limit: Schema.optional(Schema.Int) }),
   success: Schema.Struct({
     hits: Schema.Array(
@@ -526,7 +526,7 @@ const MemorySearchTool = Tool.make("memory_search", {
 
 const MemoryWriteTool = Tool.make("memory_write", {
   description:
-    "Save or update a durable fact as a markdown note (same title updates it). global:true for all projects.",
+    "Save or update a durable fact in shared agent memory (same title updates it). global:true for all projects.",
   parameters: Schema.Struct({
     title: Schema.String,
     content: Schema.String,

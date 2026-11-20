@@ -7,7 +7,6 @@ import * as Path from "effect/Path";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
-import { claudeProjectDirName } from "../memory/MemoryNotes.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { createCcrStore, defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
 import {
@@ -2009,29 +2008,19 @@ describe("RsiService Obsidian round trip", () => {
 });
 
 describe("RsiService memory", () => {
-  it.effect("searches notes, the project's Claude memory and lessons, and writes notes", () =>
+  it.effect("searches the shared memory folder and lessons, and writes memories there", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-memory-" });
       const rsiDir = path.join(tempRoot, "rsi");
-      const brainDir = path.join(tempRoot, "vault", "T3-Brain");
-      const claudeProjectsDir = path.join(tempRoot, "claude-projects");
+      const memoryDir = path.join(tempRoot, "agents-memory");
       const projectRoot = path.join(tempRoot, "repo");
-      const claudeMemoryDir = path.join(
-        claudeProjectsDir,
-        claudeProjectDirName(projectRoot),
-        "memory",
-      );
-      yield* fs.makeDirectory(claudeMemoryDir, { recursive: true });
+      yield* fs.makeDirectory(memoryDir, { recursive: true });
       yield* fs.writeFileString(
-        path.join(claudeMemoryDir, "tests.md"),
-        "---\nname: workspace-vp\n---\n\nRun tests with the workspace vp.cmd.\n",
+        path.join(memoryDir, "tests.md"),
+        "---\nname: workspace-vp\nmetadata:\n  type: reference\n---\n\nRun tests with the workspace vp.cmd.\n",
       );
-      const otherMemoryDir = path.join(claudeProjectsDir, "other-project", "memory");
-      yield* fs.makeDirectory(otherMemoryDir, { recursive: true });
-      yield* fs.writeFileString(path.join(otherMemoryDir, "drive.md"), "Drive folder for tests.\n");
-
       const rsi = yield* makeRsiService({
         persistence: {
           fs,
@@ -2039,8 +2028,7 @@ describe("RsiService memory", () => {
           rsiDir,
           lessonsPath: path.join(rsiDir, "lessons.json"),
           telemetryPath: path.join(rsiDir, "telemetry.jsonl"),
-          resolveObsidianBrainDir: () => Effect.succeed(brainDir),
-          claudeProjectsDir,
+          memoryDir,
         },
       });
       const written = yield* rsi.writeMemory({
@@ -2048,7 +2036,7 @@ describe("RsiService memory", () => {
         content: "Run tests before tagging a release.",
         projectRoot,
       });
-      expect(written.path).toBe(path.join(brainDir, "Memory", "release-checklist.md"));
+      expect(written.path).toBe(path.join(memoryDir, "release-checklist.md"));
       yield* rsi.recordLesson({
         key: "manual::tests",
         title: "Tests first",
@@ -2056,12 +2044,8 @@ describe("RsiService memory", () => {
       });
 
       const hits = yield* rsi.searchMemory({ query: "tests", projectRoot });
-      expect(hits.map((hit) => hit.source).toSorted()).toEqual([
-        "claude-memory",
-        "note",
-        "rsi-lesson",
-      ]);
-      // The memory note never becomes a prompt-injected lesson.
+      expect(hits.map((hit) => hit.source).toSorted()).toEqual(["memory", "memory", "rsi-lesson"]);
+      // A memory never becomes a prompt-injected lesson.
       expect((yield* rsi.queryLessons()).map((lesson) => lesson.title)).toEqual(["Tests first"]);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
