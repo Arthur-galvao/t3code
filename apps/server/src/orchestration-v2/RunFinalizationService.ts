@@ -197,6 +197,13 @@ function summarizeRunTelemetry(input: {
       (latestTurn?.turnTokenUsage?.outputTokens ?? 0);
   const cachedInputTokens =
     latestTurn?.tokenUsage?.cachedInputTokens ?? latestTurn?.turnTokenUsage?.cachedInputTokens ?? 0;
+  // Fallback for providers omitting tokenUsage.usedTokens (e.g. Antigravity); Claude reports usedTokens so RsiService derives its rate from usedTokens.
+  const turnCachedInputTokens = latestTurn?.turnTokenUsage?.cachedInputTokens ?? 0;
+  const turnInputTokens = latestTurn?.turnTokenUsage?.inputTokens ?? 0;
+  const cacheHitRate =
+    latestTurn?.tokenUsage?.usedTokens === undefined && turnInputTokens > 0
+      ? Math.max(0, Math.min(1, turnCachedInputTokens / turnInputTokens))
+      : undefined;
   // Tokens processed, not context size: every turn of this attempt (Codex goals span several),
   // including subagents. Input counts cache reads, so this is work done, not a bill.
   let spentTokens: number | undefined;
@@ -333,6 +340,7 @@ function summarizeRunTelemetry(input: {
     model: latestTurn?.model ?? input.run.modelSelection.model,
     usedTokens,
     cachedInputTokens,
+    ...(cacheHitRate !== undefined ? { cacheHitRate } : {}),
     toolErrorCount,
     loopTripped,
     safetyBlockedCount,

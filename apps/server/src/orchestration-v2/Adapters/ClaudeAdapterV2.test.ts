@@ -11556,6 +11556,123 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect(
+    "omits cumulative modelUsage ledger from otherUsage on turn 1 of a resumed process and records incremental otherUsage on turn 2",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("claude-resumed-ledger-attempt-1"),
+            providerTurnOrdinal: 2,
+            nativeThreadHasTurns: true,
+            text: "Resume turn 1.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000251",
+            result: "Turn 1 done.",
+            usage: {
+              input_tokens: 100,
+              output_tokens: 20,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+            modelUsage: {
+              "claude-sonnet-4-6": {
+                inputTokens: 100_000,
+                outputTokens: 20_000,
+                cacheReadInputTokens: 0,
+                cacheCreationInputTokens: 0,
+                webSearchRequests: 0,
+                costUSD: 0,
+                contextWindow: 200_000,
+                maxOutputTokens: 32_000,
+              },
+            },
+          }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const turn1Completed = harness.events.findLast(
+          (event) => event.type === "provider_turn.updated",
+        );
+        assert.equal(turn1Completed?.type, "provider_turn.updated");
+        if (turn1Completed?.type === "provider_turn.updated") {
+          assert.isUndefined(turn1Completed.providerTurn.turnTokenUsage?.otherUsage);
+          assert.equal(turn1Completed.providerTurn.turnTokenUsage?.inputTokens, 100);
+          assert.equal(turn1Completed.providerTurn.turnTokenUsage?.outputTokens, 20);
+        }
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("claude-resumed-ledger-attempt-2"),
+            providerTurnOrdinal: 3,
+            nativeThreadHasTurns: true,
+            text: "Resume turn 2.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000252",
+            result: "Turn 2 done.",
+            usage: {
+              input_tokens: 200,
+              output_tokens: 30,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+            modelUsage: {
+              "claude-sonnet-4-6": {
+                inputTokens: 100_500,
+                outputTokens: 20_100,
+                cacheReadInputTokens: 0,
+                cacheCreationInputTokens: 0,
+                webSearchRequests: 0,
+                costUSD: 0,
+                contextWindow: 200_000,
+                maxOutputTokens: 32_000,
+              },
+            },
+          }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const turn2Completed = harness.events.findLast(
+          (event) => event.type === "provider_turn.updated",
+        );
+        assert.equal(turn2Completed?.type, "provider_turn.updated");
+        if (turn2Completed?.type === "provider_turn.updated") {
+          assert.deepEqual(turn2Completed.providerTurn.turnTokenUsage?.otherUsage, {
+            inputTokens: 300,
+            outputTokens: 70,
+          });
+          assert.equal(turn2Completed.providerTurn.turnTokenUsage?.inputTokens, 200);
+          assert.equal(turn2Completed.providerTurn.turnTokenUsage?.outputTokens, 30);
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            NodeCrypto.layer,
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+          ),
+        ),
+      ),
+  );
+
   it.effect("shows automatic compaction before its boundary and completes the same item", () =>
     Effect.gen(function* () {
       const harness = yield* makeWakeHarness;

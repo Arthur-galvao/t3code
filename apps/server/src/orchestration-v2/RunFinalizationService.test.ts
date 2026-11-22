@@ -23,6 +23,7 @@ import {
   type RepositoryIdentity,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import { acpPerTurnPromptUsage } from "@t3tools/provider-acp/server/adapter";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -453,6 +454,7 @@ const makeFinalizationIntegrationFixture = (input: {
   readonly key: string;
   readonly turnItems: ReadonlyArray<OrchestrationV2TurnItem>;
   readonly status?: OrchestrationV2Run["status"];
+  readonly tokenUsage?: OrchestrationV2ProviderTurn["tokenUsage"];
   readonly turnTokenUsage?: OrchestrationV2ProviderTurn["turnTokenUsage"];
 }) =>
   Effect.gen(function* () {
@@ -515,11 +517,14 @@ const makeFinalizationIntegrationFixture = (input: {
       status: "completed",
       startedAt: now,
       completedAt: now,
-      tokenUsage: {
-        usedTokens: 1200,
-        cachedInputTokens: 900,
-        updatedAt: DateTime.formatIso(now),
-      },
+      tokenUsage:
+        "tokenUsage" in input
+          ? input.tokenUsage
+          : {
+              usedTokens: 1200,
+              cachedInputTokens: 900,
+              updatedAt: DateTime.formatIso(now),
+            },
       turnTokenUsage: input.turnTokenUsage ?? {
         usageScope: "main_agent",
         usageStatus: "complete",
@@ -852,4 +857,79 @@ it.effect("leaves spentTokens unset when the provider reported no usage counters
     assert.strictEqual(result.telemetryInputs.length, 1);
     assert.isUndefined(result.telemetryInputs[0]?.spentTokens);
   }),
+);
+
+it.effect(
+  "computes cacheHitRate from cachedInputTokens / inputTokens when tokenUsage.usedTokens is undefined",
+  () =>
+    Effect.gen(function* () {
+      const result = yield* makeFinalizationIntegrationFixture({
+        key: "antigravity_cache_rate",
+        turnItems: [],
+        tokenUsage: undefined,
+        turnTokenUsage: {
+          usageScope: "main_agent",
+          usageStatus: "complete",
+          hasSubagents: false,
+          inputTokens: 1_000,
+          cachedInputTokens: 800,
+          outputTokens: 1_000,
+          reasoningTokens: 500,
+        },
+      });
+
+      assert.strictEqual(result.telemetryInputs.length, 1);
+      // 800 / 1000 = 0.8 (not 800 / (1000 + 1000) = 0.4)
+      assert.strictEqual(result.telemetryInputs[0]?.cacheHitRate, 0.8);
+      assert.strictEqual(result.telemetryInputs[0]?.usedTokens, 2_000);
+      assert.strictEqual(result.telemetryInputs[0]?.cachedInputTokens, 800);
+    }),
+);
+
+it.effect("records main-agent spentTokens on resumed turn 1 even when otherUsage is omitted", () =>
+  Effect.gen(function* () {
+    const result = yield* makeFinalizationIntegrationFixture({
+      key: "resumed_turn_1_spend",
+      turnItems: [],
+      turnTokenUsage: {
+        usageScope: "main_agent",
+        usageStatus: "complete",
+        hasSubagents: false,
+        inputTokens: 100,
+        outputTokens: 20,
+      },
+    });
+
+    assert.strictEqual(result.telemetryInputs.length, 1);
+    assert.strictEqual(result.telemetryInputs[0]?.spentTokens, 120);
+  }),
+);
+
+it.effect(
+  "maps Antigravity geminiPromptUsage via acpPerTurnPromptUsage into RunFinalizationService without clamping cacheHitRate",
+  () =>
+    Effect.gen(function* () {
+      const mappedUsage = acpPerTurnPromptUsage(
+        {
+          inputTokens: 3928,
+          outputTokens: 200,
+          cachedReadTokens: 44169,
+          totalTokens: 48297,
+        },
+        false,
+        "completed",
+        true,
+      );
+      const result = yield* makeFinalizationIntegrationFixture({
+        key: "antigravity_acp_per_turn",
+        turnItems: [],
+        tokenUsage: undefined,
+        turnTokenUsage: mappedUsage,
+      });
+
+      assert.strictEqual(result.telemetryInputs.length, 1);
+      assert.strictEqual(result.telemetryInputs[0]?.cacheHitRate, 44169 / (3928 + 44169));
+      assert.strictEqual(result.telemetryInputs[0]?.usedTokens, 48297);
+      assert.strictEqual(result.telemetryInputs[0]?.spentTokens, 48297);
+    }),
 );
