@@ -761,6 +761,8 @@ function compressCode(text: string): string {
   const keep = new Uint8Array(len);
   let inMultiLineImport = false;
   let inSignature = false;
+  const MAX_CODE_DIVIDERS = 12;
+  let dividerCount = 0;
 
   for (let i = 0; i < len; i += 1) {
     const rawLine = lines[i] ?? "";
@@ -772,6 +774,12 @@ function compressCode(text: string): string {
       (trimmed.startsWith("#!") || trimmed.startsWith('"use ') || trimmed.startsWith("'use "))
     ) {
       keep[i] = 1;
+      continue;
+    }
+
+    if (dividerCount < MAX_CODE_DIVIDERS && /^===\s.+\s===$/.test(trimmed)) {
+      keep[i] = 1;
+      dividerCount += 1;
       continue;
     }
 
@@ -807,6 +815,31 @@ function compressCode(text: string): string {
       ) {
         inSignature = true;
       }
+    }
+  }
+
+  let keptCount = 0;
+  for (let i = 0; i < len; i += 1) {
+    if (keep[i] === 1) keptCount += 1;
+  }
+  if (keptCount < 4) {
+    let headKept = 0;
+    for (let i = 0; i < len && headKept < 5; i += 1) {
+      if (stripLineNumberPrefix(lines[i] ?? "").trim() !== "") {
+        keep[i] = 1;
+        headKept += 1;
+      }
+    }
+    let tailKept = 0;
+    for (let i = len - 1; i >= 0 && tailKept < 5; i -= 1) {
+      if (stripLineNumberPrefix(lines[i] ?? "").trim() !== "") {
+        keep[i] = 1;
+        tailKept += 1;
+      }
+    }
+    if (headKept === 0 && tailKept === 0 && keptCount === 0 && len > 0) {
+      keep[0] = 1;
+      keep[len - 1] = 1;
     }
   }
 
@@ -942,9 +975,13 @@ const TEST_EXIT_CODE_LINE_RE = /\bexit(?:ed with)?\s+code\b/i;
 const PASSING_TEST_LINE_RE =
   /^\s*(?:✓|✔|PASS\b|PASSED\b|ok\s+\S+|\.\.\.\s+ok\b|test\s+\S+\s+\.\.\.\s+ok)/i;
 const TEST_SUMMARY_LINE_RE =
-  /^\s*(?:Test Files|Tests|Snapshots|Start at|Duration|=== .* (?:passed|failed)|test result:|FAIL\s+|ok\s+\S+\s+\d)/i;
+  /^\s*(?:(?:Test Files|Tests|Snapshots|Start at|Duration)(?=\s|:)|=== .* (?:passed|failed)|test result:|FAIL\s+|ok\s+\S+\s+\d)/i;
 const TEST_FAILURE_LINE_RE =
-  /\b(?:FAIL|FAILED|AssertionError|Error:|Expected|Received|Traceback|panic)\b|^\s*(?:✗|×|at\s+\S+:\d+)/;
+  /\b(?:FAIL|FAILED|AssertionError|Error:|Expected|Received|Traceback|panic)\b|Caused by:|Traceback \(most recent call last\):|===\s*(?:FAILURES|ERRORS)\s*===|^\s*(?:✗|×|at\s+\S+:\d+|[A-Za-z_][\w.]*(?:Error|Exception):)/;
+const TEST_SUMMARY_FAILURE_RE =
+  /\b[1-9]\d*\s+(?:fail(?:ed|ure|ures|ing)?|error(?:s)?)\b|\b(?:test result:\s*FAILED|FAIL(?:ED)?)\b/;
+const NON_ZERO_EXIT_CODE_RE = /\bexit(?:ed with)?\s+code\s+(?!0\b)-?\d+/i;
+const POSITIVE_PASS_SUMMARY_RE = /\b(?:passed|0\s+failed|ok\b)/i;
 
 const DIAG_HEADER_LINE_RE =
   /^(?:\S+.*\(\d+,\d+\):\s*(?:error|warning)\b|\S+:\d+:\d+(?:\s*[-:])?\s*(?:error|warning|info)?|error\[E\d+\]|warning\[|✖|×|\s*(?:error|warning)\b[:\s])/i;
@@ -1011,17 +1048,43 @@ function compressTestRunnerOutput(lines: ReadonlyArray<string>): string {
 
   const len = lines.length;
   const keep = new Uint8Array(len);
-  for (let i = 0; i < Math.min(3, len); i += 1) keep[i] = 1;
-  for (let i = Math.max(0, len - 8); i < len; i += 1) keep[i] = 1;
+  let hasFailureOrCritical = false;
+  let hasSummary = false;
+  let hasPositivePassSignal = false;
 
   for (let i = 0; i < len; i += 1) {
     const line = lines[i] ?? "";
-    if (TEST_SUMMARY_LINE_RE.test(line) || TEST_EXIT_CODE_LINE_RE.test(line)) {
+    if (PASSING_TEST_LINE_RE.test(line)) {
+      hasPositivePassSignal = true;
+    }
+    if (TEST_SUMMARY_LINE_RE.test(line)) {
+      hasSummary = true;
       keep[i] = 1;
+      if (TEST_SUMMARY_FAILURE_RE.test(line)) {
+        hasFailureOrCritical = true;
+        markProtectedWindow(keep, i, 5);
+      } else if (POSITIVE_PASS_SUMMARY_RE.test(line)) {
+        hasPositivePassSignal = true;
+      }
+    } else if (TEST_EXIT_CODE_LINE_RE.test(line)) {
+      keep[i] = 1;
+      if (NON_ZERO_EXIT_CODE_RE.test(line)) {
+        hasFailureOrCritical = true;
+        markProtectedWindow(keep, i, 5);
+      }
     }
     if (TEST_FAILURE_LINE_RE.test(line) || CRITICAL_LOG_RE.test(line)) {
+      hasFailureOrCritical = true;
       markProtectedWindow(keep, i, 5);
     }
+  }
+
+  if (len > 16 && !hasFailureOrCritical && hasSummary && hasPositivePassSignal) {
+    for (let i = 0; i < Math.min(2, len); i += 1) keep[i] = 1;
+    for (let i = Math.max(0, len - 4); i < len; i += 1) keep[i] = 1;
+  } else {
+    for (let i = 0; i < Math.min(3, len); i += 1) keep[i] = 1;
+    for (let i = Math.max(0, len - 8); i < len; i += 1) keep[i] = 1;
   }
 
   const out: Array<string> = [];

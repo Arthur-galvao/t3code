@@ -673,3 +673,176 @@ describe("JSON-wrapped text payloads", () => {
     assert.equal(result.text, small);
   });
 });
+
+describe("compressCode sparse anchors and test runner traceback/clean-pass compaction", () => {
+  it("preserves head, tail, and === section === headers in compressCode when structural anchors are sparse", () => {
+    const store = createCcrStore();
+    const raw = [
+      "=== section alpha ===",
+      ...Array.from({ length: 45 }, (_, i) => `  payload line alpha ${i}: ${"x".repeat(120)}`),
+      "=== section beta ===",
+      ...Array.from({ length: 45 }, (_, i) => `  payload line beta ${i}: ${"y".repeat(120)}`),
+      "  final line tail 4",
+      "  final line tail 5",
+    ].join("\n");
+
+    const result = compressToolOutput({ text: raw, contentTypeHint: "code", store });
+    assert.isTrue(result.compressed);
+    assert.equal(result.contentType, "code");
+    assert.notInclude(result.text, "all lines omitted");
+    assert.include(result.text, "=== section alpha ===");
+    assert.include(result.text, "=== section beta ===");
+    assert.include(result.text, "payload line alpha 0:");
+    assert.include(result.text, "final line tail 5");
+  });
+
+  it("preserves ±5 context around Caused by, Python Traceback, === FAILURES ===, and trailing Exception lines", () => {
+    const store = createCcrStore();
+    const raw = [
+      "pytest session starts",
+      ...Array.from(
+        { length: 45 },
+        (_, i) => `tests/unit/test_service_module_${i}.py::test_pass_${i} PASSED [ 50%]`,
+      ),
+      "=== FAILURES ===",
+      "ctx-failure-before-1",
+      "Traceback (most recent call last):",
+      '  File "app/core.py", line 14, in run',
+      "    return parse(raw)",
+      "ValueError: invalid payload",
+      "Caused by: RuntimeException: bad state",
+      "ctx-after-exception-1",
+      ...Array.from(
+        { length: 45 },
+        (_, i) => `tests/unit/test_extra_module_${i}.py::test_pass_${i} PASSED [ 99%]`,
+      ),
+      "=== 1 failed, 90 passed in 1.25s ===",
+    ].join("\n");
+
+    const result = compressToolOutput({ text: raw, command: "pytest -v", store });
+    assert.isTrue(result.compressed);
+    assert.include(result.text, "=== FAILURES ===");
+    assert.include(result.text, "Traceback (most recent call last):");
+    assert.include(result.text, "ValueError: invalid payload");
+    assert.include(result.text, "Caused by: RuntimeException: bad state");
+    assert.include(result.text, "ctx-after-exception-1");
+    assert.include(result.text, "=== 1 failed, 90 passed in 1.25s ===");
+  });
+
+  it("compacts clean-pass test runner output >16 lines to first 2, summary, and last 4 lines", () => {
+    const store = createCcrStore();
+    const raw = [
+      "head-line-1",
+      "head-line-2",
+      "verbose-middle-chatter-3",
+      ...Array.from({ length: 40 }, (_, i) => `verbose setup step ${i}: ${"z".repeat(40)}`),
+      "tail-line-1",
+      "tail-line-2",
+      "Test Files  12 passed (12)",
+      "Tests  48 passed (48)",
+    ].join("\n");
+
+    const result = compressToolOutput({ text: raw, command: "vitest run", store });
+    assert.isTrue(result.compressed);
+    assert.include(result.text, "head-line-1");
+    assert.include(result.text, "head-line-2");
+    assert.notInclude(result.text, "verbose-middle-chatter-3");
+    assert.include(result.text, "lines omitted ...]");
+    assert.include(result.text, "tail-line-1");
+    assert.include(result.text, "Test Files  12 passed (12)");
+    assert.include(result.text, "Tests  48 passed (48)");
+  });
+
+  it("does not compact failure or non-zero exit runner output lacking FAIL/Error markers as a clean pass", () => {
+    const store = createCcrStore();
+    const raw = [
+      "custom runner boot",
+      ...Array.from({ length: 40 }, (_, i) => `✓ spec ${i} (${"a".repeat(80)})`),
+      "custom mismatch: actual 42 vs expected 99",
+      "diagnostic tail detail 1",
+      "diagnostic tail detail 2",
+      "diagnostic tail detail 3",
+      "diagnostic tail detail 4",
+      "=== 1 failed ===",
+      "Command exited with code 1",
+    ].join("\n");
+
+    const result = compressToolOutput({ text: raw, command: "vitest run", store });
+    assert.isTrue(result.compressed);
+    assert.include(result.text, "custom mismatch: actual 42 vs expected 99");
+    assert.include(result.text, "diagnostic tail detail 1");
+    assert.include(result.text, "=== 1 failed ===");
+    assert.include(result.text, "Command exited with code 1");
+  });
+
+  it("caps === section === dividers at 12 in compressCode and compresses strongly", () => {
+    const store = createCcrStore();
+    const lines: Array<string> = [];
+    for (let i = 0; i < 30; i += 1) {
+      lines.push(`=== section ${i} ===`);
+      lines.push(`  line a ${i}: ${"x".repeat(90)}`);
+      lines.push(`  line b ${i}: ${"y".repeat(90)}`);
+    }
+    const raw = lines.join("\n");
+
+    const result = compressToolOutput({ text: raw, contentTypeHint: "code", store });
+    assert.isTrue(result.compressed);
+    const keptDividers = result.text
+      .split("\n")
+      .filter((line) => /^L\d+:\s*===\ssection\s\d+\s===$/.test(line.trim()));
+    assert.isAbove(keptDividers.length, 0);
+    assert.isAtMost(keptDividers.length, 12);
+    assert.equal(keptDividers.length, 12);
+    assert.isBelow(result.compressedChars, result.originalChars * 0.5);
+  });
+
+  it("compacts clean-pass '0 failed' summaries while preserving '1 failed' summaries", () => {
+    const store = createCcrStore();
+    const passingRaw = [
+      "cargo test head-1",
+      "cargo test head-2",
+      "verbose-middle-chatter-only",
+      ...Array.from({ length: 40 }, (_, i) => `compiling crate step ${i}: ${"q".repeat(45)}`),
+      "tail-summary-context-1",
+      "tail-summary-context-2",
+      "tail-summary-context-3",
+      "test result: ok. 25 passed; 0 failed; 0 ignored",
+    ].join("\n");
+
+    const passingResult = compressToolOutput({ text: passingRaw, command: "cargo test", store });
+    assert.isTrue(passingResult.compressed);
+    assert.include(passingResult.text, "cargo test head-1");
+    assert.notInclude(passingResult.text, "verbose-middle-chatter-only");
+    assert.include(passingResult.text, "test result: ok. 25 passed; 0 failed; 0 ignored");
+
+    const failingRaw = [
+      "cargo test head-1",
+      ...Array.from({ length: 40 }, (_, i) => `test case_${i} ... ok (${"z".repeat(45)})`),
+      "custom diagnostic before failure",
+      "test result: FAILED. 24 passed; 1 failed",
+      "failure tail line",
+    ].join("\n");
+
+    const failingResult = compressToolOutput({ text: failingRaw, command: "cargo test", store });
+    assert.isTrue(failingResult.compressed);
+    assert.include(failingResult.text, "custom diagnostic before failure");
+    assert.include(failingResult.text, "test result: FAILED. 24 passed; 1 failed");
+    assert.include(failingResult.text, "failure tail line");
+  });
+
+  it("protects ±5 context around negative Windows NTSTATUS exit codes and skips clean-pass compaction", () => {
+    const store = createCcrStore();
+    const raw = [
+      "vitest head line",
+      ...Array.from({ length: 40 }, (_, i) => `✓ suite ${i} passed (${"x".repeat(45)})`),
+      "native crash context before ntstatus",
+      "Command exited with code -1073741819",
+      "Test Files  1 passed (1)",
+    ].join("\n");
+
+    const result = compressToolOutput({ text: raw, command: "vitest run", store });
+    assert.isTrue(result.compressed);
+    assert.include(result.text, "native crash context before ntstatus");
+    assert.include(result.text, "Command exited with code -1073741819");
+  });
+});

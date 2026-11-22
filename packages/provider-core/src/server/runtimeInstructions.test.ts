@@ -71,9 +71,20 @@ describe("buildRuntimeInstructions", () => {
   it("adds Python REPL instructions only when asked, worded for whether built-ins remain", () => {
     assert.notInclude(buildRuntimeInstructions({ harness: "Codex" }), "<python_repl>");
     const alongside = buildRuntimeInstructions({ harness: "Codex", pythonRepl: "alongside" });
-    assert.include(alongside, "Prefer the `python` tool over shell and file tools");
+    assert.include(
+      alongside,
+      "Prefer the `python` tool from the t3-code MCP server over shell and read/search tools for batched reads, searches, log/data analysis, and verification",
+    );
+    assert.include(
+      alongside,
+      "Use native file-edit tools when editing source code (so rewind, LSP diagnostics, and hooks stay intact)",
+    );
     assert.notInclude(alongside, "Your only coding tool");
+    assert.notInclude(alongside, "Do all reading, searching, editing and verifying in it");
+    assert.notInclude(alongside, "replace text");
     const only = buildRuntimeInstructions({ harness: "Claude Code", pythonRepl: "only" });
     assert.include(only, "Your only coding tool is the `python` tool");
+    assert.include(only, "Do all reading, searching, editing and verifying in it");
+    assert.include(only, "replace text");
   });
 });

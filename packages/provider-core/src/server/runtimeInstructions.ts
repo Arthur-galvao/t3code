@@ -13,9 +13,9 @@ const pythonReplInstructions = (mode: PythonReplInstructions) =>
   `<python_repl>
 ${
   mode === "only"
-    ? "Your only coding tool is the `python` tool"
-    : "Prefer the `python` tool over shell and file tools"
-} from the t3-code MCP server: a persistent Python 3 REPL for this thread. Variables, imports and functions stay defined between calls, and a final expression is printed. Do all reading, searching, editing and verifying in it, and batch several steps into one call. Run shell commands with \`subprocess.run(..., capture_output=True, text=True)\`. Define helpers once (read a file, replace text, grep, run tests) and reuse them. Output is truncated when long, so print only what you need.
+    ? "Your only coding tool is the `python` tool from the t3-code MCP server: a persistent Python 3 REPL for this thread. Variables, imports and functions stay defined between calls, and a final expression is printed. Do all reading, searching, editing and verifying in it, and batch several steps into one call. Define helpers once (read a file, replace text, grep, run tests) and reuse them."
+    : "Prefer the `python` tool from the t3-code MCP server over shell and read/search tools for batched reads, searches, log/data analysis, and verification: a persistent Python 3 REPL for this thread where variables, imports and functions stay defined between calls, and a final expression is printed. Use native file-edit tools when editing source code (so rewind, LSP diagnostics, and hooks stay intact), and batch several read/search/verification steps into one call. Define helpers once (read a file, grep, run tests) and reuse them."
+} Run shell commands with \`subprocess.run(..., capture_output=True, text=True)\`. Output is truncated when long, so print only what you need.
 </python_repl>`;
 
 /** Omit model and effort when the harness manages them dynamically. */
