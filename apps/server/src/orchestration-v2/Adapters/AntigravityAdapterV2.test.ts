@@ -15,6 +15,8 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -2833,5 +2835,578 @@ describe("AntigravityAdapterV2 session system prompt", () => {
         ),
         Effect.scoped,
       ),
+  );
+
+  it.live(
+    "forwards compatible user ~/.gemini/config/mcp_config.json servers alongside t3-code in ACP session/new",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const tempRoot = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-usermcp-" });
+        const userHome = path.join(tempRoot, "home");
+        const configPath = path.join(userHome, ".gemini", "config", "mcp_config.json");
+        yield* fileSystem.makeDirectory(path.dirname(configPath), { recursive: true });
+        yield* fileSystem.writeFileString(
+          configPath,
+          JSON.stringify({
+            mcpServers: {
+              "t3-code": { command: "hijack", args: [] },
+              context7: { serverUrl: "https://mcp.context7.com/mcp" },
+              shadcn: { command: "npx", args: ["-y", "shadcn@4.23.0", "mcp"] },
+              magicui: { command: "npx", args: ["-y", "@magicuidesign/mcp@2.1.1"] },
+            },
+          }),
+        );
+        const requestLog = path.join(tempRoot, "requests.ndjson");
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        const promptReceived = yield* Deferred.make<void>();
+        const instanceId = ProviderInstanceId.make("antigravity-user-mcp");
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          userHome,
+          selfInvocation: yield* resolveSelfInvocation(),
+          makeRuntime: (input) =>
+            makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: {
+                  T3_ACP_ANTIGRAVITY: "1",
+                  T3_ACP_AGENT_VERSION: "1.4.5",
+                  T3_ACP_MCP_HTTP: "1",
+                  T3_ACP_REQUEST_LOG_PATH: requestLog,
+                  T3_ACP_HANG_PROMPT_FOREVER: "1",
+                },
+              },
+            }).pipe(
+              Effect.provideService(SecureRandom.SecureRandom, crypto),
+              Effect.map((runtime): RuntimeService => ({
+                ...runtime,
+                prompt: (request) =>
+                  Deferred.succeed(promptReceived, undefined).pipe(
+                    Effect.andThen(runtime.prompt(request)),
+                  ),
+              })),
+            ),
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+        const workspace = path.join(tempRoot, "workspace");
+        yield* fileSystem.makeDirectory(workspace, { recursive: true });
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const threadId = ThreadId.make("thread-antigravity-user-mcp");
+        yield* (yield* McpProviderSessions.McpProviderSessions).set({
+          environmentId: EnvironmentId.make("environment-antigravity-user-mcp"),
+          threadId,
+          providerSessionId: "provider-session-antigravity-user-mcp",
+          providerInstanceId: instanceId,
+          endpoint: "http://127.0.0.1:43124/mcp",
+          authorizationHeader: "Bearer user-mcp-token",
+          browserToolsAvailable: false,
+        });
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-user-mcp"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        yield* session
+          .startTurn({
+            appThread: {
+              createdBy: "user",
+              creationSource: "web",
+              id: threadId,
+              projectId: ProjectId.make("project-antigravity-user-mcp"),
+              title: "Antigravity user mcp",
+              providerInstanceId: instanceId,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: providerThread.id,
+              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+            threadId,
+            runId: RunId.make("run-antigravity-user-mcp"),
+            runOrdinal: 1,
+            providerTurnOrdinal: 1,
+            attemptId: RunAttemptId.make("attempt-antigravity-user-mcp"),
+            rootNodeId: NodeId.make("node-antigravity-user-mcp"),
+            providerThread,
+            message: {
+              createdBy: "user",
+              creationSource: "web",
+              messageId: MessageId.make("message-antigravity-user-mcp"),
+              text: "check mcp",
+              attachments: [],
+            },
+            modelSelection,
+            runtimePolicy,
+          })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(promptReceived);
+        const logged = (yield* fileSystem.readFileString(requestLog))
+          .split(/\r?\n/)
+          .filter((line) => line.trim().length > 0)
+          .map(
+            (line) => JSON.parse(line) as { method?: string; params?: { mcpServers?: unknown } },
+          );
+        const newSession = logged.find((req) => req.method === "session/new");
+        const mcpServers = (newSession?.params?.mcpServers ?? []) as Array<{
+          name: string;
+          type?: string;
+          url?: string;
+          headers?: Array<unknown>;
+          command?: string;
+          args?: Array<string>;
+        }>;
+        assert.deepEqual(
+          mcpServers.map((s) => s.name),
+          ["t3-code", "context7", "shadcn", "magicui"],
+        );
+        assert.equal(mcpServers[0]?.url, "http://127.0.0.1:43124/mcp");
+        assert.deepEqual(mcpServers[1], {
+          type: "http",
+          name: "context7",
+          url: "https://mcp.context7.com/mcp",
+          headers: [],
+        });
+        const hostPlatform = yield* HostProcess.Platform;
+        if (hostPlatform === "win32") {
+          assert.match(mcpServers[2]?.command ?? "", /(node|cmd)\.exe$/i);
+          if (/node\.exe$/i.test(mcpServers[2]?.command ?? "")) {
+            assert.match(mcpServers[2]?.args?.[0] ?? "", /npx-cli\.js$/i);
+            assert.deepEqual(mcpServers[2]?.args?.slice(1), ["-y", "shadcn@4.23.0", "mcp"]);
+            assert.match(mcpServers[3]?.args?.[0] ?? "", /npx-cli\.js$/i);
+            assert.deepEqual(mcpServers[3]?.args?.slice(1), ["-y", "@magicuidesign/mcp@2.1.1"]);
+          } else {
+            assert.deepEqual(mcpServers[2]?.args, [
+              "/d",
+              "/c",
+              "npx",
+              "-y",
+              "shadcn@4.23.0",
+              "mcp",
+            ]);
+            assert.deepEqual(mcpServers[3]?.args, [
+              "/d",
+              "/c",
+              "npx",
+              "-y",
+              "@magicuidesign/mcp@2.1.1",
+            ]);
+          }
+        } else {
+          assert.equal(mcpServers[2]?.command, "npx");
+          assert.deepEqual(mcpServers[2]?.args, ["-y", "shadcn@4.23.0", "mcp"]);
+          assert.equal(mcpServers[3]?.command, "npx");
+          assert.deepEqual(mcpServers[3]?.args, ["-y", "@magicuidesign/mcp@2.1.1"]);
+        }
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            NodeCrypto.layer,
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            TestProviderHost.layer({ settings: DEFAULT_SERVER_SETTINGS }).pipe(
+              Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+            ),
+          ),
+        ),
+        Effect.scoped,
+      ),
+  );
+
+  it.live(
+    "unwraps npx.cmd directly to node.exe + npx-cli.js and falls back cleanly when initialize omits mcpCapabilities",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const tempRoot = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-agy15-" });
+        const fakeNodeDir = path.join(tempRoot, "fake-node");
+        const fakeNodeExe = path.join(fakeNodeDir, "node.exe");
+        const fakeNpxCmd = path.join(fakeNodeDir, "npx.CMD");
+        const fakeNpxCli = path.join(fakeNodeDir, "node_modules", "npm", "bin", "npx-cli.js");
+        yield* fileSystem.makeDirectory(path.dirname(fakeNpxCli), { recursive: true });
+        yield* fileSystem.writeFileString(fakeNodeExe, "");
+        yield* fileSystem.writeFileString(fakeNpxCmd, "@ECHO OFF\n");
+        yield* fileSystem.writeFileString(fakeNpxCli, "// npx-cli\n");
+
+        const userHome = path.join(tempRoot, "home");
+        const configPath = path.join(userHome, ".gemini", "config", "mcp_config.json");
+        yield* fileSystem.makeDirectory(path.dirname(configPath), { recursive: true });
+        yield* fileSystem.writeFileString(
+          configPath,
+          JSON.stringify({
+            mcpServers: {
+              "t3-code": { command: "hijack", args: [] },
+              context7: { command: "npx", args: ["-y", "@upstash/context7-mcp@4.7.3"] },
+              shadcn: { command: "npx", args: ["-y", "shadcn@4.23.0", "mcp"] },
+              magicui: { command: "npx", args: ["-y", "@magicuidesign/mcp@2.1.1"] },
+              customTool: { command: "custom-mcp", args: ["--flag"] },
+              httpOnly: { serverUrl: "https://unsupported.example.com/mcp" },
+            },
+          }),
+        );
+        const requestLog = path.join(tempRoot, "requests.ndjson");
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        const promptReceived = yield* Deferred.make<void>();
+        const instanceId = ProviderInstanceId.make("antigravity-agy15-mcp");
+        yield* Effect.gen(function* () {
+          const adapter = yield* makeAntigravityAdapterV2({
+            instanceId,
+            userHome,
+            selfInvocation: yield* resolveSelfInvocation(),
+            makeRuntime: (input) =>
+              makeAntigravityAcpRuntime({
+                ...input,
+                childProcessSpawner,
+                spawn: {
+                  command: process.execPath,
+                  args: [mockAgentPath],
+                  cwd: input.cwd,
+                  env: {
+                    T3_ACP_ANTIGRAVITY: "1",
+                    T3_ACP_AGENT_VERSION: "1.5.13",
+                    T3_ACP_REQUEST_LOG_PATH: requestLog,
+                    T3_ACP_HANG_PROMPT_FOREVER: "1",
+                  },
+                },
+              }).pipe(
+                Effect.provideService(SecureRandom.SecureRandom, crypto),
+                Effect.map((runtime): RuntimeService => ({
+                  ...runtime,
+                  prompt: (request) =>
+                    Deferred.succeed(promptReceived, undefined).pipe(
+                      Effect.andThen(runtime.prompt(request)),
+                    ),
+                })),
+              ),
+            withProcess: (_stop, task) => task,
+            defaultModel: Effect.undefined,
+          });
+          const workspace = path.join(tempRoot, "workspace");
+          yield* fileSystem.makeDirectory(workspace, { recursive: true });
+          const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: workspace,
+          });
+          const threadId = ThreadId.make("thread-antigravity-agy15-mcp");
+          yield* (yield* McpProviderSessions.McpProviderSessions).set({
+            environmentId: EnvironmentId.make("environment-antigravity-agy15-mcp"),
+            threadId,
+            providerSessionId: "provider-session-antigravity-agy15-mcp",
+            providerInstanceId: instanceId,
+            endpoint: "http://127.0.0.1:43126/mcp",
+            authorizationHeader: "Bearer agy15-mcp-token",
+            browserToolsAvailable: false,
+          });
+          const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+          const session = yield* adapter.openSession({
+            threadId,
+            providerSessionId: ProviderSessionId.make("provider-session-antigravity-agy15-mcp"),
+            modelSelection,
+            runtimePolicy,
+          });
+          const providerThread = yield* session.ensureThread({
+            threadId,
+            modelSelection,
+            runtimePolicy,
+          });
+          const now = yield* DateTime.now;
+          yield* session
+            .startTurn({
+              appThread: {
+                createdBy: "user",
+                creationSource: "web",
+                id: threadId,
+                projectId: ProjectId.make("project-antigravity-agy15-mcp"),
+                title: "Antigravity agy 1.5 mcp",
+                providerInstanceId: instanceId,
+                modelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: null,
+                worktreePath: null,
+                activeProviderThreadId: providerThread.id,
+                lineage: {
+                  parentThreadId: null,
+                  relationshipToParent: null,
+                  rootThreadId: threadId,
+                },
+                forkedFrom: null,
+                createdAt: now,
+                updatedAt: now,
+                archivedAt: null,
+                settledOverride: null,
+                settledAt: null,
+                lastVisitedAt: null,
+                deletedAt: null,
+              },
+              threadId,
+              runId: RunId.make("run-antigravity-agy15-mcp"),
+              runOrdinal: 1,
+              providerTurnOrdinal: 1,
+              attemptId: RunAttemptId.make("attempt-antigravity-agy15-mcp"),
+              rootNodeId: NodeId.make("node-antigravity-agy15-mcp"),
+              providerThread,
+              message: {
+                createdBy: "user",
+                creationSource: "web",
+                messageId: MessageId.make("message-antigravity-agy15-mcp"),
+                text: "check agy15 mcp",
+                attachments: [],
+              },
+              modelSelection,
+              runtimePolicy,
+            })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(promptReceived);
+        }).pipe(
+          Effect.provideService(HostProcess.Platform, "win32"),
+          Effect.provideService(HostProcess.Environment, {
+            ComSpec: "C:\\Windows\\System32\\cmd.exe",
+          }),
+          Effect.provideService(SpawnExecutableResolution, (command) =>
+            command === "npx"
+              ? fakeNpxCmd
+              : command === "custom-mcp"
+                ? "C:\\Program Files\\Custom Tool\\custom-mcp.cmd"
+                : undefined,
+          ),
+        );
+        const logged = (yield* fileSystem.readFileString(requestLog))
+          .split(/\r?\n/)
+          .filter((line) => line.trim().length > 0)
+          .map(
+            (line) => JSON.parse(line) as { method?: string; params?: { mcpServers?: unknown } },
+          );
+        const newSession = logged.find((req) => req.method === "session/new");
+        const mcpServers = (newSession?.params?.mcpServers ?? []) as Array<{
+          name: string;
+          command?: string;
+          args?: Array<string>;
+        }>;
+        assert.deepEqual(
+          mcpServers.map((s) => s.name),
+          ["t3-code", "context7", "shadcn", "magicui", "customTool"],
+        );
+        const expectedSep = fakeNpxCmd.includes("\\") ? "\\" : "/";
+        const expectedNodeExe = `${fakeNodeDir}${expectedSep}node.exe`;
+        const expectedNpxCli = `${fakeNodeDir}${expectedSep}node_modules${expectedSep}npm${expectedSep}bin${expectedSep}npx-cli.js`;
+        assert.equal(mcpServers[1]?.command, expectedNodeExe);
+        assert.deepEqual(mcpServers[1]?.args, [
+          expectedNpxCli,
+          "-y",
+          "@upstash/context7-mcp@4.7.3",
+        ]);
+        assert.equal(mcpServers[2]?.command, expectedNodeExe);
+        assert.deepEqual(mcpServers[2]?.args, [expectedNpxCli, "-y", "shadcn@4.23.0", "mcp"]);
+        assert.equal(mcpServers[3]?.command, expectedNodeExe);
+        assert.deepEqual(mcpServers[3]?.args, [expectedNpxCli, "-y", "@magicuidesign/mcp@2.1.1"]);
+        assert.equal(mcpServers[4]?.command, "C:\\Windows\\System32\\cmd.exe");
+        assert.deepEqual(mcpServers[4]?.args, ["/d", "/c", "custom-mcp", "--flag"]);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            NodeCrypto.layer,
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            TestProviderHost.layer({ settings: DEFAULT_SERVER_SETTINGS }).pipe(
+              Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+            ),
+          ),
+        ),
+        Effect.scoped,
+      ),
+  );
+
+  it.live("ignores malformed user mcp_config.json without breaking session startup", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const crypto = yield* SecureRandom.SecureRandom;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const tempRoot = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-badmcp-" });
+      const userHome = path.join(tempRoot, "home");
+      const configPath = path.join(userHome, ".gemini", "config", "mcp_config.json");
+      yield* fileSystem.makeDirectory(path.dirname(configPath), { recursive: true });
+      yield* fileSystem.writeFileString(configPath, "{ not valid json");
+      const requestLog = path.join(tempRoot, "requests.ndjson");
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      const promptReceived = yield* Deferred.make<void>();
+      const instanceId = ProviderInstanceId.make("antigravity-bad-mcp");
+      const adapter = yield* makeAntigravityAdapterV2({
+        instanceId,
+        userHome,
+        selfInvocation: yield* resolveSelfInvocation(),
+        makeRuntime: (input) =>
+          makeAntigravityAcpRuntime({
+            ...input,
+            childProcessSpawner,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: input.cwd,
+              env: {
+                T3_ACP_ANTIGRAVITY: "1",
+                T3_ACP_AGENT_VERSION: "1.4.5",
+                T3_ACP_MCP_HTTP: "1",
+                T3_ACP_REQUEST_LOG_PATH: requestLog,
+                T3_ACP_HANG_PROMPT_FOREVER: "1",
+              },
+            },
+          }).pipe(
+            Effect.provideService(SecureRandom.SecureRandom, crypto),
+            Effect.map((runtime): RuntimeService => ({
+              ...runtime,
+              prompt: (request) =>
+                Deferred.succeed(promptReceived, undefined).pipe(
+                  Effect.andThen(runtime.prompt(request)),
+                ),
+            })),
+          ),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.undefined,
+      });
+      const workspace = path.join(tempRoot, "workspace");
+      yield* fileSystem.makeDirectory(workspace, { recursive: true });
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: workspace,
+      });
+      const threadId = ThreadId.make("thread-antigravity-bad-mcp");
+      yield* (yield* McpProviderSessions.McpProviderSessions).set({
+        environmentId: EnvironmentId.make("environment-antigravity-bad-mcp"),
+        threadId,
+        providerSessionId: "provider-session-antigravity-bad-mcp",
+        providerInstanceId: instanceId,
+        endpoint: "http://127.0.0.1:43125/mcp",
+        authorizationHeader: "Bearer bad-mcp-token",
+        browserToolsAvailable: false,
+      });
+      const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-antigravity-bad-mcp"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const now = yield* DateTime.now;
+      yield* session
+        .startTurn({
+          appThread: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project-antigravity-bad-mcp"),
+            title: "Antigravity bad mcp",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          threadId,
+          runId: RunId.make("run-antigravity-bad-mcp"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("attempt-antigravity-bad-mcp"),
+          rootNodeId: NodeId.make("node-antigravity-bad-mcp"),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-antigravity-bad-mcp"),
+            text: "check bad mcp",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(promptReceived);
+      const logged = (yield* fileSystem.readFileString(requestLog))
+        .split(/\r?\n/)
+        .filter((line) => line.trim().length > 0)
+        .map((line) => JSON.parse(line) as { method?: string; params?: { mcpServers?: unknown } });
+      const newSession = logged.find((req) => req.method === "session/new");
+      const mcpServers = (newSession?.params?.mcpServers ?? []) as Array<{ name: string }>;
+      assert.deepEqual(
+        mcpServers.map((s) => s.name),
+        ["t3-code"],
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          TestProviderHost.layer({ settings: DEFAULT_SERVER_SETTINGS }).pipe(
+            Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+          ),
+        ),
+      ),
+      Effect.scoped,
+    ),
   );
 });

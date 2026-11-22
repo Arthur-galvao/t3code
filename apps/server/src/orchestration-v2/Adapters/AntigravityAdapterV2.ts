@@ -56,6 +56,7 @@ import {
   normalizeAntigravityToolCall,
 } from "../../provider/acp/AntigravityProtocol.ts";
 import { isAntigravitySignInRequiredError } from "../../provider/antigravityAuthSupport.ts";
+import { readAntigravityUserMcpServers } from "../../provider/antigravityUserMcpConfig.ts";
 import {
   AcpProviderCapabilitiesV2,
   makeAcpAdapterV2,
@@ -112,6 +113,10 @@ export interface AntigravityAdapterV2Options {
   readonly continuationRequests?: Parameters<typeof makeAcpAdapterV2>[0]["continuationRequests"];
   /** The agent's GEMINI_HOME. Its session logs show turns that ended on an upstream error. */
   readonly profileDirectory?: string;
+  /** Host user home holding ~/.gemini/config/mcp_config.json outside the isolated profile. */
+  readonly userHome?: string;
+  /** Merged driver process environment (PATH/ComSpec) used when resolving stdio MCP executables. */
+  readonly processEnvironment?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -190,7 +195,7 @@ function antigravityReadMinCompressChars(filePath: string): number {
 export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
-  const { profileDirectory } = options;
+  const { profileDirectory, userHome } = options;
   let safetyGuardEnabled = true;
   let compressionEnabled = true;
   const refreshSafetyGuardEnabled = options.toolSafetyGuardEnabled
@@ -405,6 +410,20 @@ export function makeAntigravityAcpAdapterFlavor(
     normalizeToolCall: normalizeAntigravityToolCall,
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
     supportsImagePrompts: true,
+    ...(userHome === undefined
+      ? {}
+      : {
+          readExtraMcpServers: () =>
+            readAntigravityUserMcpServers({
+              userHome,
+              ...(options.processEnvironment === undefined
+                ? {}
+                : { env: options.processEnvironment }),
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, options.fileSystem),
+              Effect.provideService(Path.Path, options.path),
+            ),
+        }),
     compactViaAdvertisedCommand: true,
     requiresSignIn: isAntigravitySignInRequiredError,
     checksVersionAtHandshake: true,
