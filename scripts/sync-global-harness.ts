@@ -4,28 +4,85 @@ import * as NodeOS from "node:os";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
-interface McpServerSpec {
-  readonly command: string;
-  readonly args: ReadonlyArray<string>;
-}
+export type McpTransportSpec =
+  | {
+      readonly transport?: "stdio";
+      readonly command: string;
+      readonly args: ReadonlyArray<string>;
+    }
+  | {
+      readonly transport: "http";
+      readonly url: string;
+    };
 
-const DEFAULT_MCP_SERVERS: Readonly<Record<string, McpServerSpec>> = {
+export type McpServerSpec = McpTransportSpec & {
+  readonly antigravity?: McpTransportSpec;
+};
+
+export type McpTargetFormat = "claude" | "antigravity";
+
+export const DEFAULT_MCP_SERVERS: Readonly<Record<string, McpServerSpec>> = {
+  context7: {
+    transport: "http",
+    url: "https://mcp.context7.com/mcp",
+    antigravity: {
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "@upstash/context7-mcp@4.7.3"],
+    },
+  },
   shadcn: {
+    transport: "stdio",
     command: "npx",
-    args: ["-y", "shadcn@latest", "mcp"],
+    args: ["-y", "shadcn@4.23.0", "mcp"],
   },
   magicui: {
+    transport: "stdio",
     command: "npx",
-    args: ["-y", "@magicuidesign/mcp@latest"],
+    args: ["-y", "@magicuidesign/mcp@2.1.1"],
   },
 };
+
+// Exact unpinned Round 1 defaults safe to auto-upgrade without disturbing user edits.
+export const LEGACY_DEFAULT_MCP_ENTRIES: Readonly<
+  Record<McpTargetFormat, Readonly<Record<string, ReadonlyArray<unknown>>>>
+> = {
+  claude: {
+    shadcn: [{ command: "npx", args: ["-y", "shadcn@latest", "mcp"] }],
+    magicui: [{ command: "npx", args: ["-y", "@magicuidesign/mcp@latest"] }],
+  },
+  antigravity: {
+    context7: [{ serverUrl: "https://mcp.context7.com/mcp" }],
+    shadcn: [{ command: "npx", args: ["-y", "shadcn@latest", "mcp"] }],
+    magicui: [{ command: "npx", args: ["-y", "@magicuidesign/mcp@latest"] }],
+  },
+};
+
+export function formatMcpServerForTarget(
+  spec: McpServerSpec,
+  format: McpTargetFormat,
+): Record<string, unknown> {
+  const effective = format === "antigravity" && spec.antigravity ? spec.antigravity : spec;
+  if (effective.transport === "http") {
+    return format === "antigravity"
+      ? { serverUrl: effective.url }
+      : { type: "http", url: effective.url };
+  }
+  return {
+    command: effective.command,
+    args: [...effective.args],
+  };
+}
 
 const decodeJsonUnknown = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 const encodeJsonUnknown = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
@@ -44,64 +101,298 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-const syncJsonMcpFile = Effect.fn("syncJsonMcpFile")(function* (filePath: string) {
+function stableJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stableJsonValue);
+  }
+  if (isPlainRecord(value)) {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      out[key] = stableJsonValue(value[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+export function shouldApplyMcpSpec(
+  existing: unknown,
+  desired: unknown,
+  name: string,
+  format: McpTargetFormat,
+): boolean {
+  if (existing === undefined) {
+    return true;
+  }
+  const existingKey = JSON.stringify(stableJsonValue(existing));
+  const desiredKey = JSON.stringify(stableJsonValue(desired));
+  if (existingKey === desiredKey) {
+    return false;
+  }
+  const legacyEntries = LEGACY_DEFAULT_MCP_ENTRIES[format][name] ?? [];
+  return legacyEntries.some((legacy) => JSON.stringify(stableJsonValue(legacy)) === existingKey);
+}
+
+function parseMcpTransportSpec(raw: unknown): McpTransportSpec | undefined {
+  if (!isPlainRecord(raw)) {
+    return undefined;
+  }
+  if (raw.transport === "http") {
+    return typeof raw.url === "string" && raw.url.trim().length > 0
+      ? { transport: "http", url: raw.url.trim() }
+      : undefined;
+  }
+  if (raw.transport === undefined || raw.transport === "stdio") {
+    if (typeof raw.command !== "string" || raw.command.trim().length === 0) {
+      return undefined;
+    }
+    const args =
+      raw.args === undefined
+        ? []
+        : Array.isArray(raw.args) && raw.args.every((item) => typeof item === "string")
+          ? [...raw.args]
+          : undefined;
+    if (args === undefined) {
+      return undefined;
+    }
+    return { transport: "stdio", command: raw.command.trim(), args };
+  }
+  return undefined;
+}
+
+export class SyncGlobalHarnessConfigError extends Schema.TaggedError<SyncGlobalHarnessConfigError>()(
+  "SyncGlobalHarnessConfigError",
+  {
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+export const loadCanonicalMcpServers = Effect.fn("loadCanonicalMcpServers")(function* (
+  specPath: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  if (!(yield* fs.exists(specPath))) {
+    return DEFAULT_MCP_SERVERS;
+  }
+  const raw = (yield* fs.readFileString(specPath)).trim();
+  if (raw === "") {
+    return yield* new SyncGlobalHarnessConfigError({
+      detail: `Canonical MCP spec is empty: ${specPath}`,
+    });
+  }
+  const decoded = yield* decodeJsonUnknown(raw).pipe(
+    Effect.mapError(
+      (cause) =>
+        new SyncGlobalHarnessConfigError({
+          detail: `Invalid canonical MCP spec at ${specPath}: ${String(cause)}`,
+          cause,
+        }),
+    ),
+  );
+  if (!isPlainRecord(decoded) || !isPlainRecord(decoded.mcpServers)) {
+    return yield* new SyncGlobalHarnessConfigError({
+      detail: `Canonical MCP spec must be a JSON object with mcpServers: ${specPath}`,
+    });
+  }
+  const parsed: Record<string, McpServerSpec> = {};
+  for (const [name, entry] of Object.entries(decoded.mcpServers)) {
+    const base = parseMcpTransportSpec(entry);
+    if (base === undefined) {
+      return yield* new SyncGlobalHarnessConfigError({
+        detail: `Invalid canonical MCP server entry "${name}" in ${specPath}.`,
+      });
+    }
+    let antigravity: McpTransportSpec | undefined;
+    if (isPlainRecord(entry) && entry.antigravity !== undefined) {
+      antigravity = parseMcpTransportSpec(entry.antigravity);
+      if (antigravity === undefined) {
+        return yield* new SyncGlobalHarnessConfigError({
+          detail: `Invalid antigravity override for MCP server "${name}" in ${specPath}.`,
+        });
+      }
+    }
+    parsed[name] = antigravity === undefined ? base : { ...base, antigravity };
+  }
+  return parsed;
+});
+
+const RETRYABLE_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+function extractErrorCode(error: unknown, depth = 0): string | undefined {
+  if (depth >= 4 || !isPlainRecord(error)) {
+    return undefined;
+  }
+  if (typeof error.code === "string") {
+    return error.code;
+  }
+  return extractErrorCode(error.cause, depth + 1) ?? extractErrorCode(error.reason, depth + 1);
+}
+
+function isRetryableRenameError(error: unknown): boolean {
+  const code = extractErrorCode(error);
+  return code !== undefined && RETRYABLE_RENAME_CODES.has(code);
+}
+
+let atomicWriteCounter = 0;
+
+function posixFileMode(
+  platform: NodeJS.Platform,
+  filePath: string,
+  existingMode: number | undefined,
+): number | undefined {
+  if (platform === "win32") {
+    return undefined;
+  }
+  if (existingMode !== undefined) {
+    return existingMode & 0o777;
+  }
+  return filePath.endsWith(".claude.json") ? 0o600 : undefined;
+}
+
+const writeFileAtomic = Effect.fn("writeFileAtomic")(function* (
+  filePath: string,
+  content: string,
+  createBackup: boolean,
+) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const platform = yield* HostProcess.Platform;
+  yield* fs.makeDirectory(path.dirname(filePath), { recursive: true });
   const exists = yield* fs.exists(filePath);
-  if (!exists && !initMissing) {
+  const existingInfo = exists ? yield* fs.stat(filePath) : undefined;
+  const mode = posixFileMode(platform, filePath, existingInfo?.mode);
+  const nowMillis = yield* Clock.currentTimeMillis;
+  atomicWriteCounter += 1;
+  const suffix = `${process.pid}.${nowMillis}.${atomicWriteCounter}`;
+  const tmpPath = `${filePath}.tmp.${suffix}`;
+
+  yield* Effect.gen(function* () {
+    // Write tmp first (with final POSIX mode from creation when supported) so out-of-space errors preserve original/.bak.
+    yield* fs.writeFileString(tmpPath, content, mode === undefined ? {} : { mode });
+    if (mode !== undefined) {
+      yield* fs.chmod(tmpPath, mode);
+    }
+    if (createBackup && exists) {
+      const bakPath = `${filePath}.bak`;
+      yield* fs.copyFile(filePath, bakPath);
+      if (mode !== undefined) {
+        yield* fs.chmod(bakPath, mode);
+      }
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const renamed = yield* Effect.result(fs.rename(tmpPath, filePath));
+      if (Result.isSuccess(renamed)) {
+        return;
+      }
+      if (attempt === 2 || !isRetryableRenameError(renamed.failure)) {
+        return yield* renamed.failure;
+      }
+      yield* Effect.sleep("50 millis");
+    }
+  }).pipe(Effect.onError(() => fs.remove(tmpPath, { force: true }).pipe(Effect.ignore)));
+});
+
+const readValidatedJsonObjectFile = Effect.fn("readValidatedJsonObjectFile")(function* (
+  filePath: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const raw = (yield* fs.readFileString(filePath)).trim();
+  if (raw === "") {
+    return {} as Record<string, unknown>;
+  }
+  const loaded = yield* decodeJsonUnknown(raw).pipe(
+    Effect.mapError(
+      (cause) =>
+        new SyncGlobalHarnessConfigError({
+          detail: `Invalid JSON at ${filePath}: ${String(cause)}`,
+          cause,
+        }),
+    ),
+  );
+  if (!isPlainRecord(loaded)) {
+    return yield* new SyncGlobalHarnessConfigError({
+      detail: `JSON root must be an object at ${filePath}.`,
+    });
+  }
+  return loaded;
+});
+
+export const validateJsonMcpTargets = Effect.fn("validateJsonMcpTargets")(function* (
+  filePaths: ReadonlyArray<string>,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  for (const filePath of filePaths) {
+    if (yield* fs.exists(filePath)) {
+      yield* readValidatedJsonObjectFile(filePath);
+    }
+  }
+});
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+export const syncJsonMcpFile = Effect.fn("syncJsonMcpFile")(function* (
+  filePath: string,
+  targetFormat: McpTargetFormat,
+  isDryRun = dryRun,
+  shouldInitMissing = initMissing,
+  servers: Readonly<Record<string, McpServerSpec>> = DEFAULT_MCP_SERVERS,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const exists = yield* fs.exists(filePath);
+  if (!exists && !shouldInitMissing) {
     yield* logAction("skip-missing", filePath, "not present (pass --init-missing to create)");
     return;
   }
 
-  let parsed: Record<string, unknown> = {};
-  if (exists) {
-    const raw = (yield* fs.readFileString(filePath)).trim();
-    const loaded = yield* (raw === "" ? Effect.succeed<unknown>({}) : decodeJsonUnknown(raw)).pipe(
-      Effect.catch((error) =>
-        Effect.gen(function* () {
-          yield* Effect.logWarning(`Skipped invalid JSON at ${filePath}: ${String(error)}`);
-          return null;
-        }),
-      ),
-    );
-    if (loaded === null) {
-      return;
-    }
-    if (isPlainRecord(loaded)) {
-      parsed = loaded;
-    }
-  }
+  const parsed: Record<string, unknown> = exists
+    ? yield* readValidatedJsonObjectFile(filePath)
+    : {};
 
   const existingServers: Record<string, unknown> = isPlainRecord(parsed.mcpServers)
     ? { ...parsed.mcpServers }
     : {};
 
-  const added: Array<string> = [];
-  for (const [name, spec] of Object.entries(DEFAULT_MCP_SERVERS)) {
-    if (!(name in existingServers)) {
-      existingServers[name] = {
-        command: spec.command,
-        args: [...spec.args],
-      };
-      added.push(name);
+  const changed: Array<string> = [];
+  for (const [name, spec] of Object.entries(servers)) {
+    const desired = formatMcpServerForTarget(spec, targetFormat);
+    if (shouldApplyMcpSpec(existingServers[name], desired, name, targetFormat)) {
+      existingServers[name] = desired;
+      changed.push(name);
     }
   }
 
-  if (added.length === 0) {
+  if (exists && changed.length === 0) {
     yield* logAction("mcp-json", filePath, "already in sync");
     return;
   }
 
   const next = { ...parsed, mcpServers: existingServers };
-  if (!dryRun) {
-    yield* fs.makeDirectory(path.dirname(filePath), { recursive: true });
+  if (!isDryRun) {
     const serialized = yield* encodeJsonPretty(next);
-    yield* fs.writeFileString(filePath, `${serialized}\n`);
+    yield* writeFileAtomic(filePath, `${serialized}\n`, exists);
   }
-  yield* logAction("mcp-json", filePath, `added ${added.join(", ")}`);
+  yield* logAction(
+    "mcp-json",
+    filePath,
+    changed.length > 0 ? `synced ${changed.join(", ")}` : "initialized",
+  );
 });
 
-const syncCodexToml = Effect.fn("syncCodexToml")(function* (filePath: string) {
+const syncCodexToml = Effect.fn("syncCodexToml")(function* (
+  filePath: string,
+  servers: Readonly<Record<string, McpServerSpec>> = DEFAULT_MCP_SERVERS,
+) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const exists = yield* fs.exists(filePath);
@@ -114,17 +405,23 @@ const syncCodexToml = Effect.fn("syncCodexToml")(function* (filePath: string) {
   const sectionsToAppend: Array<string> = [];
   const added: Array<string> = [];
 
-  for (const [name, spec] of Object.entries(DEFAULT_MCP_SERVERS)) {
-    const headerPattern = new RegExp(`^\\[mcp_servers\\.${name}\\]`, "m");
+  for (const [name, spec] of Object.entries(servers)) {
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const headerPattern = new RegExp(`^\\[mcp_servers\\.${escapedName}\\]`, "m");
     if (!headerPattern.test(raw)) {
-      const encodedCommand = yield* encodeJsonUnknown(spec.command);
-      const encodedArgs = yield* encodeJsonUnknown(spec.args);
-      sectionsToAppend.push(
-        `[mcp_servers.${name}]`,
-        `command = ${encodedCommand}`,
-        `args = ${encodedArgs}`,
-        "",
-      );
+      if (spec.transport === "http") {
+        const encodedUrl = yield* encodeJsonUnknown(spec.url);
+        sectionsToAppend.push(`[mcp_servers.${name}]`, `url = ${encodedUrl}`, "");
+      } else {
+        const encodedCommand = yield* encodeJsonUnknown(spec.command);
+        const encodedArgs = yield* encodeJsonUnknown(spec.args);
+        sectionsToAppend.push(
+          `[mcp_servers.${name}]`,
+          `command = ${encodedCommand}`,
+          `args = ${encodedArgs}`,
+          "",
+        );
+      }
       added.push(name);
     }
   }
@@ -137,7 +434,7 @@ const syncCodexToml = Effect.fn("syncCodexToml")(function* (filePath: string) {
   if (!dryRun) {
     yield* fs.makeDirectory(path.dirname(filePath), { recursive: true });
     const separator = raw.length > 0 && !raw.endsWith("\n") ? "\n\n" : raw.length > 0 ? "\n" : "";
-    yield* fs.writeFileString(filePath, `${raw}${separator}${sectionsToAppend.join("\n")}`);
+    yield* writeFileAtomic(filePath, `${raw}${separator}${sectionsToAppend.join("\n")}`, exists);
   }
   yield* logAction("mcp-toml", filePath, `added ${added.join(", ")}`);
 });
@@ -218,12 +515,12 @@ export const syncSkillTree = Effect.fn("syncSkillTree")(function* (
       const destExists = yield* fs.exists(dstPath);
       if (current.depth === 0 && entry === "council.json" && destExists) continue;
 
-      const srcText = yield* fs.readFileString(srcPath);
-      const destText = destExists ? yield* fs.readFileString(dstPath) : null;
-      if (srcText !== destText) {
+      const srcBytes = yield* fs.readFile(srcPath);
+      const destBytes = destExists ? yield* fs.readFile(dstPath) : null;
+      if (destBytes === null || !bytesEqual(srcBytes, destBytes)) {
         if (!isDryRun) {
           yield* fs.makeDirectory(path.dirname(dstPath), { recursive: true });
-          yield* fs.writeFileString(dstPath, srcText);
+          yield* fs.writeFile(dstPath, srcBytes);
         }
         copied += 1;
       }
@@ -249,6 +546,11 @@ const syncSkillDirs = Effect.gen(function* () {
     path.join(homeDir, ".claude", "skills"),
     path.join(homeDir, ".gemini", "config", "skills"),
   ];
+  // Sync standalone Gemini CLI skills dir only when already present; never create it on --init-missing.
+  const geminiLegacySkills = path.join(homeDir, ".gemini", "skills");
+  if (yield* fs.exists(geminiLegacySkills)) {
+    targets.push(geminiLegacySkills);
+  }
 
   for (const targetRoot of targets) {
     if (!(yield* fs.exists(targetRoot)) && !initMissing) {
@@ -317,8 +619,7 @@ const syncGlobalClaudeMd = Effect.fn("syncGlobalClaudeMd")(function* (filePath: 
   }
 
   if (!dryRun) {
-    yield* fs.makeDirectory(parentDir, { recursive: true });
-    yield* fs.writeFileString(filePath, next);
+    yield* writeFileAtomic(filePath, next, existing.length > 0);
   }
   yield* logAction(
     "claude-md",
@@ -331,10 +632,15 @@ const syncGlobalClaudeMd = Effect.fn("syncGlobalClaudeMd")(function* (filePath: 
 
 const main = Effect.gen(function* () {
   const path = yield* Path.Path;
-  yield* syncJsonMcpFile(path.join(homeDir, ".claude.json"));
-  yield* syncJsonMcpFile(path.join(homeDir, ".claude", ".claude.json"));
-  yield* syncJsonMcpFile(path.join(homeDir, ".gemini", "antigravity", "mcp_config.json"));
-  yield* syncCodexToml(path.join(homeDir, ".codex", "config.toml"));
+  const claudeRootPath = path.join(homeDir, ".claude.json");
+  const claudeSubPath = path.join(homeDir, ".claude", ".claude.json");
+  const agMcpPath = path.join(homeDir, ".gemini", "config", "mcp_config.json");
+  const servers = yield* loadCanonicalMcpServers(path.join(homeDir, ".agents", "mcp-servers.json"));
+  yield* validateJsonMcpTargets([claudeRootPath, claudeSubPath, agMcpPath]);
+  yield* syncJsonMcpFile(claudeRootPath, "claude", dryRun, initMissing, servers);
+  yield* syncJsonMcpFile(claudeSubPath, "claude", dryRun, initMissing, servers);
+  yield* syncJsonMcpFile(agMcpPath, "antigravity", dryRun, initMissing, servers);
+  yield* syncCodexToml(path.join(homeDir, ".codex", "config.toml"), servers);
   yield* syncGlobalClaudeMd(path.join(homeDir, ".claude", "CLAUDE.md"));
   yield* syncSkillDirs;
 });
