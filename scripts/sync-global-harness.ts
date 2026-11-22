@@ -142,6 +142,96 @@ const syncCodexToml = Effect.fn("syncCodexToml")(function* (filePath: string) {
   yield* logAction("mcp-toml", filePath, `added ${added.join(", ")}`);
 });
 
+const REPO_LOCAL_SKILLS = new Set([
+  "test-t3-app",
+  "test-t3-mobile",
+  "verify-t3",
+  "contribution-triage",
+]);
+
+export function shouldSyncSkillGlobally(skillName: string, skillMdContent: string): boolean {
+  const match = skillMdContent.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (match !== null) {
+    const frontmatter = match[1] ?? "";
+    if (
+      /^\s*sync-global\s*:\s*false\b/im.test(frontmatter) ||
+      /^\s*scope\s*:\s*(?:repo|local|repo-local)\b/im.test(frontmatter)
+    ) {
+      return false;
+    }
+    if (/^\s*sync-global\s*:\s*true\b/im.test(frontmatter)) {
+      return true;
+    }
+  }
+  return !REPO_LOCAL_SKILLS.has(skillName);
+}
+
+export const collectGlobalSkillNames = Effect.fn("collectGlobalSkillNames")(function* (
+  sourceDir: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  if (!(yield* fs.exists(sourceDir))) {
+    return [] as Array<string>;
+  }
+  const entries = yield* fs.readDirectory(sourceDir);
+  const skillNames: Array<string> = [];
+  for (const entry of entries) {
+    const entryDir = path.join(sourceDir, entry);
+    const info = yield* fs.stat(entryDir);
+    if (info.type !== "Directory") continue;
+    const skillMdPath = path.join(entryDir, "SKILL.md");
+    if (!(yield* fs.exists(skillMdPath))) continue;
+    const skillMdContent = yield* fs.readFileString(skillMdPath);
+    if (!shouldSyncSkillGlobally(entry, skillMdContent)) continue;
+    skillNames.push(entry);
+  }
+  return skillNames;
+});
+
+export const syncSkillTree = Effect.fn("syncSkillTree")(function* (
+  srcDir: string,
+  dstDir: string,
+  isDryRun: boolean,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  let copied = 0;
+  const stack: Array<{ readonly src: string; readonly dst: string; readonly depth: number }> = [
+    { src: srcDir, dst: dstDir, depth: 0 },
+  ];
+
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    const entries = yield* fs.readDirectory(current.src);
+    for (const entry of entries) {
+      if (entry.startsWith(".") || entry === "__pycache__") continue;
+      const srcPath = path.join(current.src, entry);
+      const dstPath = path.join(current.dst, entry);
+      const info = yield* fs.stat(srcPath);
+      if (info.type === "Directory") {
+        stack.push({ src: srcPath, dst: dstPath, depth: current.depth + 1 });
+        continue;
+      }
+      if (info.type !== "File") continue;
+
+      const destExists = yield* fs.exists(dstPath);
+      if (current.depth === 0 && entry === "council.json" && destExists) continue;
+
+      const srcText = yield* fs.readFileString(srcPath);
+      const destText = destExists ? yield* fs.readFileString(dstPath) : null;
+      if (srcText !== destText) {
+        if (!isDryRun) {
+          yield* fs.makeDirectory(path.dirname(dstPath), { recursive: true });
+          yield* fs.writeFileString(dstPath, srcText);
+        }
+        copied += 1;
+      }
+    }
+  }
+  return copied;
+});
+
 const syncSkillDirs = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -152,18 +242,12 @@ const syncSkillDirs = Effect.gen(function* () {
     return;
   }
 
-  const entries = yield* fs.readDirectory(sourceDir);
-  const skillNames: Array<string> = [];
-  for (const entry of entries) {
-    const info = yield* fs.stat(path.join(sourceDir, entry));
-    if (info.type === "Directory") {
-      skillNames.push(entry);
-    }
-  }
+  const skillNames = yield* collectGlobalSkillNames(sourceDir);
 
   const targets = [
     path.join(homeDir, ".agents", "skills"),
     path.join(homeDir, ".claude", "skills"),
+    path.join(homeDir, ".gemini", "config", "skills"),
   ];
 
   for (const targetRoot of targets) {
@@ -176,28 +260,7 @@ const syncSkillDirs = Effect.gen(function* () {
       const skillSourceDir = path.join(sourceDir, skill);
       const skillMarker = path.join(skillSourceDir, "SKILL.md");
       if (!(yield* fs.exists(skillMarker))) continue;
-
-      const skillEntries = yield* fs.readDirectory(skillSourceDir);
-      for (const fileName of skillEntries) {
-        if (fileName.startsWith(".")) continue;
-        const srcFile = path.join(skillSourceDir, fileName);
-        const fileInfo = yield* fs.stat(srcFile);
-        if (fileInfo.type !== "File") continue;
-
-        const destFile = path.join(targetRoot, skill, fileName);
-        const destExists = yield* fs.exists(destFile);
-        if (fileName === "council.json" && destExists) continue;
-
-        const srcText = yield* fs.readFileString(srcFile);
-        const destText = destExists ? yield* fs.readFileString(destFile) : null;
-        if (srcText !== destText) {
-          if (!dryRun) {
-            yield* fs.makeDirectory(path.dirname(destFile), { recursive: true });
-            yield* fs.writeFileString(destFile, srcText);
-          }
-          copied += 1;
-        }
-      }
+      copied += yield* syncSkillTree(skillSourceDir, path.join(targetRoot, skill), dryRun);
     }
     yield* logAction(
       "skills",

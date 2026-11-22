@@ -1,5 +1,6 @@
 ---
 name: verify-t3
+sync-global: false
 description: Scoped Windows-safe verification workflow for T3 Code using workspace-local vp.cmd (effect-tsgo typecheck, Vitest unit/browser tests, oxlint-plugin-t3code lint, knip, and check:changed).
 ---
 
