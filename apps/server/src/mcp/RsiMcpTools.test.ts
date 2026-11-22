@@ -10,6 +10,8 @@ import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { defaultCcrStore } from "@t3tools/provider-core/server/ccrStore";
+import { compressToolOutput } from "@t3tools/provider-core/server/contextCompressor";
 import * as ServerConfig from "../config.ts";
 import * as RsiService from "../orchestration-v2/RsiService.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
@@ -79,6 +81,10 @@ describe("RSI MCP tools", () => {
         model: "claude-sonnet-4-6",
         usedTokens: 1000,
         cachedInputTokens: 800,
+        spentTokens: 1200,
+        tokensSavedEst: 500,
+        compressedCallsCount: 2,
+        ccrRetrievals: 1,
         toolErrorCount: 1,
         loopTripped: false,
         safetyBlockedCount: 1,
@@ -134,6 +140,12 @@ describe("RSI MCP tools", () => {
       assert.equal(summaryResult.totalRuns, 1);
       assert.equal(summaryResult.safetyBlocks, 1);
       assert.equal(summaryResult.avgCacheHitRate, 0.8);
+      assert.equal(summaryResult.totalTokensSavedEst, 500);
+      assert.equal(summaryResult.totalCompressedCalls, 2);
+      assert.equal(summaryResult.totalCcrRetrievals, 1);
+      assert.equal(summaryResult.ccrRetrievalRate, 0.5);
+      assert.equal(summaryResult.totalSpentTokens, 1200);
+      assert.equal(summaryResult.byProvider[0]?.avgSpentTokens, 1200);
 
       const service = yield* OrchestratorMcpService.OrchestratorMcpService;
       const failure = yield* service
@@ -195,6 +207,131 @@ describe("RSI MCP tools", () => {
         ),
       ),
     ),
+  );
+
+  it.effect(
+    "syncs compressToolOutput + context_retrieve into rsi_telemetry_summary end-to-end",
+    () => {
+      const e2eThreadId = "thread:e2e-ccr";
+      const e2eScope: McpInvocationScope = {
+        environmentId: EnvironmentId.make("environment:e2e-ccr"),
+        requestNamespace: "provider-session:e2e-ccr",
+        thread: {
+          threadId: ThreadId.make(e2eThreadId),
+          providerSessionId: "provider-session:e2e-ccr",
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        },
+        client: undefined,
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 1,
+      };
+
+      return Effect.gen(function* () {
+        defaultCcrStore.clear();
+        const largePayload = Array.from(
+          { length: 80 },
+          (_, i) =>
+            `[2026-11-21T15:00:00Z] INFO worker-${i % 4}: processed item ${i} (${"x".repeat(60)})`,
+        ).join("\n");
+        const compressed = compressToolOutput({
+          text: largePayload,
+          threadId: e2eThreadId,
+          contentTypeHint: "logs",
+          minChars: 500,
+          store: defaultCcrStore,
+        });
+        assert.isTrue(compressed.compressed);
+        assert.isDefined(compressed.ccrId);
+        const ccrId = compressed.ccrId!;
+
+        const toolkit = yield* OrchestratorToolkit;
+        const retrieveOpt = yield* Stream.runHead(
+          yield* toolkit.handle("context_retrieve", {
+            ccrId,
+            startLine: 1,
+            endLine: 5,
+          }),
+        );
+        assert.isTrue(Option.isSome(retrieveOpt));
+        if (Option.isNone(retrieveOpt)) return;
+        assert.isFalse(retrieveOpt.value.isFailure);
+        const retrieveResult = retrieveOpt.value.result;
+        assert.isTrue("found" in retrieveResult);
+        if (!("found" in retrieveResult)) return;
+        assert.isTrue(retrieveResult.found);
+
+        const rsi = yield* RsiService.RsiService;
+        yield* rsi.recordRunTelemetry({
+          threadId: e2eThreadId,
+          runId: "run:e2e-ccr-1",
+          provider: "claudeAgent",
+          model: "claude-sonnet-5-5",
+          usedTokens: 1000,
+          cachedInputTokens: 700,
+          spentTokens: 1100,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 500,
+        });
+
+        const summaryOpt = yield* Stream.runHead(
+          yield* toolkit.handle("rsi_telemetry_summary", {
+            threadId: e2eThreadId,
+          }),
+        );
+        assert.isTrue(Option.isSome(summaryOpt));
+        if (Option.isNone(summaryOpt)) return;
+        assert.isFalse(summaryOpt.value.isFailure);
+        const summaryResult = summaryOpt.value.result;
+        assert.isTrue("totalCompressedCalls" in summaryResult);
+        if (!("totalCompressedCalls" in summaryResult)) return;
+        assert.equal(summaryResult.totalCompressedCalls, 1);
+        assert.equal(summaryResult.totalCcrRetrievals, 1);
+        assert.equal(summaryResult.ccrRetrievalRate, 1);
+        assert.isAbove(summaryResult.totalTokensSavedEst, 0);
+      }).pipe(
+        Effect.ensuring(Effect.sync(() => defaultCcrStore.clear())),
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(OrchestratorHandlers.layer).pipe(
+            Layer.provideMerge(
+              OrchestratorMcpService.layer.pipe(
+                Layer.provideMerge(RsiService.RsiService.makeLayer({ persistCcr: false })),
+                Layer.provide(
+                  Layer.mergeAll(
+                    NodeServices.layer,
+                    NodeCrypto.layer,
+                    ServerSettings.layerTest(),
+                    threadManagementMock,
+                    Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+                    Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+                    Layer.mock(ProviderRegistry.ProviderRegistry)({
+                      getProviders: Effect.succeed([]),
+                    }),
+                    Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+                      list: () => Effect.succeed([]),
+                    }),
+                    Layer.mock(ProjectService.ProjectService)({}),
+                    Layer.mock(SecretRequests.SecretRequests)({}),
+                    Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+                    Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+                  ),
+                ),
+              ),
+            ),
+            Layer.provideMerge(Layer.succeed(McpInvocationContext.McpInvocationContext, e2eScope)),
+            Layer.provideMerge(threadManagementMock),
+            Layer.provideMerge(Layer.mock(PeerForwarding.PeerForwarding)({})),
+            Layer.provideMerge(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
+            Layer.provideMerge(Layer.mock(PeerLinks.PeerLinks)({})),
+            Layer.provideMerge(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
+            Layer.provideMerge(Layer.mock(ThreadMetadataMcpService.ThreadMetadataMcpService)({})),
+          ),
+        ),
+      );
+    },
   );
 });
 

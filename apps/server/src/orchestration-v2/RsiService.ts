@@ -31,34 +31,76 @@ const UNSCOPED_CCR_KEY = "__global__";
 interface SyncedCcrBaseline {
   readonly tokensSavedEst: number;
   readonly compressedCallsCount: number;
+  readonly retrieveCallsCount: number;
 }
 
 function computeCcrDelta(
-  stats: Pick<CcrStats, "tokensSavedEst" | "compressedCallsCount">,
+  stats: Pick<CcrStats, "tokensSavedEst" | "compressedCallsCount" | "retrieveCallsCount">,
   synced: SyncedCcrBaseline | undefined,
-): { readonly tokens: number; readonly calls: number } {
+): { readonly tokens: number; readonly calls: number; readonly retrievals: number } {
   const prevTokens = synced?.tokensSavedEst ?? 0;
   const prevCalls = synced?.compressedCallsCount ?? 0;
+  const prevRetrievals = synced?.retrieveCallsCount ?? 0;
   const baseTokens = stats.tokensSavedEst < prevTokens ? 0 : prevTokens;
   const baseCalls = stats.compressedCallsCount < prevCalls ? 0 : prevCalls;
+  const baseRetrievals = stats.retrieveCallsCount < prevRetrievals ? 0 : prevRetrievals;
   return {
     tokens: Math.max(0, stats.tokensSavedEst - baseTokens),
     calls: Math.max(0, stats.compressedCallsCount - baseCalls),
+    retrievals: Math.max(0, stats.retrieveCallsCount - baseRetrievals),
   };
 }
 
 function nextBaselineForKey(
-  stats: Pick<CcrStats, "tokensSavedEst" | "compressedCallsCount">,
+  stats: Pick<CcrStats, "tokensSavedEst" | "compressedCallsCount" | "retrieveCallsCount">,
   prev: SyncedCcrBaseline | undefined,
   syncTokens: boolean,
   syncCalls: boolean,
+  syncRetrievals: boolean,
 ): SyncedCcrBaseline {
   return {
     tokensSavedEst: syncTokens ? stats.tokensSavedEst : (prev?.tokensSavedEst ?? 0),
     compressedCallsCount: syncCalls
       ? stats.compressedCallsCount
       : (prev?.compressedCallsCount ?? 0),
+    retrieveCallsCount: syncRetrievals ? stats.retrieveCallsCount : (prev?.retrieveCallsCount ?? 0),
   };
+}
+
+function sanitizeSyncedCcrBaseline(raw: unknown): SyncedCcrBaseline | undefined {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const obj = raw as Record<string, unknown>;
+  const sanitizeInt = (value: unknown): number =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+  const tokensSavedEst = sanitizeInt(obj.tokensSavedEst);
+  const compressedCallsCount = sanitizeInt(obj.compressedCallsCount);
+  const retrieveCallsCount = sanitizeInt(obj.retrieveCallsCount);
+  if (tokensSavedEst === 0 && compressedCallsCount === 0 && retrieveCallsCount === 0) {
+    return undefined;
+  }
+  return { tokensSavedEst, compressedCallsCount, retrieveCallsCount };
+}
+
+function parseCcrSyncJson(raw: string): Map<string, SyncedCcrBaseline> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const baselines = new Map<string, SyncedCcrBaseline>();
+    for (const [threadId, entry] of Object.entries(parsed)) {
+      if (threadId.trim() === "") continue;
+      const baseline = sanitizeSyncedCcrBaseline(entry);
+      if (baseline !== undefined) {
+        baselines.set(threadId, baseline);
+      }
+    }
+    return baselines;
+  } catch {
+    return undefined;
+  }
 }
 
 export type RsiLessonScope = "global" | "glob";
@@ -141,6 +183,7 @@ export interface RsiRunTelemetryInput {
   readonly spentTokens?: number | undefined;
   readonly tokensSavedEst?: number | undefined;
   readonly compressedCallsCount?: number | undefined;
+  readonly ccrRetrievals?: number | undefined;
   readonly failureSignature?: RsiRunFailureSignature | undefined;
   readonly appliedLessonIds?: ReadonlyArray<string> | undefined;
   readonly editedFiles?: ReadonlyArray<string> | undefined;
@@ -167,6 +210,7 @@ export interface RsiRunTelemetryRecord {
   readonly spentTokens?: number | undefined;
   readonly tokensSavedEst?: number | undefined;
   readonly compressedCallsCount?: number | undefined;
+  readonly ccrRetrievals?: number | undefined;
   readonly failureKey?: string | undefined;
   readonly timestamp: string;
 }
@@ -200,6 +244,8 @@ export interface RsiTelemetrySummary {
   readonly totalCachedInputTokens: number;
   readonly totalTokensSavedEst: number;
   readonly totalCompressedCalls: number;
+  readonly totalCcrRetrievals: number;
+  readonly ccrRetrievalRate: number;
   readonly totalSpentTokens: number;
   readonly avgCacheHitRate: number;
   readonly avgDurationMs: number;
@@ -1012,6 +1058,10 @@ function encodeTelemetryLine(record: RsiRunTelemetryRecord): string {
   return `${JSON.stringify(record)}\n`;
 }
 
+function encodeCcrSyncPayload(baselines: ReadonlyMap<string, SyncedCcrBaseline>): string {
+  return `${JSON.stringify(Object.fromEntries(baselines), null, 2)}\n`;
+}
+
 function escapeWikilinkAlias(raw: string): string {
   return raw.replace(/[\r\n|[\]]+/g, " ").trim() || "Untitled Lesson";
 }
@@ -1323,6 +1373,10 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
   const importedObsidianNotesRef = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
 
   const persistence = input?.persistence;
+  const ccrSyncPath =
+    persistence !== undefined
+      ? persistence.path.join(persistence.rsiDir, "ccr-sync.json")
+      : undefined;
   const isAutoDistillEnabled = input?.isAutoDistillEnabled ?? (() => Effect.succeed(true));
   const ccrStore = input?.ccrStore ?? defaultCcrStore;
   if (persistence !== undefined && input?.persistCcr === true) {
@@ -1547,6 +1601,10 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
         yield* Ref.set(lessonsRef, loadedLessons);
         yield* syncObsidianBrainLocked(loadedLessons);
       }
+      let retained: ReadonlyArray<RsiRunTelemetryRecord> = [];
+      const telemetryFileExists = yield* persistence.fs
+        .exists(persistence.telemetryPath)
+        .pipe(Effect.orElseSucceed(() => false));
       const telemetryRaw = yield* persistence.fs
         .readFileString(persistence.telemetryPath)
         .pipe(Effect.orElseSucceed(() => ""));
@@ -1555,7 +1613,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           .split(/\r?\n/)
           .filter((line) => line.trim() !== "").length;
         const telemetryRows = parseTelemetryJsonl(telemetryRaw);
-        const retained = telemetryRows.slice(-MAX_IN_MEMORY_TELEMETRY);
+        retained = telemetryRows.slice(-MAX_IN_MEMORY_TELEMETRY);
         yield* Ref.set(telemetryRef, retained);
         yield* Ref.set(recurrenceRef, buildRecurrenceCountsFromTelemetry(retained));
         if (rawLineCount > TELEMETRY_COMPACT_LINE_THRESHOLD) {
@@ -1565,8 +1623,85 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           yield* Ref.set(telemetryFileLinesRef, rawLineCount);
         }
       }
+      if (ccrSyncPath !== undefined) {
+        const ccrSyncRaw = yield* persistence.fs
+          .readFileString(ccrSyncPath)
+          .pipe(Effect.orElseSucceed(() => undefined as string | undefined));
+        const parsedSync = ccrSyncRaw !== undefined ? parseCcrSyncJson(ccrSyncRaw) : undefined;
+        if (parsedSync !== undefined) {
+          yield* Ref.set(lastSyncedCcrByThreadRef, parsedSync);
+          // Preserve pre-first-run compressions on brand-new installs, while seeding when telemetry history (even empty) exists on disk.
+        } else if (retained.length > 0 || telemetryFileExists) {
+          const storeBaselines = ccrStore.getCompressionBaselines?.();
+          if (storeBaselines !== undefined) {
+            const seeded = new Map<string, SyncedCcrBaseline>();
+            for (const [key, entry] of storeBaselines) {
+              seeded.set(key, entry);
+            }
+            yield* Ref.set(lastSyncedCcrByThreadRef, seeded);
+            yield* persistCcrSyncLocked(seeded);
+          } else {
+            const sumsByThread = new Map<
+              string,
+              { tokensSavedEst: number; compressedCallsCount: number; retrieveCallsCount: number }
+            >();
+            for (const row of retained) {
+              const existing = sumsByThread.get(row.threadId) ?? {
+                tokensSavedEst: 0,
+                compressedCallsCount: 0,
+                retrieveCallsCount: 0,
+              };
+              existing.tokensSavedEst += Math.floor(
+                clampNonNegativeNumber(row.tokensSavedEst ?? 0),
+              );
+              existing.compressedCallsCount += Math.floor(
+                clampNonNegativeNumber(row.compressedCallsCount ?? 0),
+              );
+              existing.retrieveCallsCount += Math.floor(
+                clampNonNegativeNumber(row.ccrRetrievals ?? 0),
+              );
+              sumsByThread.set(row.threadId, existing);
+            }
+            const upgraded = new Map<string, SyncedCcrBaseline>();
+            for (const [threadId, sums] of sumsByThread) {
+              const store = ccrStore.getStats(threadId);
+              const baseline: SyncedCcrBaseline = {
+                tokensSavedEst: Math.min(store.tokensSavedEst, sums.tokensSavedEst),
+                compressedCallsCount: Math.min(
+                  store.compressedCallsCount,
+                  sums.compressedCallsCount,
+                ),
+                retrieveCallsCount: Math.min(store.retrieveCallsCount, sums.retrieveCallsCount),
+              };
+              if (
+                baseline.tokensSavedEst > 0 ||
+                baseline.compressedCallsCount > 0 ||
+                baseline.retrieveCallsCount > 0
+              ) {
+                upgraded.set(threadId, baseline);
+              }
+            }
+            yield* Ref.set(lastSyncedCcrByThreadRef, upgraded);
+          }
+        }
+      }
     }
     yield* Ref.set(hydratedRef, true);
+  });
+
+  const persistCcrSyncLocked = Effect.fn("RsiService.persistCcrSyncLocked")(function* (
+    baselines: ReadonlyMap<string, SyncedCcrBaseline>,
+  ) {
+    if (persistence === undefined || ccrSyncPath === undefined) return;
+    yield* persistence.fs
+      .makeDirectory(persistence.rsiDir, { recursive: true })
+      .pipe(Effect.ignore);
+    const payload = encodeCcrSyncPayload(baselines);
+    const tmpPath = `${ccrSyncPath}.tmp`;
+    yield* persistence.fs.writeFileString(tmpPath, payload).pipe(
+      Effect.andThen(persistence.fs.rename(tmpPath, ccrSyncPath)),
+      Effect.catch((cause) => Effect.logWarning("Failed to write RSI CCR sync state", { cause })),
+    );
   });
 
   const writeCompactedTelemetryLocked = (rows: ReadonlyArray<RsiRunTelemetryRecord>) => {
@@ -1859,10 +1994,12 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
 
         const syncTokens = telemetryInput.tokensSavedEst === undefined;
         const syncCalls = telemetryInput.compressedCallsCount === undefined;
+        const syncRetrievals = telemetryInput.ccrRetrievals === undefined;
 
         let deltaTokens = 0;
         let deltaCalls = 0;
-        if (syncTokens || syncCalls) {
+        let deltaRetrievals = 0;
+        if (syncTokens || syncCalls || syncRetrievals) {
           const syncedMap = yield* Ref.get(lastSyncedCcrByThreadRef);
           const prevThread = syncedMap.get(telemetryInput.threadId);
           const threadStats = ccrStore.getStats(telemetryInput.threadId);
@@ -1873,39 +2010,71 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           const unscopedStats = isUnscopedThread ? undefined : ccrStore.getStats(UNSCOPED_CCR_KEY);
           const unscopedDelta =
             unscopedStats === undefined
-              ? { tokens: 0, calls: 0 }
+              ? { tokens: 0, calls: 0, retrievals: 0 }
               : computeCcrDelta(unscopedStats, prevUnscoped);
 
           deltaTokens = threadDelta.tokens + unscopedDelta.tokens;
           deltaCalls = threadDelta.calls + unscopedDelta.calls;
+          deltaRetrievals = threadDelta.retrievals + unscopedDelta.retrievals;
 
-          yield* Ref.update(lastSyncedCcrByThreadRef, (current) => {
+          let syncedChanged = false;
+          const updatedSynced = yield* Ref.updateAndGet(lastSyncedCcrByThreadRef, (current) => {
             const next = new Map(current);
             if (
               prevThread !== undefined ||
               threadStats.tokensSavedEst > 0 ||
-              threadStats.compressedCallsCount > 0
+              threadStats.compressedCallsCount > 0 ||
+              threadStats.retrieveCallsCount > 0
             ) {
-              next.set(
-                telemetryInput.threadId,
-                nextBaselineForKey(threadStats, prevThread, syncTokens, syncCalls),
+              const nextThreadBaseline = nextBaselineForKey(
+                threadStats,
+                prevThread,
+                syncTokens,
+                syncCalls,
+                syncRetrievals,
               );
+              if (
+                prevThread === undefined ||
+                prevThread.tokensSavedEst !== nextThreadBaseline.tokensSavedEst ||
+                prevThread.compressedCallsCount !== nextThreadBaseline.compressedCallsCount ||
+                prevThread.retrieveCallsCount !== nextThreadBaseline.retrieveCallsCount
+              ) {
+                syncedChanged = true;
+              }
+              next.set(telemetryInput.threadId, nextThreadBaseline);
             }
             if (
               unscopedStats !== undefined &&
               ((syncTokens && unscopedDelta.tokens > 0) ||
                 (syncCalls && unscopedDelta.calls > 0) ||
+                (syncRetrievals && unscopedDelta.retrievals > 0) ||
                 (prevUnscoped !== undefined &&
                   (unscopedStats.tokensSavedEst < prevUnscoped.tokensSavedEst ||
-                    unscopedStats.compressedCallsCount < prevUnscoped.compressedCallsCount)))
+                    unscopedStats.compressedCallsCount < prevUnscoped.compressedCallsCount ||
+                    unscopedStats.retrieveCallsCount < prevUnscoped.retrieveCallsCount)))
             ) {
-              next.set(
-                UNSCOPED_CCR_KEY,
-                nextBaselineForKey(unscopedStats, prevUnscoped, syncTokens, syncCalls),
+              const nextUnscopedBaseline = nextBaselineForKey(
+                unscopedStats,
+                prevUnscoped,
+                syncTokens,
+                syncCalls,
+                syncRetrievals,
               );
+              if (
+                prevUnscoped === undefined ||
+                prevUnscoped.tokensSavedEst !== nextUnscopedBaseline.tokensSavedEst ||
+                prevUnscoped.compressedCallsCount !== nextUnscopedBaseline.compressedCallsCount ||
+                prevUnscoped.retrieveCallsCount !== nextUnscopedBaseline.retrieveCallsCount
+              ) {
+                syncedChanged = true;
+              }
+              next.set(UNSCOPED_CCR_KEY, nextUnscopedBaseline);
             }
             return next;
           });
+          if (syncedChanged) {
+            yield* persistCcrSyncLocked(updatedSynced);
+          }
         }
 
         const resolvedTokensSavedEst =
@@ -1919,6 +2088,12 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
             ? Math.floor(clampNonNegativeNumber(telemetryInput.compressedCallsCount))
             : deltaCalls > 0
               ? deltaCalls
+              : undefined;
+        const resolvedCcrRetrievals =
+          telemetryInput.ccrRetrievals !== undefined
+            ? Math.floor(clampNonNegativeNumber(telemetryInput.ccrRetrievals))
+            : deltaRetrievals > 0
+              ? deltaRetrievals
               : undefined;
 
         const sig = telemetryInput.failureSignature;
@@ -1986,6 +2161,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
           ...(resolvedCompressedCallsCount !== undefined
             ? { compressedCallsCount: resolvedCompressedCallsCount }
             : {}),
+          ...(resolvedCcrRetrievals !== undefined ? { ccrRetrievals: resolvedCcrRetrievals } : {}),
           ...(recurrenceKey !== undefined ? { failureKey: recurrenceKey } : {}),
           timestamp: nowIso,
         };
@@ -2368,6 +2544,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
     const latestByThread = new Map<string, RsiRunTelemetryRecord>();
     let totalTokensSavedEst = 0;
     let totalCompressedCalls = 0;
+    let totalCcrRetrievals = 0;
     let cacheHitRateSum = 0;
     let durationSum = 0;
     let totalSpentTokens = 0;
@@ -2395,6 +2572,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       latestByThread.set(row.threadId, row);
       totalTokensSavedEst += clampNonNegativeNumber(row.tokensSavedEst ?? 0);
       totalCompressedCalls += Math.floor(clampNonNegativeNumber(row.compressedCallsCount ?? 0));
+      totalCcrRetrievals += Math.floor(clampNonNegativeNumber(row.ccrRetrievals ?? 0));
       cacheHitRateSum += row.cacheHitRate;
       durationSum += row.durationMs;
 
@@ -2425,20 +2603,39 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       const delta = computeCcrDelta(threadStats, lastSyncedByThread.get(summaryInput.threadId));
       totalTokensSavedEst += delta.tokens;
       totalCompressedCalls += delta.calls;
+      totalCcrRetrievals += delta.retrievals;
     } else if (summaryInput?.threadId === undefined && summaryInput?.provider === undefined) {
-      const storeStats = ccrStore.getStats();
-      let totalSyncedTokens = 0;
-      let totalSyncedCalls = 0;
-      for (const baseline of lastSyncedByThread.values()) {
-        totalSyncedTokens += baseline.tokensSavedEst;
-        totalSyncedCalls += baseline.compressedCallsCount;
+      const storeBaselines = ccrStore.getCompressionBaselines?.();
+      if (storeBaselines !== undefined) {
+        // Compute unsynced delta per thread key so global Math.round(/4) never drifts below the sum of per-thread baselines.
+        for (const [tid, baseline] of storeBaselines) {
+          const delta = computeCcrDelta(baseline, lastSyncedByThread.get(tid));
+          totalTokensSavedEst += delta.tokens;
+          totalCompressedCalls += delta.calls;
+          totalCcrRetrievals += delta.retrievals;
+        }
+      } else {
+        const storeStats = ccrStore.getStats();
+        let totalSyncedTokens = 0;
+        let totalSyncedCalls = 0;
+        let totalSyncedRetrievals = 0;
+        for (const baseline of lastSyncedByThread.values()) {
+          totalSyncedTokens += baseline.tokensSavedEst;
+          totalSyncedCalls += baseline.compressedCallsCount;
+          totalSyncedRetrievals += baseline.retrieveCallsCount;
+        }
+        const delta = computeCcrDelta(storeStats, {
+          tokensSavedEst: totalSyncedTokens,
+          compressedCallsCount: totalSyncedCalls,
+          retrieveCallsCount: totalSyncedRetrievals,
+        });
+        totalTokensSavedEst +=
+          storeStats.compressedCallsCount >= totalSyncedCalls
+            ? Math.max(0, storeStats.tokensSavedEst - totalSyncedTokens)
+            : storeStats.tokensSavedEst;
+        totalCompressedCalls += delta.calls;
+        totalCcrRetrievals += delta.retrievals;
       }
-      const delta = computeCcrDelta(storeStats, {
-        tokensSavedEst: totalSyncedTokens,
-        compressedCallsCount: totalSyncedCalls,
-      });
-      totalTokensSavedEst += delta.tokens;
-      totalCompressedCalls += delta.calls;
     }
 
     // usedTokens is the context size of a run's last message, not spend: count each thread's latest run once.
@@ -2477,6 +2674,11 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
       totalCachedInputTokens,
       totalTokensSavedEst,
       totalCompressedCalls,
+      totalCcrRetrievals,
+      ccrRetrievalRate:
+        totalCompressedCalls > 0
+          ? Math.round((totalCcrRetrievals / totalCompressedCalls) * 10_000) / 10_000
+          : 0,
       totalSpentTokens,
       avgCacheHitRate:
         totalRuns > 0 ? Math.round((cacheHitRateSum / totalRuns) * 10_000) / 10_000 : 0,

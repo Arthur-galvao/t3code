@@ -50,6 +50,12 @@ export interface CcrRetrieveResult {
   readonly content: string;
 }
 
+export interface CcrCompressionBaseline {
+  readonly tokensSavedEst: number;
+  readonly compressedCallsCount: number;
+  readonly retrieveCallsCount: number;
+}
+
 export interface CcrStats {
   readonly entriesCount: number;
   readonly currentBytes: number;
@@ -90,6 +96,7 @@ export interface CcrStore {
     threadId?: string,
   ) => void;
   readonly getStats: (threadId?: string) => CcrStats;
+  readonly getCompressionBaselines?: () => ReadonlyMap<string, CcrCompressionBaseline>;
   readonly configurePersistence: (
     persistPath: string,
     options?: CcrStorePersistenceOptions,
@@ -855,6 +862,25 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
     };
   };
 
+  const getCompressionBaselines = (): ReadonlyMap<string, CcrCompressionBaseline> => {
+    const baselines = new Map<string, CcrCompressionBaseline>();
+    for (const [tid, counters] of threadCompression) {
+      const tokensSavedEst = Math.round(counters.totalSavedChars / 4);
+      if (
+        tokensSavedEst > 0 ||
+        counters.compressedCallsCount > 0 ||
+        counters.retrieveCallsCount > 0
+      ) {
+        baselines.set(tid, {
+          tokensSavedEst,
+          compressedCallsCount: counters.compressedCallsCount,
+          retrieveCallsCount: counters.retrieveCallsCount,
+        });
+      }
+    }
+    return baselines;
+  };
+
   const clear = () => {
     cancelPendingPersist();
     entries.clear();
@@ -877,6 +903,7 @@ export function createCcrStore(options?: CcrStoreOptions): CcrStore {
     purgeThread,
     recordCompression,
     getStats,
+    getCompressionBaselines,
     configurePersistence,
     hydrate,
     flush,

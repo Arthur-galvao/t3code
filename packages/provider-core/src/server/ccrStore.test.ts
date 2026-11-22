@@ -447,4 +447,34 @@ describe("createCcrStore", () => {
       NodeFS.rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it("exposes scoped and __global__ compression baselines via getCompressionBaselines after hydration", () => {
+    const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-ccr-baselines-"));
+    try {
+      const persistPath = NodePath.join(tempDir, "ccr-cache.json");
+      const writer = createCcrStore({ persistPath, debounceMs: 0 });
+      const entry = writer.put({ content: "line1\nline2", contentType: "text", threadId: "t1" });
+      writer.recordCompression(1_600, 400, "t1");
+      writer.retrieve({ ccrId: entry.ccrId, threadId: "t1" });
+      writer.recordCompression(1_200, 200);
+      writer.flush();
+
+      const reader = createCcrStore();
+      reader.configurePersistence(persistPath, { debounceMs: 0 });
+      const baselines = reader.getCompressionBaselines?.();
+      assert.isDefined(baselines);
+      assert.deepEqual(baselines?.get("t1"), {
+        tokensSavedEst: 300,
+        compressedCallsCount: 1,
+        retrieveCallsCount: 1,
+      });
+      assert.deepEqual(baselines?.get("__global__"), {
+        tokensSavedEst: 250,
+        compressedCallsCount: 1,
+        retrieveCallsCount: 0,
+      });
+    } finally {
+      NodeFS.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });

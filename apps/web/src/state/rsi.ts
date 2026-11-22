@@ -73,6 +73,7 @@ export function hasNonZeroRsiCcrSavings(summary: RsiTelemetrySummary | null | un
   return (
     summary.totalTokensSavedEst > 0 ||
     summary.totalCompressedCalls > 0 ||
+    summary.totalCcrRetrievals > 0 ||
     summary.totalCachedInputTokens > 0 ||
     summary.avgCacheHitRate > 0
   );

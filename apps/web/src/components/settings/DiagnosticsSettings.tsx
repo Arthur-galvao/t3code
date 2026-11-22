@@ -926,9 +926,14 @@ function RsiObservabilityDiagnostics({
           }
           tooltip={
             telemetry
-              ? gt("Estimated tokens saved across {calls} compressed tool calls.", {
-                  calls: formatCount(telemetry.totalCompressedCalls),
-                })
+              ? gt(
+                  "Estimated tokens saved across {calls} compressed tool calls ({retrievals} retrievals, {rate} recall rate).",
+                  {
+                    calls: formatCount(telemetry.totalCompressedCalls),
+                    retrievals: formatCount(telemetry.totalCcrRetrievals),
+                    rate: formatPercent(telemetry.ccrRetrievalRate, 1),
+                  },
+                )
               : undefined
           }
         />

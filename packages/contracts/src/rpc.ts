@@ -2292,6 +2292,7 @@ export const RsiRunTelemetryRecord = Schema.Struct({
   spentTokens: Schema.optional(Schema.Number),
   tokensSavedEst: Schema.optional(Schema.Number),
   compressedCallsCount: Schema.optional(Schema.Number),
+  ccrRetrievals: Schema.optional(Schema.Number),
   timestamp: Schema.String,
 });
 export type RsiRunTelemetryRecord = typeof RsiRunTelemetryRecord.Type;
@@ -2319,6 +2320,8 @@ export const RsiTelemetrySummary = Schema.Struct({
   totalCachedInputTokens: Schema.Number,
   totalTokensSavedEst: Schema.Number,
   totalCompressedCalls: Schema.Number,
+  totalCcrRetrievals: Schema.Number,
+  ccrRetrievalRate: Schema.Number,
   totalSpentTokens: Schema.optional(Schema.Number),
   avgCacheHitRate: Schema.Number,
   avgDurationMs: Schema.Number,

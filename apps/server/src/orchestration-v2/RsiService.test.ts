@@ -702,6 +702,358 @@ describe("RsiService", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("persists CCR sync baselines across server restarts without double-counting", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-ccr-restart-" });
+      const rsiDir = path.join(tempRoot, "rsi");
+      const persistence = {
+        fs,
+        path,
+        rsiDir,
+        lessonsPath: path.join(rsiDir, "lessons.json"),
+        telemetryPath: path.join(rsiDir, "telemetry.jsonl"),
+      };
+
+      const threadId = "thread-restart-1";
+      const store1 = createCcrStore();
+      const rsi1 = yield* makeRsiService({ persistence, ccrStore: store1, persistCcr: true });
+
+      const entry1 = store1.put({
+        threadId,
+        content: Array.from({ length: 12 }, (_, i) => `restart line ${i}`).join("\n"),
+        contentType: "logs",
+      });
+      store1.recordCompression(4_000, 800, threadId);
+      store1.retrieve({ ccrId: entry1.ccrId, threadId, startLine: 1, endLine: 2 });
+
+      const run1 = yield* rsi1.recordRunTelemetry({
+        threadId,
+        runId: "run-restart-1",
+        provider: "claudeAgent",
+        model: "claude-sonnet-5-5",
+        usedTokens: 1_000,
+        cachedInputTokens: 600,
+        toolErrorCount: 0,
+        loopTripped: false,
+        safetyBlockedCount: 0,
+        wastedReads: 0,
+        outcome: "completed",
+        durationMs: 500,
+      });
+      expect(run1.tokensSavedEst).toBe(800);
+      expect(run1.compressedCallsCount).toBe(1);
+      expect(run1.ccrRetrievals).toBe(1);
+      store1.flush();
+
+      expect(yield* fs.exists(path.join(rsiDir, "ccr-sync.json"))).toBe(true);
+      const summary1 = yield* rsi1.getTelemetrySummary();
+
+      const store2 = createCcrStore();
+      const rsi2 = yield* makeRsiService({ persistence, ccrStore: store2, persistCcr: true });
+      const summary2 = yield* rsi2.getTelemetrySummary();
+      expect(summary2.totalTokensSavedEst).toBe(summary1.totalTokensSavedEst);
+      expect(summary2.totalCompressedCalls).toBe(summary1.totalCompressedCalls);
+      expect(summary2.totalCcrRetrievals).toBe(summary1.totalCcrRetrievals);
+      expect(summary2.ccrRetrievalRate).toBe(summary1.ccrRetrievalRate);
+
+      // New compression + retrieval after restart contributes only the incremental delta.
+      const entry2 = store2.put({
+        threadId,
+        content: Array.from({ length: 12 }, (_, i) => `restart2 line ${i}`).join("\n"),
+        contentType: "logs",
+      });
+      store2.recordCompression(3_000, 600, threadId);
+      store2.retrieve({ ccrId: entry2.ccrId, threadId, startLine: 1, endLine: 2 });
+
+      const run2 = yield* rsi2.recordRunTelemetry({
+        threadId,
+        runId: "run-restart-2",
+        provider: "claudeAgent",
+        model: "claude-sonnet-5-5",
+        usedTokens: 1_200,
+        cachedInputTokens: 800,
+        toolErrorCount: 0,
+        loopTripped: false,
+        safetyBlockedCount: 0,
+        wastedReads: 0,
+        outcome: "completed",
+        durationMs: 400,
+      });
+      expect(run2.tokensSavedEst).toBe(600);
+      expect(run2.compressedCallsCount).toBe(1);
+      expect(run2.ccrRetrievals).toBe(1);
+
+      const summaryAfterRun2 = yield* rsi2.getTelemetrySummary();
+      expect(summaryAfterRun2.totalTokensSavedEst).toBe(1_400);
+      expect(summaryAfterRun2.totalCompressedCalls).toBe(2);
+      expect(summaryAfterRun2.totalCcrRetrievals).toBe(2);
+      expect(summaryAfterRun2.ccrRetrievalRate).toBe(1);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "migrates pre-existing telemetry.jsonl + ccr-cache.json without ccr-sync.json without double-counting",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-ccr-upgrade-" });
+        const rsiDir = path.join(tempRoot, "rsi");
+        const persistence = {
+          fs,
+          path,
+          rsiDir,
+          lessonsPath: path.join(rsiDir, "lessons.json"),
+          telemetryPath: path.join(rsiDir, "telemetry.jsonl"),
+        };
+
+        const threadId = "thread-upgrade-1";
+        yield* fs.makeDirectory(rsiDir, { recursive: true });
+
+        // Seed legacy ccr-cache.json via store1 (includes 2 scoped compressions + 1 historical retrieval + 1 unscoped compression).
+        const legacyStore = createCcrStore();
+        legacyStore.configurePersistence(path.join(rsiDir, "ccr-cache.json"));
+        const entry = legacyStore.put({
+          threadId,
+          content: "a\nb\nc\nd\n",
+          contentType: "logs",
+        });
+        legacyStore.recordCompression(1_200, 200, threadId);
+        legacyStore.recordCompression(1_200, 200, threadId);
+        legacyStore.retrieve({ ccrId: entry.ccrId, threadId, startLine: 1, endLine: 2 });
+        legacyStore.recordCompression(1_200, 200);
+        legacyStore.flush();
+
+        // Seed legacy telemetry.jsonl that already recorded tokensSavedEst + compressedCallsCount, but not ccrRetrievals.
+        const legacyRow = {
+          threadId,
+          runId: "run-legacy-1",
+          provider: "claudeAgent",
+          model: "claude-sonnet-4-6",
+          usedTokens: 900,
+          cachedInputTokens: 450,
+          cacheHitRate: 0.5,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 300,
+          tokensSavedEst: 500,
+          compressedCallsCount: 2,
+          timestamp: "2026-11-20T00:00:00.000Z",
+        };
+        yield* fs.writeFileString(persistence.telemetryPath, `${JSON.stringify(legacyRow)}\n`);
+        expect(yield* fs.exists(path.join(rsiDir, "ccr-sync.json"))).toBe(false);
+
+        const store2 = createCcrStore();
+        const rsi2 = yield* makeRsiService({ persistence, ccrStore: store2, persistCcr: true });
+        const threadSummary = yield* rsi2.getTelemetrySummary({ threadId });
+        expect(yield* fs.exists(path.join(rsiDir, "ccr-sync.json"))).toBe(true);
+        expect(threadSummary.totalTokensSavedEst).toBe(500);
+        expect(threadSummary.totalCompressedCalls).toBe(2);
+        expect(threadSummary.totalCcrRetrievals).toBe(0);
+
+        const globalSummary = yield* rsi2.getTelemetrySummary();
+        expect(globalSummary.totalTokensSavedEst).toBe(500);
+        expect(globalSummary.totalCompressedCalls).toBe(2);
+        expect(globalSummary.totalCcrRetrievals).toBe(0);
+
+        store2.recordCompression(1_200, 200, threadId);
+        store2.retrieve({ ccrId: entry.ccrId, threadId, startLine: 1, endLine: 2 });
+        const postUpgradeRun = yield* rsi2.recordRunTelemetry({
+          threadId,
+          runId: "run-post-upgrade-2",
+          provider: "claudeAgent",
+          model: "claude-sonnet-4-6",
+          usedTokens: 950,
+          cachedInputTokens: 500,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 310,
+        });
+        expect(postUpgradeRun.tokensSavedEst).toBe(250);
+        expect(postUpgradeRun.compressedCallsCount).toBe(1);
+        expect(postUpgradeRun.ccrRetrievals).toBe(1);
+
+        const postSummary = yield* rsi2.getTelemetrySummary();
+        expect(postSummary.totalTokensSavedEst).toBe(750);
+        expect(postSummary.totalCompressedCalls).toBe(3);
+        expect(postSummary.totalCcrRetrievals).toBe(1);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "avoids global tokensSavedEst double-counting across threads with non-multiple-of-4 savedChars",
+    () =>
+      Effect.gen(function* () {
+        const store = createCcrStore();
+        const rsi = yield* makeRsiService({ ccrStore: store });
+
+        // Each thread has 1002 saved chars => Math.round(1002/4)=251 each (sum=502),
+        // while global Math.round(2004/4)=501 (1 token lower than sum of per-thread baselines).
+        store.recordCompression(1_202, 200, "thread-round-a");
+        store.recordCompression(1_202, 200, "thread-round-b");
+
+        yield* rsi.recordRunTelemetry({
+          threadId: "thread-round-a",
+          runId: "run-round-a1",
+          provider: "claudeAgent",
+          model: "claude-sonnet-5-5",
+          usedTokens: 1_000,
+          cachedInputTokens: 500,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 200,
+        });
+        yield* rsi.recordRunTelemetry({
+          threadId: "thread-round-b",
+          runId: "run-round-b1",
+          provider: "antigravity",
+          model: "gemini-4-neon",
+          usedTokens: 1_000,
+          cachedInputTokens: 500,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 200,
+        });
+
+        const settledSummary = yield* rsi.getTelemetrySummary();
+        expect(settledSummary.totalTokensSavedEst).toBe(502);
+        expect(settledSummary.totalCompressedCalls).toBe(2);
+
+        store.recordCompression(1_202, 200, "thread-round-a");
+        const liveSummary = yield* rsi.getTelemetrySummary();
+        expect(liveSummary.totalTokensSavedEst).toBe(752);
+        expect(liveSummary.totalCompressedCalls).toBe(3);
+      }),
+  );
+
+  it.effect("seeds ccr-sync.json on startup when telemetry.jsonl exists as an empty file", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-rsi-ccr-empty-tel-" });
+      const rsiDir = path.join(tempRoot, "rsi");
+      const persistence = {
+        fs,
+        path,
+        rsiDir,
+        lessonsPath: path.join(rsiDir, "lessons.json"),
+        telemetryPath: path.join(rsiDir, "telemetry.jsonl"),
+      };
+
+      yield* fs.makeDirectory(rsiDir, { recursive: true });
+      const legacyStore = createCcrStore();
+      legacyStore.configurePersistence(path.join(rsiDir, "ccr-cache.json"));
+      legacyStore.recordCompression(2_000, 400, "thread-old");
+      legacyStore.flush();
+      yield* fs.writeFileString(persistence.telemetryPath, "");
+
+      const store2 = createCcrStore();
+      const rsi2 = yield* makeRsiService({ persistence, ccrStore: store2, persistCcr: true });
+      const summary = yield* rsi2.getTelemetrySummary();
+      expect(yield* fs.exists(path.join(rsiDir, "ccr-sync.json"))).toBe(true);
+      expect(summary.totalTokensSavedEst).toBe(0);
+      expect(summary.totalCompressedCalls).toBe(0);
+
+      const newRun = yield* rsi2.recordRunTelemetry({
+        threadId: "thread-new",
+        runId: "run-new-1",
+        provider: "claudeAgent",
+        model: "claude-sonnet-5-5",
+        usedTokens: 500,
+        cachedInputTokens: 250,
+        toolErrorCount: 0,
+        loopTripped: false,
+        safetyBlockedCount: 0,
+        wastedReads: 0,
+        outcome: "completed",
+        durationMs: 150,
+      });
+      expect(newRun.tokensSavedEst).toBeUndefined();
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "tracks ccrRetrievals and computes ccrRetrievalRate across live and finalized runs",
+    () =>
+      Effect.gen(function* () {
+        const store = createCcrStore();
+        const rsi = yield* makeRsiService({ ccrStore: store });
+
+        const entryA = store.put({
+          threadId: "t-ret",
+          content: Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n"),
+          contentType: "logs",
+        });
+        store.recordCompression(4_000, 800, "t-ret");
+        store.recordCompression(4_000, 800, "t-ret");
+        store.retrieve({ ccrId: entryA.ccrId, threadId: "t-ret", startLine: 1, endLine: 2 });
+
+        const preSummary = yield* rsi.getTelemetrySummary({ threadId: "t-ret" });
+        expect(preSummary.totalCompressedCalls).toBe(2);
+        expect(preSummary.totalCcrRetrievals).toBe(1);
+        expect(preSummary.ccrRetrievalRate).toBe(0.5);
+
+        const firstRun = yield* rsi.recordRunTelemetry({
+          threadId: "t-ret",
+          runId: "r-ret-1",
+          provider: "claudeAgent",
+          model: "sonnet",
+          usedTokens: 1_000,
+          cachedInputTokens: 500,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 500,
+        });
+        expect(firstRun.ccrRetrievals).toBe(1);
+
+        const postSummary = yield* rsi.getTelemetrySummary({ threadId: "t-ret" });
+        expect(postSummary.totalCcrRetrievals).toBe(1);
+        expect(postSummary.ccrRetrievalRate).toBe(0.5);
+
+        // Explicit override + subsequent live retrieval delta without double counting.
+        store.retrieve({ ccrId: entryA.ccrId, threadId: "t-ret", startLine: 3, endLine: 4 });
+        const explicitRun = yield* rsi.recordRunTelemetry({
+          threadId: "t-other-ret",
+          runId: "r-ret-2",
+          provider: "antigravity",
+          model: "gemini",
+          usedTokens: 1_000,
+          cachedInputTokens: 500,
+          toolErrorCount: 0,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 400,
+          compressedCallsCount: 2,
+          ccrRetrievals: 1,
+        });
+        expect(explicitRun.ccrRetrievals).toBe(1);
+
+        const globalSummary = yield* rsi.getTelemetrySummary();
+        expect(globalSummary.totalCompressedCalls).toBe(4);
+        expect(globalSummary.totalCcrRetrievals).toBe(3);
+        expect(globalSummary.ccrRetrievalRate).toBe(0.75);
+      }),
+  );
+
   it.effect(
     "mirrors RSI lessons into Obsidian T3-Brain vault with MOC index and respects vault settings",
     () =>

@@ -21,6 +21,8 @@ function makeSummary(overrides?: Partial<RsiTelemetrySummary>): RsiTelemetrySumm
     totalCachedInputTokens: 0,
     totalTokensSavedEst: 0,
     totalCompressedCalls: 0,
+    totalCcrRetrievals: 0,
+    ccrRetrievalRate: 0,
     avgCacheHitRate: 0,
     avgDurationMs: 0,
     byProvider: [],
@@ -64,6 +66,7 @@ describe("rsi state helpers", () => {
     expect(hasNonZeroRsiCcrSavings(makeSummary())).toBe(false);
     expect(hasNonZeroRsiCcrSavings(makeSummary({ totalTokensSavedEst: 420 }))).toBe(true);
     expect(hasNonZeroRsiCcrSavings(makeSummary({ totalCompressedCalls: 2 }))).toBe(true);
+    expect(hasNonZeroRsiCcrSavings(makeSummary({ totalCcrRetrievals: 1 }))).toBe(true);
     expect(hasNonZeroRsiCcrSavings(makeSummary({ avgCacheHitRate: 0.35 }))).toBe(true);
   });
 
