@@ -8,8 +8,11 @@ import {
   DEFAULT_MCP_SERVERS,
   LEGACY_DEFAULT_MCP_ENTRIES,
   collectGlobalSkillNames,
+  findUnknownCliFlags,
   formatMcpServerForTarget,
   loadCanonicalMcpServers,
+  loadLocalRuntimeEntries,
+  parseNpxPinnedArgs,
   shouldApplyMcpSpec,
   shouldSyncSkillGlobally,
   syncJsonMcpFile,
@@ -327,7 +330,87 @@ it.layer(NodeServices.layer)("sync-global-harness", (it) => {
         });
         assert.deepEqual(LEGACY_DEFAULT_MCP_ENTRIES.antigravity.context7, [
           { serverUrl: "https://mcp.context7.com/mcp" },
+          { command: "npx", args: ["-y", "@upstash/context7-mcp@4.7.3"] },
         ]);
+        assert.deepEqual(findUnknownCliFlags(["--dry-run", "--init-missing"]), []);
+        assert.deepEqual(findUnknownCliFlags(["--dryrun", "--unknown"]), ["--dryrun", "--unknown"]);
+        assert.equal(parseNpxPinnedArgs(["-y", "shadcn@latest", "mcp"]), undefined);
+        assert.deepEqual(parseNpxPinnedArgs(["-y", "shadcn@4.23.0", "mcp"]), {
+          pkg: "shadcn",
+          version: "4.23.0",
+          rest: ["mcp"],
+        });
+      }),
+  );
+
+  it.effect(
+    "resolves local mcp-runtime node entrypoints, upgrades pinned npx defaults, and preserves custom env overrides",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sync-runtime-" });
+        const runtimeDir = path.join(tempDir, "mcp-runtime");
+        const shadcnPkgDir = path.join(runtimeDir, "node_modules", "shadcn");
+        const shadcnEntry = path.join(shadcnPkgDir, "dist", "index.js");
+        yield* fs.makeDirectory(path.dirname(shadcnEntry), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(shadcnPkgDir, "package.json"),
+          JSON.stringify({ name: "shadcn", version: "4.23.0", bin: "./dist/index.js" }),
+        );
+        yield* fs.writeFileString(shadcnEntry, "// shadcn entry\n");
+
+        const formatOptions = yield* loadLocalRuntimeEntries(runtimeDir, DEFAULT_MCP_SERVERS);
+        assert.deepEqual(
+          formatMcpServerForTarget(DEFAULT_MCP_SERVERS.shadcn!, "claude", formatOptions),
+          {
+            command: "node",
+            args: [shadcnEntry, "mcp"],
+          },
+        );
+        // Uninstalled package in runtimeDir falls back cleanly to portable npx.
+        assert.deepEqual(
+          formatMcpServerForTarget(DEFAULT_MCP_SERVERS.magicui!, "claude", formatOptions),
+          {
+            command: "npx",
+            args: ["-y", "@magicuidesign/mcp@2.1.1"],
+          },
+        );
+
+        const targetJson = path.join(tempDir, ".claude.json");
+        yield* fs.writeFileString(
+          targetJson,
+          JSON.stringify({
+            mcpServers: {
+              shadcn: { command: "npx", args: ["-y", "shadcn@4.23.0", "mcp"] },
+              magicui: {
+                command: "npx",
+                args: ["-y", "@magicuidesign/mcp@2.1.1"],
+                env: { CUSTOM: "keep" },
+              },
+            },
+          }),
+        );
+        yield* syncJsonMcpFile(
+          targetJson,
+          "claude",
+          false,
+          true,
+          DEFAULT_MCP_SERVERS,
+          formatOptions,
+        );
+        const updated = JSON.parse(yield* fs.readFileString(targetJson)) as {
+          mcpServers: Record<string, unknown>;
+        };
+        assert.deepEqual(updated.mcpServers.shadcn, {
+          command: "node",
+          args: [shadcnEntry, "mcp"],
+        });
+        assert.deepEqual(updated.mcpServers.magicui, {
+          command: "npx",
+          args: ["-y", "@magicuidesign/mcp@2.1.1"],
+          env: { CUSTOM: "keep" },
+        });
       }),
   );
 });

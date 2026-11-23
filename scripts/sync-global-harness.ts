@@ -53,30 +53,94 @@ export const DEFAULT_MCP_SERVERS: Readonly<Record<string, McpServerSpec>> = {
   },
 };
 
-// Exact unpinned Round 1 defaults safe to auto-upgrade without disturbing user edits.
+export interface LocalRuntimePackageEntry {
+  readonly version: string;
+  readonly entryPath: string;
+}
+
+export interface McpSyncFormatOptions {
+  readonly localEntries?: Readonly<Record<string, LocalRuntimePackageEntry>>;
+  readonly runtimeNodeModulesDir?: string;
+  readonly platform?: NodeJS.Platform;
+}
+
+// Exact Round 1 unpinned & Round 2 pinned npx defaults safe to auto-upgrade without disturbing user edits.
 export const LEGACY_DEFAULT_MCP_ENTRIES: Readonly<
   Record<McpTargetFormat, Readonly<Record<string, ReadonlyArray<unknown>>>>
 > = {
   claude: {
-    shadcn: [{ command: "npx", args: ["-y", "shadcn@latest", "mcp"] }],
-    magicui: [{ command: "npx", args: ["-y", "@magicuidesign/mcp@latest"] }],
+    shadcn: [
+      { command: "npx", args: ["-y", "shadcn@latest", "mcp"] },
+      { command: "npx", args: ["-y", "shadcn@4.23.0", "mcp"] },
+    ],
+    magicui: [
+      { command: "npx", args: ["-y", "@magicuidesign/mcp@latest"] },
+      { command: "npx", args: ["-y", "@magicuidesign/mcp@2.1.1"] },
+    ],
   },
   antigravity: {
-    context7: [{ serverUrl: "https://mcp.context7.com/mcp" }],
-    shadcn: [{ command: "npx", args: ["-y", "shadcn@latest", "mcp"] }],
-    magicui: [{ command: "npx", args: ["-y", "@magicuidesign/mcp@latest"] }],
+    context7: [
+      { serverUrl: "https://mcp.context7.com/mcp" },
+      { command: "npx", args: ["-y", "@upstash/context7-mcp@4.7.3"] },
+    ],
+    shadcn: [
+      { command: "npx", args: ["-y", "shadcn@latest", "mcp"] },
+      { command: "npx", args: ["-y", "shadcn@4.23.0", "mcp"] },
+    ],
+    magicui: [
+      { command: "npx", args: ["-y", "@magicuidesign/mcp@latest"] },
+      { command: "npx", args: ["-y", "@magicuidesign/mcp@2.1.1"] },
+    ],
   },
 };
+
+const NPM_PKG_NAME_RE = /^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/;
+const PINNED_SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
+export function parseNpxPinnedArgs(
+  args: ReadonlyArray<string>,
+):
+  | { readonly pkg: string; readonly version: string; readonly rest: ReadonlyArray<string> }
+  | undefined {
+  if (args.length < 2 || (args[0] !== "-y" && args[0] !== "--yes")) {
+    return undefined;
+  }
+  const token = args[1];
+  if (token === undefined) {
+    return undefined;
+  }
+  const atIdx = token.lastIndexOf("@");
+  if (atIdx <= 0) {
+    return undefined;
+  }
+  const pkg = token.slice(0, atIdx);
+  const version = token.slice(atIdx + 1);
+  if (!NPM_PKG_NAME_RE.test(pkg) || pkg.includes("..") || !PINNED_SEMVER_RE.test(version)) {
+    return undefined;
+  }
+  return { pkg, version, rest: args.slice(2) };
+}
 
 export function formatMcpServerForTarget(
   spec: McpServerSpec,
   format: McpTargetFormat,
+  options?: McpSyncFormatOptions,
 ): Record<string, unknown> {
   const effective = format === "antigravity" && spec.antigravity ? spec.antigravity : spec;
   if (effective.transport === "http") {
     return format === "antigravity"
       ? { serverUrl: effective.url }
       : { type: "http", url: effective.url };
+  }
+  if (effective.command === "npx" && options?.localEntries !== undefined) {
+    const parsed = parseNpxPinnedArgs(effective.args);
+    const localEntry = parsed === undefined ? undefined : options.localEntries[parsed.pkg];
+    if (parsed !== undefined && localEntry !== undefined && localEntry.version === parsed.version) {
+      return {
+        command: "node",
+        args: [localEntry.entryPath, ...parsed.rest],
+      };
+    }
   }
   return {
     command: effective.command,
@@ -115,11 +179,46 @@ function stableJsonValue(value: unknown): unknown {
   return value;
 }
 
+function isPathInsideDir(
+  targetPath: string,
+  parentDir: string,
+  platform: NodeJS.Platform,
+): boolean {
+  const norm = (value: string) => {
+    const cleaned = value.replace(/[\\/]+/g, "/").replace(/\/+$/u, "");
+    return platform === "win32" ? cleaned.toLowerCase() : cleaned;
+  };
+  const p = norm(parentDir);
+  const t = norm(targetPath);
+  return t.length > p.length && t.startsWith(`${p}/`);
+}
+
+function isManagedRuntimeNodeEntry(existing: unknown, options?: McpSyncFormatOptions): boolean {
+  const runtimeNodeModulesDir = options?.runtimeNodeModulesDir;
+  if (runtimeNodeModulesDir === undefined || !isPlainRecord(existing)) {
+    return false;
+  }
+  const keys = Object.keys(existing).sort();
+  if (keys.length !== 2 || keys[0] !== "args" || keys[1] !== "command") {
+    return false;
+  }
+  if (existing.command !== "node" || !Array.isArray(existing.args) || existing.args.length === 0) {
+    return false;
+  }
+  const entryArg = existing.args[0];
+  return (
+    typeof entryArg === "string" &&
+    existing.args.every((item) => typeof item === "string") &&
+    isPathInsideDir(entryArg, runtimeNodeModulesDir, options?.platform ?? "linux")
+  );
+}
+
 export function shouldApplyMcpSpec(
   existing: unknown,
   desired: unknown,
   name: string,
   format: McpTargetFormat,
+  options?: McpSyncFormatOptions,
 ): boolean {
   if (existing === undefined) {
     return true;
@@ -130,7 +229,10 @@ export function shouldApplyMcpSpec(
     return false;
   }
   const legacyEntries = LEGACY_DEFAULT_MCP_ENTRIES[format][name] ?? [];
-  return legacyEntries.some((legacy) => JSON.stringify(stableJsonValue(legacy)) === existingKey);
+  if (legacyEntries.some((legacy) => JSON.stringify(stableJsonValue(legacy)) === existingKey)) {
+    return true;
+  }
+  return isManagedRuntimeNodeEntry(existing, options);
 }
 
 function parseMcpTransportSpec(raw: unknown): McpTransportSpec | undefined {
@@ -347,6 +449,7 @@ export const syncJsonMcpFile = Effect.fn("syncJsonMcpFile")(function* (
   isDryRun = dryRun,
   shouldInitMissing = initMissing,
   servers: Readonly<Record<string, McpServerSpec>> = DEFAULT_MCP_SERVERS,
+  formatOptions?: McpSyncFormatOptions,
 ) {
   const fs = yield* FileSystem.FileSystem;
   const exists = yield* fs.exists(filePath);
@@ -365,8 +468,8 @@ export const syncJsonMcpFile = Effect.fn("syncJsonMcpFile")(function* (
 
   const changed: Array<string> = [];
   for (const [name, spec] of Object.entries(servers)) {
-    const desired = formatMcpServerForTarget(spec, targetFormat);
-    if (shouldApplyMcpSpec(existingServers[name], desired, name, targetFormat)) {
+    const desired = formatMcpServerForTarget(spec, targetFormat, formatOptions);
+    if (shouldApplyMcpSpec(existingServers[name], desired, name, targetFormat, formatOptions)) {
       existingServers[name] = desired;
       changed.push(name);
     }
@@ -388,6 +491,73 @@ export const syncJsonMcpFile = Effect.fn("syncJsonMcpFile")(function* (
     changed.length > 0 ? `synced ${changed.join(", ")}` : "initialized",
   );
 });
+
+export const loadLocalRuntimeEntries = Effect.fn("loadLocalRuntimeEntries")(function* (
+  runtimeDir: string,
+  servers: Readonly<Record<string, McpServerSpec>>,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const platform = yield* HostProcess.Platform;
+  const resolvedRuntimeDir = path.resolve(runtimeDir);
+  const runtimeNodeModulesDir = path.join(resolvedRuntimeDir, "node_modules");
+  const localEntries: Record<string, LocalRuntimePackageEntry> = {};
+
+  const candidateSpecs: Array<McpTransportSpec> = [];
+  for (const spec of Object.values(servers)) {
+    candidateSpecs.push(spec);
+    if (spec.antigravity !== undefined) {
+      candidateSpecs.push(spec.antigravity);
+    }
+  }
+
+  for (const spec of candidateSpecs) {
+    if (spec.transport === "http" || spec.command !== "npx") continue;
+    const parsed = parseNpxPinnedArgs(spec.args);
+    if (parsed === undefined || localEntries[parsed.pkg] !== undefined) continue;
+    const pkgDir = path.join(runtimeNodeModulesDir, ...parsed.pkg.split("/"));
+    const pkgJsonPath = path.join(pkgDir, "package.json");
+    if (!(yield* fs.exists(pkgJsonPath))) continue;
+    const pkgMeta = yield* fs.readFileString(pkgJsonPath).pipe(
+      Effect.flatMap((raw) => decodeJsonUnknown(raw)),
+      Effect.orElseSucceed(() => undefined),
+    );
+    if (!isPlainRecord(pkgMeta) || pkgMeta.version !== parsed.version) continue;
+    let relBin: string | undefined;
+    if (typeof pkgMeta.bin === "string") {
+      relBin = pkgMeta.bin;
+    } else if (isPlainRecord(pkgMeta.bin)) {
+      const shortName = parsed.pkg.split("/").pop();
+      const preferred =
+        shortName !== undefined && typeof pkgMeta.bin[shortName] === "string"
+          ? pkgMeta.bin[shortName]
+          : undefined;
+      const firstString = Object.values(pkgMeta.bin).find(
+        (val): val is string => typeof val === "string",
+      );
+      relBin = preferred ?? firstString;
+    }
+    if (typeof relBin !== "string" || relBin.trim().length === 0) continue;
+    const entryPath = path.resolve(pkgDir, relBin);
+    if (!isPathInsideDir(entryPath, pkgDir, platform)) continue;
+    if (!(yield* fs.exists(entryPath))) continue;
+    const stat = yield* fs.stat(entryPath).pipe(Effect.orElseSucceed(() => undefined));
+    if (stat?.type !== "File") continue;
+    localEntries[parsed.pkg] = { version: parsed.version, entryPath };
+  }
+
+  return {
+    localEntries,
+    runtimeNodeModulesDir,
+    platform,
+  } satisfies McpSyncFormatOptions;
+});
+
+export function findUnknownCliFlags(args: ReadonlyArray<string>): ReadonlyArray<string> {
+  return args.filter(
+    (arg) => arg.startsWith("-") && arg !== "--dry-run" && arg !== "--init-missing",
+  );
+}
 
 const syncCodexToml = Effect.fn("syncCodexToml")(function* (
   filePath: string,
@@ -631,15 +801,25 @@ const syncGlobalClaudeMd = Effect.fn("syncGlobalClaudeMd")(function* (filePath: 
 });
 
 const main = Effect.gen(function* () {
+  const unknownFlags = findUnknownCliFlags(process.argv.slice(2));
+  if (unknownFlags.length > 0) {
+    return yield* new SyncGlobalHarnessConfigError({
+      detail: `Unknown flag(s): ${unknownFlags.join(", ")}. Supported: --dry-run, --init-missing`,
+    });
+  }
   const path = yield* Path.Path;
   const claudeRootPath = path.join(homeDir, ".claude.json");
   const claudeSubPath = path.join(homeDir, ".claude", ".claude.json");
   const agMcpPath = path.join(homeDir, ".gemini", "config", "mcp_config.json");
   const servers = yield* loadCanonicalMcpServers(path.join(homeDir, ".agents", "mcp-servers.json"));
+  const formatOptions = yield* loadLocalRuntimeEntries(
+    path.join(homeDir, ".agents", "mcp-runtime"),
+    servers,
+  );
   yield* validateJsonMcpTargets([claudeRootPath, claudeSubPath, agMcpPath]);
-  yield* syncJsonMcpFile(claudeRootPath, "claude", dryRun, initMissing, servers);
-  yield* syncJsonMcpFile(claudeSubPath, "claude", dryRun, initMissing, servers);
-  yield* syncJsonMcpFile(agMcpPath, "antigravity", dryRun, initMissing, servers);
+  yield* syncJsonMcpFile(claudeRootPath, "claude", dryRun, initMissing, servers, formatOptions);
+  yield* syncJsonMcpFile(claudeSubPath, "claude", dryRun, initMissing, servers, formatOptions);
+  yield* syncJsonMcpFile(agMcpPath, "antigravity", dryRun, initMissing, servers, formatOptions);
   yield* syncCodexToml(path.join(homeDir, ".codex", "config.toml"), servers);
   yield* syncGlobalClaudeMd(path.join(homeDir, ".claude", "CLAUDE.md"));
   yield* syncSkillDirs;
