@@ -445,4 +445,71 @@ describe("AcpMcpStdioBridge", () => {
       expect(signal?.aborted).toBe(true);
     }),
   );
+
+  it.effect(
+    "forwards t3-tool-exposure header when toolExposure is configured or passed via env",
+    () =>
+      Effect.gen(function* () {
+        const { input, requests, bridge } = makeHarness(() =>
+          Response.json(
+            { jsonrpc: "2.0", id: 1, result: { tools: [] } },
+            { headers: { "mcp-session-id": "session-42" } },
+          ),
+        );
+        void bridge;
+        const exposedRequests: Array<Headers> = [];
+        const bridgeInput = new NodeStream.PassThrough();
+        const exposedFiber = yield* Effect.forkChild(
+          runAcpMcpStdioBridge({
+            endpoint: "http://127.0.0.1:1/mcp",
+            authorization: "Bearer bridge-test",
+            toolExposure: "compact",
+            input: bridgeInput,
+            output: { write: () => undefined },
+            fetchImplementation: async (_url, init) => {
+              exposedRequests.push(new Headers(init?.headers));
+              return Response.json({ jsonrpc: "2.0", id: 1, result: { tools: [] } });
+            },
+          }),
+        );
+        bridgeInput.end(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`);
+        yield* Fiber.join(exposedFiber);
+        expect(exposedRequests).toHaveLength(1);
+        expect(exposedRequests[0]?.get("t3-tool-exposure")).toBe("compact");
+
+        // Also ensure fast-path CLI reads T3_ACP_MCP_TOOL_EXPOSURE="compact"
+        const originalEnvironment = process.env;
+        using _environment = {
+          [Symbol.dispose]: () => {
+            process.env = originalEnvironment;
+          },
+        };
+        process.env = {
+          ...originalEnvironment,
+          T3_ACP_MCP_ENDPOINT: "http://127.0.0.1:1/mcp",
+          T3_ACP_MCP_AUTHORIZATION: "Bearer bridge-test",
+          T3_ACP_MCP_TOOL_EXPOSURE: "compact",
+        };
+        const originalStdin = process.stdin;
+        const mockInput = new NodeStream.PassThrough();
+        Object.defineProperty(process, "stdin", { value: mockInput, configurable: true });
+        using _stdin = {
+          [Symbol.dispose]: () => {
+            Object.defineProperty(process, "stdin", { value: originalStdin, configurable: true });
+          },
+        };
+        const cliHeaders: Array<Headers> = [];
+        using _fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+          cliHeaders.push(new Headers(init?.headers));
+          return Response.json({ jsonrpc: "2.0", id: 9, result: { tools: [] } });
+        });
+        using _stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+        mockInput.end(`${JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list" })}\n`);
+        yield* Effect.promise(() => runAcpMcpCliFastPath("acp-mcp-bridge", []));
+        expect(cliHeaders).toHaveLength(1);
+        expect(cliHeaders[0]?.get("t3-tool-exposure")).toBe("compact");
+        void input;
+        void requests;
+      }),
+  );
 });

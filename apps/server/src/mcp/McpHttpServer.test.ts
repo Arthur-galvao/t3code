@@ -2165,3 +2165,135 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
+
+it.effect(
+  "lists core tools upfront in compact mode and loads remaining tools via tool_search",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const scope = {
+          environmentId,
+          requestNamespace: "compactToken",
+          thread: {
+            threadId: ThreadId.make("thread-compactToken"),
+            providerSessionId: "compactToken",
+            providerInstanceId: ProviderInstanceId.make("antigravity"),
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        } satisfies McpInvocationContext.McpThreadInvocationScope;
+        const tool = (name: string, description: string) =>
+          Tool.make(name, {
+            description,
+            success: Schema.Struct({}),
+            failure: OrchestratorMcpFailure,
+            failureMode: "return",
+          });
+        const CompactToolkit = Toolkit.make(
+          tool("delegate_task", "Delegates a task."),
+          tool("context_retrieve", "Retrieves compressed output."),
+          tool("html_render", "Renders HTML output."),
+          tool("device_open", "Opens a simulator device."),
+        );
+        const reads = McpToolAccess.reads(() => Effect.succeed({}));
+        const serverLayer = McpHttpServer.layerMcpTransport(
+          Layer.mergeAll(
+            McpHttpServer.toolkitRegistration(
+              CompactToolkit,
+              McpToolAccess.toLayer(CompactToolkit, {
+                delegate_task: reads,
+                context_retrieve: reads,
+                html_render: reads,
+                device_open: reads,
+              }),
+            ),
+            McpHttpServer.layerToolSearch,
+          ),
+        ).pipe(
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+          Layer.provide(
+            Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+              resolve: (token) => Effect.succeed(token === "compactToken" ? scope : undefined),
+            }),
+          ),
+        );
+        yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+          Layer.build,
+        );
+        const httpClient = yield* HttpClient.HttpClient;
+        const headers = {
+          accept: "application/json, text/event-stream",
+          authorization: "Bearer compactToken",
+          "t3-tool-exposure": "compact",
+        };
+        const initialize = yield* httpClient.post("/mcp", {
+          headers,
+          body: HttpBody.text(
+            `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+            "application/json",
+          ),
+        });
+        const rpc = (method: string, params: object) =>
+          httpClient
+            .post("/mcp", {
+              headers: {
+                ...headers,
+                "mcp-session-id": initialize.headers["mcp-session-id"]!,
+                "mcp-protocol-version": "2025-06-18",
+              },
+              body: HttpBody.text(
+                JSON.stringify({ jsonrpc: "2.0", id: 2, method, params }),
+                "application/json",
+              ),
+            })
+            .pipe(
+              Effect.flatMap((response) => response.text),
+              Effect.map((text): unknown =>
+                text
+                  .split("\n")
+                  .filter((line) => line.startsWith("data: ") || line.startsWith("{"))
+                  .map((line) => JSON.parse(line.replace(/^data: /u, "")) as { id?: number })
+                  .find((message) => message.id === 2),
+              ),
+            );
+
+        const listNames = rpc("tools/list", {}).pipe(
+          Effect.map((body) =>
+            (body as { result: { tools: ReadonlyArray<{ name: string }> } }).result.tools
+              .map((listed) => listed.name)
+              .sort(),
+          ),
+        );
+        expect(yield* listNames).toEqual([
+          "context_retrieve",
+          "delegate_task",
+          "html_render",
+          "tool_search",
+        ]);
+        // Unlisted non-core tools stay directly callable and appear in tools/list once searched.
+        const directCall = yield* rpc("tools/call", { name: "device_open", arguments: {} });
+        expect(
+          (directCall as { result: { structuredContent?: unknown } }).result.structuredContent,
+        ).toEqual({});
+
+        const searchResult = yield* rpc("tools/call", {
+          name: "tool_search",
+          arguments: { query: "device" },
+        });
+        expect(
+          (searchResult as { result: { structuredContent?: unknown } }).result.structuredContent,
+        ).toEqual({
+          tools: [{ name: "device_open", description: "Opens a simulator device." }],
+        });
+        expect(yield* listNames).toEqual([
+          "context_retrieve",
+          "delegate_task",
+          "device_open",
+          "html_render",
+          "tool_search",
+        ]);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);

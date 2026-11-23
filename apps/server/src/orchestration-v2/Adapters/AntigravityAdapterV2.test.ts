@@ -3223,11 +3223,15 @@ describe("AntigravityAdapterV2 session system prompt", () => {
           name: string;
           command?: string;
           args?: Array<string>;
+          env?: Array<{ name: string; value: string }>;
         }>;
         assert.deepEqual(
           mcpServers.map((s) => s.name),
           ["t3-code", "context7", "shadcn", "magicui", "customTool"],
         );
+        assert.includeDeepMembers(mcpServers[0]?.env ?? [], [
+          { name: "T3_ACP_MCP_TOOL_EXPOSURE", value: "compact" },
+        ]);
         const expectedSep = fakeNpxCmd.includes("\\") ? "\\" : "/";
         const expectedNodeExe = `${fakeNodeDir}${expectedSep}node.exe`;
         const expectedNpxCli = `${fakeNodeDir}${expectedSep}node_modules${expectedSep}npm${expectedSep}bin${expectedSep}npx-cli.js`;

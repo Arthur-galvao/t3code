@@ -1,3 +1,4 @@
+import type { McpToolExposureMode } from "@t3tools/provider-core/server/mcpSession";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
@@ -10,6 +11,36 @@ const DIRECT_TOOLS: ReadonlySet<string> = new Set([
   "task_status",
   "python",
   TOOL_SEARCH,
+]);
+
+/** Core tools listed upfront in compact mode (e.g. Antigravity's 50 KB eager schema cap). */
+const COMPACT_DIRECT_TOOLS: ReadonlySet<string> = new Set([
+  ...DIRECT_TOOLS,
+  "task_cancel",
+  "rsi_query_lessons",
+  "rsi_record_lesson",
+  "rsi_telemetry_summary",
+  "memory_search",
+  "memory_write",
+  "context_retrieve",
+  "html_preview",
+  "html_render",
+  "send_to_user",
+  "request_secret",
+  "t3_thread_list",
+  "t3_thread_read",
+  "t3_thread_send",
+  "t3_thread_launch",
+  "t3_thread_wait",
+  "schedule_task",
+  "list_scheduled_tasks",
+  "preview_status",
+  "preview_open",
+  "preview_navigate",
+  "preview_snapshot",
+  "preview_act",
+  "preview_evaluate",
+  "t3_preview_close",
 ]);
 
 const MAX_RESULTS = 10;
@@ -29,7 +60,11 @@ export class McpToolExposure extends Context.Service<
       providerSessionId: string,
       query: string,
     ) => Effect.Effect<ReadonlyArray<ListedTool>>;
-    readonly isListed: (providerSessionId: string, tool: string) => boolean;
+    readonly isListed: (
+      providerSessionId: string,
+      tool: string,
+      mode?: McpToolExposureMode,
+    ) => boolean;
   }
 >()("t3/mcp/McpToolExposure") {}
 
@@ -82,7 +117,8 @@ export const make = (
       }
       return found;
     }),
-    isListed: (providerSessionId, tool) =>
-      DIRECT_TOOLS.has(tool) || loaded.get(providerSessionId)?.has(tool) === true,
+    isListed: (providerSessionId, tool, mode = "deferred") =>
+      (mode === "compact" ? COMPACT_DIRECT_TOOLS : DIRECT_TOOLS).has(tool) ||
+      loaded.get(providerSessionId)?.has(tool) === true,
   });
 };

@@ -411,6 +411,8 @@ export interface AcpAdapterV2Flavor {
   readonly mcpOverHttp?: boolean;
   /** The agent has no tool search of its own, so T3 lists optional tools on demand. */
   readonly deferMcpTools?: boolean;
+  /** Passed to the `acp-mcp-bridge` stdio bridge when the agent connects over stdio. */
+  readonly stdioMcpToolExposure?: McpProviderSession.McpToolExposureMode;
   readonly readExtraMcpServers?: () => Effect.Effect<ReadonlyArray<EffectAcpSchema.McpServer>>;
   readonly normalizeSessionUpdate?: (
     notification: EffectAcpSchema.SessionNotification,
@@ -1002,6 +1004,7 @@ function acpMcpContext(
   mcpOverHttp: boolean | undefined,
   deferMcpTools: boolean | undefined,
   extraServers: ReadonlyArray<EffectAcpSchema.McpServer> = [],
+  stdioMcpToolExposure: McpProviderSession.McpToolExposureMode | undefined = undefined,
 ): AcpMcpContext {
   if (session === undefined) {
     return { servers: [], acpServers: [], httpServers: [], extraServers };
@@ -1017,6 +1020,11 @@ function acpMcpContext(
           { name: "ELECTRON_RUN_AS_NODE", value: "1" },
           { name: "T3_ACP_MCP_ENDPOINT", value: session.endpoint },
           { name: "T3_ACP_MCP_AUTHORIZATION", value: session.authorizationHeader },
+          ...(stdioMcpToolExposure === undefined
+            ? []
+            : [
+                { name: McpProviderSession.ACP_MCP_TOOL_EXPOSURE_ENV, value: stdioMcpToolExposure },
+              ]),
         ],
       },
     ],
@@ -2004,6 +2012,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 flavor.mcpOverHttp,
                 flavor.deferMcpTools,
                 extraServers,
+                flavor.stdioMcpToolExposure,
               ),
             )
           : mcpSessions
@@ -2016,6 +2025,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     flavor.mcpOverHttp,
                     flavor.deferMcpTools,
                     extraServers,
+                    flavor.stdioMcpToolExposure,
                   ),
                 ),
               ),
