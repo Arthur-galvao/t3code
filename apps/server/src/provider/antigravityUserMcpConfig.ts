@@ -1,9 +1,5 @@
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import {
-  npmShimExecutable,
-  SpawnExecutableResolution,
-  type SpawnExecutableResolver,
-} from "@t3tools/shared/shell";
+import { npmShimExecutable, SpawnExecutableResolution } from "@t3tools/shared/shell";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -240,6 +236,12 @@ function windowsExtension(filePath: string): string {
   return dot <= 0 ? "" : base.slice(dot).toLowerCase();
 }
 
+type SyncExecutableResolver = (
+  command: string,
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+) => string | undefined;
+
 export interface DirectNodeScriptInvocation {
   readonly nodeExecutable: string;
   readonly scriptPath: string;
@@ -250,7 +252,7 @@ export function normalizeStdioMcpServerForPlatform(
   options: {
     readonly platform: NodeJS.Platform;
     readonly env: NodeJS.ProcessEnv;
-    readonly resolveExecutable: SpawnExecutableResolver;
+    readonly resolveExecutable: SyncExecutableResolver;
     readonly resolveNpmShim?: (shimPath: string) => string | undefined;
     readonly resolveNodeScript?: (shimPath: string) => DirectNodeScriptInvocation | undefined;
   },
@@ -343,22 +345,22 @@ export const readAntigravityUserMcpServers = Effect.fn("readAntigravityUserMcpSe
         });
       }
 
+      // The shared resolver may be async; resolve up front so normalization stays synchronous.
       const resolvedByCommand = new Map<string, string | undefined>();
-      const cachedResolveExecutable: SpawnExecutableResolver = (
-        command,
-        targetPlatform,
-        targetEnv,
-      ) => {
-        if (targetPlatform === platform && targetEnv === env) {
-          if (resolvedByCommand.has(command)) {
-            return resolvedByCommand.get(command);
-          }
-          const found = resolveExecutable(command, targetPlatform, targetEnv);
-          resolvedByCommand.set(command, found);
-          return found;
-        }
-        return resolveExecutable(command, targetPlatform, targetEnv);
-      };
+      const resolveOnce = (command: string) =>
+        resolvedByCommand.has(command)
+          ? Effect.succeed(resolvedByCommand.get(command))
+          : Effect.promise(async () => {
+              try {
+                return await resolveExecutable(command, platform, env);
+              } catch {
+                return undefined; // Unresolvable commands run as written.
+              }
+            }).pipe(
+              Effect.tap((found) => Effect.sync(() => resolvedByCommand.set(command, found))),
+            );
+      const cachedResolveExecutable: SyncExecutableResolver = (command) =>
+        resolvedByCommand.get(command);
 
       const directNodeScripts = new Map<string, DirectNodeScriptInvocation>();
       if (platform === "win32") {
@@ -366,7 +368,7 @@ export const readAntigravityUserMcpServers = Effect.fn("readAntigravityUserMcpSe
           if (!isStdioMcpServer(server)) {
             continue;
           }
-          const resolved = cachedResolveExecutable(server.command, "win32", env) ?? server.command;
+          const resolved = (yield* resolveOnce(server.command)) ?? server.command;
           if (
             windowsBasename(resolved).toLowerCase() !== "npx.cmd" ||
             directNodeScripts.has(resolved)
@@ -383,7 +385,7 @@ export const readAntigravityUserMcpServers = Effect.fn("readAntigravityUserMcpSe
             const siblingNode = `${shimDir}${sep}node.exe`;
             const nodeExecutable = (yield* fs.exists(siblingNode))
               ? siblingNode
-              : (cachedResolveExecutable("node", "win32", env) ?? "node.exe");
+              : ((yield* resolveOnce("node")) ?? "node.exe");
             directNodeScripts.set(resolved, { nodeExecutable, scriptPath: npxCliPath });
           }
         }

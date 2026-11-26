@@ -17,6 +17,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import { routineSpan } from "@t3tools/shared/observability";
 
 export const MAX_OVERDUE_ARM_MS = 24 * 60 * 60 * 1000;
 export const USAGE_LIMIT_FALLBACK_PROMPT =
@@ -177,7 +178,7 @@ const makeSweep = Effect.gen(function* () {
       }).pipe(Effect.andThen(due.invalidate)),
     ),
   );
-  return Effect.fn("UsageLimitRecoveryWorker.sweep")(function* () {
+  return Effect.fn("UsageLimitRecoveryWorker.sweep", { attributes: routineSpan })(function* () {
     const now = yield* DateTime.now;
     const nowMs = DateTime.toEpochMillis(now);
     if (yield* due.isIdle(nowMs)) return;

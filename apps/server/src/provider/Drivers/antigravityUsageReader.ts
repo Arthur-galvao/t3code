@@ -126,9 +126,17 @@ const MODEL_IDS: Record<number, string> = {
   1417: "gemini-4-argon",
   1418: "gemini-4-argon",
   1419: "gemini-4-argon",
+  1427: "gemini-4-carbon",
+  1437: "gemini-4-carbon",
+  1525: "gemini-4-hydrogen",
   1526: "gemini-4-hydrogen",
+  1527: "gemini-4-hydrogen",
+  1532: "gemini-4-neon",
+  1533: "gemini-4-neon",
   1537: "gemini-pro-orchestrator-neon",
+  1667: "gemini-pro-orchestrator",
   1668: "gemini-4-neon",
+  1669: "gemini-4-hydrogen-orchestrator",
 };
 
 // Antigravity routing tiers that have no priced entry of their own.
@@ -136,6 +144,7 @@ const RATE_ALIASES: Record<string, string> = {
   "gemini-pro-orchestrator-neon": "gemini-4-neon",
   "gemini-pro-orchestrator-argon": "gemini-4-argon",
   "gemini-pro-orchestrator": "gemini-4-carbon",
+  "gemini-pro-orchestrator-g1-pro": "gemini-4-argon",
   "gemini-pro-orchestrator-carbon": "gemini-4-carbon",
   // Closest Flash-tier priced base model.
   "gemini-flash-worker-agy": "gemini-3.8-flash",
@@ -144,7 +153,7 @@ const RATE_ALIASES: Record<string, string> = {
 // Effort and routing variants share the base model's price.
 export const antigravityRateModel = (model: string) => {
   const base = model.replace(
-    /-(?:extra-low|low|medium|high|tiered|control|thinking|agent|trial)$/,
+    /-(?:extra-low|low|medium|high|tiered|control|thinking|agent|orchestrator|trial|n|r)$/,
     "",
   );
   return /^gemini-3-flash-(?:agent(?:-[ab])?|[ab])$/.test(model)
@@ -153,7 +162,7 @@ export const antigravityRateModel = (model: string) => {
       ? "gemini-3.7-flash"
       : base === "gemini-3-flash"
         ? "gemini-3-flash-preview"
-        : (RATE_ALIASES[base] ?? base);
+        : (RATE_ALIASES[model] ?? RATE_ALIASES[base] ?? base);
 };
 
 function withRateModel(record: UsageRecord): UsageRecord {
@@ -186,7 +195,14 @@ function isConcreteModel(model: string): boolean {
 
 function rememberModel(models: Map<number, string | null>, id: number, model: string | null) {
   const previous = models.get(id);
-  models.set(id, previous === undefined || previous === model ? model : null);
+  if (previous === undefined) models.set(id, model);
+  else if (
+    previous !== model &&
+    (previous === null ||
+      model === null ||
+      antigravityRateModel(previous) !== antigravityRateModel(model))
+  )
+    models.set(id, null);
 }
 
 interface Metadata {
