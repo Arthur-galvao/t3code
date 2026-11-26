@@ -685,11 +685,36 @@ export function sanitizePromptLessonText(raw: string): string {
     .trim();
 }
 
+// Shell state, JSON envelopes and routine git chatter are tool output, not lessons.
+const NON_ACTIONABLE_ERROR_PATTERNS: ReadonlyArray<RegExp> = [
+  /^[{[]/,
+  /_meta|io\.modelcontextprotocol/,
+  /\$erroractionpreference|set-location|push-location|get-childitem|if \(\$lastexitcode|@'|@"/,
+  /auto-merging |already up to date/,
+];
+
 export function isActionableErrorSignature(scrubbed: string): boolean {
   const text = scrubbed.trim().toLowerCase();
   if (text === "" || GENERIC_ERROR_SIGNATURES.has(text)) return false;
   if (/^(?:run|loop)_[a-z_]+$/.test(text)) return false;
+  if (text.endsWith("=")) return false;
+  if (NON_ACTIONABLE_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return false;
   return text.length >= 12 && /\S\s+\S/.test(text);
+}
+
+const PROSE_COMMAND_PREFIX = /^(?:feat|fix|chore|docs):/i;
+const SHELL_SCRIPT_FRAGMENT = /\$|@'|@"|;|&&|\|\||if \(|foreach/i;
+const POWERSHELL_STATE_CMDLET =
+  /(?:^|\s)(?:set-location|push-location|pop-location|get-childitem)(?=\s|$)/i;
+
+export function isCleanVerificationCommand(normalizedCmd: string): boolean {
+  const cmd = normalizedCmd.trim();
+  if (cmd === "") return false;
+  if (/^[{[]/.test(cmd)) return false;
+  if (PROSE_COMMAND_PREFIX.test(cmd)) return false;
+  if (SHELL_SCRIPT_FRAGMENT.test(cmd)) return false;
+  if (POWERSHELL_STATE_CMDLET.test(cmd)) return false;
+  return true;
 }
 
 function isLegacyUnscopedAutoLesson(
@@ -2308,7 +2333,7 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
             new Set(
               (telemetryInput.verifiedCommands ?? [])
                 .map((cmd) => normalizeVerifiedCommand(cmd))
-                .filter((cmd) => cmd !== ""),
+                .filter((cmd) => cmd !== "" && isCleanVerificationCommand(cmd)),
             ),
           );
 
@@ -2357,6 +2382,8 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
             pairSucceeded !== "" &&
             pairFailed.length <= MAX_DISPLAY_COMMAND_CHARS &&
             pairSucceeded.length <= MAX_DISPLAY_COMMAND_CHARS &&
+            isCleanVerificationCommand(pairFailed) &&
+            isCleanVerificationCommand(pairSucceeded) &&
             extractBaseToolName(pairFailed) === extractBaseToolName(pairSucceeded) &&
             pairFailed.toLowerCase() !== pairSucceeded.toLowerCase();
 
@@ -2386,55 +2413,54 @@ export const makeRsiService = Effect.fn("RsiService.make")(function* (input?: {
               },
               nowIso,
             );
-          } else if (
-            record.toolErrorCount > 0 &&
-            !distilledForSignature &&
-            // Without a concrete verify command, only a detailed error is worth a lesson.
-            ((normalizedCommands.length > 0 &&
-              normalizedCommands[0]!.length <= MAX_DISPLAY_COMMAND_CHARS) ||
-              isActionableErrorSignature(scrubErrorText(sig?.errorSignature ?? "")))
-          ) {
+          } else if (record.toolErrorCount > 0 && !distilledForSignature) {
             const recoveryTool = sig?.tool ?? "recovery";
-            const recoveryCmd =
-              normalizedCommands.length > 0 &&
-              normalizedCommands[0]!.length <= MAX_DISPLAY_COMMAND_CHARS
-                ? normalizedCommands[0]!
-                : undefined;
-            const recoverySig =
-              scrubErrorText(sig?.errorSignature ?? "") ||
-              (recoveryCmd ?? "recovered_after_tool_errors");
-            const recoveryKey = buildAutoLessonKey({
-              provider: record.provider,
-              tool: recoveryTool,
-              errorSignature: recoverySig,
-            });
-            const rawRecoveryTitle = sig?.title
-              ? `Recovered: ${sig.title}`
-              : `Verify preconditions before ${recoveryTool} (${record.provider})`;
-            yield* recordLessonLocked(
-              {
-                key: recoveryKey,
+            const scrubbedSignature = scrubErrorText(sig?.errorSignature ?? "");
+            const actionableSignature = isActionableErrorSignature(scrubbedSignature);
+            const recoveryCmd = normalizedCommands.find(
+              (cmd) => cmd.length <= MAX_DISPLAY_COMMAND_CHARS,
+            );
+            // A routine signature ("failed", raw MCP JSON) only earns a lesson with a clean verify command.
+            if (recoveryCmd !== undefined || actionableSignature) {
+              const recoverySig =
+                (actionableSignature ? scrubbedSignature : "") ||
+                recoveryCmd ||
+                "recovered_after_tool_errors";
+              const recoveryKey = buildAutoLessonKey({
                 provider: record.provider,
                 tool: recoveryTool,
                 errorSignature: recoverySig,
-                title: capTitle(rawRecoveryTitle),
-                guidance:
-                  recoveryCmd !== undefined
-                    ? `Recovered after ${record.toolErrorCount} tool error(s); verify changes with \`${recoveryCmd}\`.`
-                    : (scrubbedSigGuidance ??
-                      `Recovered after ${record.toolErrorCount} tool error(s); inspect paths and preconditions before editing.`),
-                rationaleTrace:
-                  sig?.rationaleTrace ??
-                  `Post-success recovery distillation from run ${record.runId} (${record.toolErrorCount} tool error(s) resolved).`,
-                triggerCondition:
-                  scrubbedSigTrigger ?? `${record.provider}:${recoveryTool}:${recoverySig}`,
-                scope: sig?.scope ?? "global",
-                ...(sig?.globs === undefined ? {} : { globs: sig.globs }),
-                ...(projectRoot === undefined ? {} : { projectRoot }),
-                confidence: 0.68,
-              },
-              nowIso,
-            );
+              });
+              const rawRecoveryTitle =
+                actionableSignature && sig?.title
+                  ? `Recovered: ${sig.title}`
+                  : `Verify preconditions before ${recoveryTool} (${record.provider})`;
+              yield* recordLessonLocked(
+                {
+                  key: recoveryKey,
+                  provider: record.provider,
+                  tool: recoveryTool,
+                  errorSignature: recoverySig,
+                  title: capTitle(rawRecoveryTitle),
+                  guidance:
+                    recoveryCmd !== undefined
+                      ? `Recovered after ${record.toolErrorCount} tool error(s); verify changes with \`${recoveryCmd}\`.`
+                      : ((actionableSignature ? scrubbedSigGuidance : undefined) ??
+                        `Recovered after ${record.toolErrorCount} tool error(s); inspect paths and preconditions before editing.`),
+                  rationaleTrace:
+                    (actionableSignature ? sig?.rationaleTrace : undefined) ??
+                    `Post-success recovery distillation from run ${record.runId} (${record.toolErrorCount} tool error(s) resolved).`,
+                  triggerCondition:
+                    (actionableSignature ? scrubbedSigTrigger : undefined) ??
+                    `${record.provider}:${recoveryTool}:${recoverySig}`,
+                  scope: sig?.scope ?? "global",
+                  ...(sig?.globs === undefined ? {} : { globs: sig.globs }),
+                  ...(projectRoot === undefined ? {} : { projectRoot }),
+                  confidence: 0.68,
+                },
+                nowIso,
+              );
+            }
           }
         }
 

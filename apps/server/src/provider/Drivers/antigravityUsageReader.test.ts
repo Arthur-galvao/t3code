@@ -383,6 +383,11 @@ describe("readAntigravityUsage", () => {
             "gemini-3-flash-agent",
             "gemini-3-flash",
             "gemini-default",
+            "gemini-pro-orchestrator-neon",
+            "gemini-pro-orchestrator-argon",
+            "gemini-pro-orchestrator-carbon",
+            "gemini-4-argon-trial",
+            "gemini-flash-worker-agy",
           ].entries()) {
             yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
               idx,
@@ -393,6 +398,11 @@ describe("readAntigravityUsage", () => {
               new Uint8Array(protoBytes(9, protoNumber(2, 10 + idx))),
             ]);
           }
+          // No name evidence, so the offline model table resolves the routing tier.
+          yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+            20,
+            new Uint8Array(protoBytes(9, [...protoNumber(1, 1537), ...protoNumber(2, 90)])),
+          ]);
         }),
       );
       const result = yield* readAntigravityUsage(dir, 0);
@@ -405,6 +415,12 @@ describe("readAntigravityUsage", () => {
           ["gemini-3-flash-agent", "gemini-3.5-flash"],
           ["gemini-3-flash", "gemini-3-flash-preview"],
           ["gemini-default", undefined],
+          ["gemini-pro-orchestrator-neon", "gemini-4-neon"],
+          ["gemini-pro-orchestrator-argon", "gemini-4-argon"],
+          ["gemini-pro-orchestrator-carbon", "gemini-4-carbon"],
+          ["gemini-4-argon-trial", "gemini-4-argon"],
+          ["gemini-flash-worker-agy", "gemini-3.8-flash"],
+          ["gemini-pro-orchestrator-neon", "gemini-4-neon"],
         ],
       );
     }).pipe(Effect.provide(NodeServices.layer)),

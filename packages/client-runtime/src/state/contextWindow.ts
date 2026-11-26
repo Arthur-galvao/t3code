@@ -21,6 +21,10 @@ import type { ThreadStructure, ThreadStructureTurnItem } from "./models.ts";
 // Fallback TTL: Claude's 1h cache plus slack.
 const CLAUDE_RESUME_COMPACTION_FALLBACK_MS = 70 * 60_000;
 
+// Antigravity compacts at a lower ceiling than Claude and resumes with a short-lived session.
+const ANTIGRAVITY_LONG_CONTEXT_WARNING_TOKENS = 150_000;
+const ANTIGRAVITY_RESUME_COMPACTION_FALLBACK_MS = 5 * 60_000;
+
 // A typed `/compact`, with or without instructions, is already the compaction. Queueing a
 // bare one ahead of it would run an uninstructed compaction first and charge for two.
 export const COMPACT_COMMAND_PATTERN = /^\/compact(?:\s|$)/i;
@@ -256,6 +260,19 @@ export function hasDismissedResumeCompaction(
   });
 }
 
+export function longContextWarningTokens(input: {
+  readonly provider: string | null | undefined;
+  readonly usedTokens: number | null | undefined;
+}): number | null {
+  const usedTokens = input.usedTokens;
+  return input.provider === "antigravity" &&
+    typeof usedTokens === "number" &&
+    Number.isFinite(usedTokens) &&
+    usedTokens >= ANTIGRAVITY_LONG_CONTEXT_WARNING_TOKENS
+    ? usedTokens
+    : null;
+}
+
 export function shouldOfferResumeCompaction(input: {
   readonly provider: string | null | undefined;
   readonly usedTokens: number | null | undefined;
@@ -263,19 +280,24 @@ export function shouldOfferResumeCompaction(input: {
   readonly promptCacheTtlMs?: number | undefined;
   readonly now: string;
 }): boolean {
-  if (
-    input.provider !== "claudeAgent" ||
-    (input.usedTokens ?? 0) < COMPACTION_SUGGESTION_MIN_TOKENS
-  ) {
-    return false;
-  }
+  const threshold =
+    input.provider === "claudeAgent"
+      ? COMPACTION_SUGGESTION_MIN_TOKENS
+      : input.provider === "antigravity"
+        ? ANTIGRAVITY_LONG_CONTEXT_WARNING_TOKENS
+        : null;
+  if (threshold === null || (input.usedTokens ?? 0) < threshold) return false;
 
+  const fallbackMs =
+    input.provider === "antigravity"
+      ? ANTIGRAVITY_RESUME_COMPACTION_FALLBACK_MS
+      : CLAUDE_RESUME_COMPACTION_FALLBACK_MS;
   const updatedAt = Date.parse(input.updatedAt ?? "");
   const now = Date.parse(input.now);
   return (
     Number.isFinite(updatedAt) &&
     Number.isFinite(now) &&
-    now - updatedAt >= (input.promptCacheTtlMs ?? CLAUDE_RESUME_COMPACTION_FALLBACK_MS)
+    now - updatedAt >= (input.promptCacheTtlMs ?? fallbackMs)
   );
 }
 

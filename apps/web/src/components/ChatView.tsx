@@ -344,6 +344,7 @@ import { useProactivePanels } from "../hooks/useProactivePanels";
 import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEntries";
 import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+import { longContextBannerItem, longContextWarningBandKey } from "./chat/ComposerLongContext";
 import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
 import { ComposerSurface } from "./chat/ComposerSurface";
 import { resolveThreadSyncPhase } from "../threadSync";
@@ -352,6 +353,7 @@ import {
   deriveLatestContextWindowSnapshot,
   hasDismissedResumeCompaction,
   latestProviderTurnTokenUsage,
+  longContextWarningTokens,
   shouldOfferResumeCompaction,
 } from "@t3tools/client-runtime/state/context-window";
 import {
@@ -2586,6 +2588,9 @@ export default function ChatView(props: ChatViewProps) {
   const [fullHistoryThreadKeys, setFullHistoryThreadKeys] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  const [dismissedLongContextBandByThread, setDismissedLongContextBandByThread] = useState<
+    Readonly<Record<string, string>>
+  >({});
   const keepFullHistory = fullHistoryThreadKeys.has(routeThreadKey);
   const setKeepFullHistory = (threadKey: string, keep: boolean) => {
     setFullHistoryThreadKeys((current) => {
@@ -3083,6 +3088,47 @@ export default function ChatView(props: ChatViewProps) {
   const sendPreviewAnnotationStable = useStableCallback(sendPreviewAnnotation);
   const onComposerResumeStable = useStableCallback(onResume);
   const onComposerCompactContextStable = useStableCallback(onCompactContext);
+  const longContextTokens =
+    activeContextWindow &&
+    pendingHandoff === null &&
+    !freshSessionPending &&
+    resumeCompactionTokens === null &&
+    multipleModelSelections === null &&
+    !isWorking &&
+    activePendingApproval === null &&
+    pendingUserInputs.length === 0
+      ? longContextWarningTokens({
+          provider: selectedProvider,
+          usedTokens: activeContextWindow.usedTokens,
+        })
+      : null;
+  const longContextBandKey =
+    longContextTokens !== null
+      ? longContextWarningBandKey(routeThreadKey, longContextTokens)
+      : null;
+  const allComposerBannerItems =
+    longContextTokens !== null &&
+    longContextBandKey !== null &&
+    dismissedLongContextBandByThread[routeThreadKey] !== longContextBandKey
+      ? [
+          ...composerBannerItems,
+          longContextBannerItem(
+            {
+              usedTokens: longContextTokens,
+              canCompact: !compactDisabled,
+              canStartFresh: freshSessionCommandAvailable,
+              onCompact: onComposerCompactContextStable,
+              onStartFresh: armFreshSessionStable,
+              onDismiss: () =>
+                setDismissedLongContextBandByThread((current) => ({
+                  ...current,
+                  [routeThreadKey]: longContextBandKey,
+                })),
+            },
+            messages,
+          ),
+        ]
+      : composerBannerItems;
   // Read from the projection the footer renders, so the scroll below sees the new message.
   const pendingGuestMessageIds =
     serverProjection?.thread.guestShare?.messages.flatMap((message) =>
@@ -3758,9 +3804,9 @@ export default function ChatView(props: ChatViewProps) {
                                 }
                                 isPreparingWorktree={isPreparingWorktree && !sendQueuesBehindSetup}
                                 bannerItems={
-                                  isDraftHeroState || composerBannerItems.length === 0
+                                  isDraftHeroState || allComposerBannerItems.length === 0
                                     ? EMPTY_COMPOSER_BANNER_ITEMS
-                                    : composerBannerItems
+                                    : allComposerBannerItems
                                 }
                                 resumeCompactionTokens={resumeCompactionTokens}
                                 keepFullHistory={keepFullHistory}
@@ -3923,12 +3969,12 @@ export default function ChatView(props: ChatViewProps) {
                           </div>
                         </div>
                       </ComposerSurface.Shell>
-                      {isDraftHeroState && composerBannerItems.length > 0 ? (
+                      {isDraftHeroState && allComposerBannerItems.length > 0 ? (
                         // Out of flow, like the headline, so a notice never moves the centered composer.
                         // Short windows pin the composer to the bottom, where an out-of-flow notice
                         // would fall off-screen, so there it takes space and lifts the composer.
                         <div className="absolute inset-x-0 top-full flex flex-col gap-1 pt-4 [@media(max-height:34rem)]:static">
-                          <ComposerBannerStack items={composerBannerItems} detached />
+                          <ComposerBannerStack items={allComposerBannerItems} detached />
                         </div>
                       ) : null}
                     </div>

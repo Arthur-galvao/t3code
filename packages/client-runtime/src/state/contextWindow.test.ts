@@ -14,7 +14,11 @@ import {
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
-import { compactBeforeSendTokens } from "./contextWindow.ts";
+import {
+  compactBeforeSendTokens,
+  longContextWarningTokens,
+  shouldOfferResumeCompaction,
+} from "./contextWindow.ts";
 import type { ThreadStructure } from "./models.ts";
 import { v2Projection } from "./orchestrationV2TestFixtures.ts";
 
@@ -22,6 +26,7 @@ const claude = ProviderInstanceId.make("claudeAgent");
 const claudeWork = ProviderInstanceId.make("claude_work");
 const claudeOtherHome = ProviderInstanceId.make("claude_other_home");
 const codex = ProviderInstanceId.make("codex");
+const antigravity = ProviderInstanceId.make("antigravity");
 const lastTurnAt = "2026-10-30T14:23:02.000Z";
 const returnedAt = "2026-10-30T23:03:21.000Z";
 
@@ -55,6 +60,7 @@ function sendInput(
     { instanceId: claudeWork, driver: "claudeAgent", groupKey: "claude:~/.claude" },
     { instanceId: claudeOtherHome, driver: "claudeAgent", groupKey: "claude:~/.claude-other" },
     { instanceId: codex, driver: "codex", groupKey: "codex:~/.codex" },
+    { instanceId: antigravity, driver: "antigravity", groupKey: "antigravity:default" },
   ].map(({ instanceId, driver, groupKey }) => ({
     instanceId,
     driver: ProviderDriverKind.make(driver),
@@ -260,5 +266,107 @@ describe("compactBeforeSendTokens", () => {
     expect(compactBeforeSendTokens(sendInput(overrides as Parameters<typeof sendInput>[0]))).toBe(
       expected ? 293_611 : null,
     );
+  });
+});
+
+describe("longContextWarningTokens", () => {
+  it.each([
+    {
+      name: "Antigravity just under the warning",
+      provider: "antigravity",
+      used: 149_999,
+      expected: null,
+    },
+    {
+      name: "Antigravity at the warning",
+      provider: "antigravity",
+      used: 150_000,
+      expected: 150_000,
+    },
+    {
+      name: "Antigravity well over the warning",
+      provider: "antigravity",
+      used: 320_000,
+      expected: 320_000,
+    },
+    { name: "Claude over the warning", provider: "claudeAgent", used: 300_000, expected: null },
+    { name: "Codex over the warning", provider: "codex", used: 300_000, expected: null },
+    { name: "no provider", provider: null, used: 300_000, expected: null },
+    { name: "no usage", provider: "antigravity", used: null, expected: null },
+    { name: "non-finite usage", provider: "antigravity", used: Number.NaN, expected: null },
+  ] as const)("$name", ({ provider, used, expected }) => {
+    expect(longContextWarningTokens({ provider, usedTokens: used })).toBe(expected);
+  });
+});
+
+describe("shouldOfferResumeCompaction", () => {
+  const stale = "2026-10-30T14:23:02.000Z";
+
+  it.each([
+    {
+      name: "Antigravity past the 5m fallback",
+      provider: "antigravity",
+      usedTokens: 150_000,
+      now: "2026-10-30T14:30:00.000Z",
+      expected: true,
+    },
+    {
+      name: "Antigravity within the 5m fallback",
+      provider: "antigravity",
+      usedTokens: 150_000,
+      now: "2026-10-30T14:27:00.000Z",
+      expected: false,
+    },
+    {
+      name: "Antigravity under 150K",
+      provider: "antigravity",
+      usedTokens: 149_999,
+      now: "2026-10-30T14:30:00.000Z",
+      expected: false,
+    },
+    {
+      name: "Claude still needs 200K",
+      provider: "claudeAgent",
+      usedTokens: 150_000,
+      now: "2026-10-30T23:03:21.000Z",
+      expected: false,
+    },
+    {
+      name: "Claude within its 70m fallback",
+      provider: "claudeAgent",
+      usedTokens: 293_611,
+      now: "2026-10-30T15:23:02.000Z",
+      expected: false,
+    },
+    {
+      name: "Codex is never offered",
+      provider: "codex",
+      usedTokens: 400_000,
+      now: "2026-10-30T23:03:21.000Z",
+      expected: false,
+    },
+  ] as const)("$name", ({ provider, usedTokens, now, expected }) => {
+    expect(shouldOfferResumeCompaction({ provider, usedTokens, updatedAt: stale, now })).toBe(
+      expected,
+    );
+  });
+});
+
+describe("compactBeforeSendTokens for Antigravity", () => {
+  it.each([
+    { name: "a stale Antigravity thread over 150K", expected: 293_611 },
+    { name: "under 150K", usedTokens: 149_999, expected: null },
+    { name: "within the 5m fallback", now: "2026-10-30T14:27:00.000Z", expected: null },
+    { name: "without /compact", slashCommands: [], expected: null },
+  ] as const)("$name", ({ name: _name, expected, ...overrides }) => {
+    expect(
+      compactBeforeSendTokens(
+        sendInput({
+          ...(overrides as Parameters<typeof sendInput>[0]),
+          source: antigravity,
+          selected: antigravity,
+        }),
+      ),
+    ).toBe(expected);
   });
 });

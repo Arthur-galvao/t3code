@@ -14,6 +14,7 @@ import {
   RsiService,
   buildAutoLessonKey,
   isActionableErrorSignature,
+  isCleanVerificationCommand,
   makeRsiService,
   normalizeSignaturePart,
   sanitizePromptLessonText,
@@ -2218,8 +2219,162 @@ describe("RsiService lesson quality", () => {
     for (const generic of ["failed", "Error", "run_failed", "loop_interrupted", "  "]) {
       expect(isActionableErrorSignature(generic)).toBe(false);
     }
+    for (const noise of [
+      "$erroractionpreference = 'Stop'",
+      "set-location $files = @( ) fmt @files",
+      "@' feat: verify PBIR .pbix from Power BI",
+      '{"_meta":{"io.modelcontextprotocol/clientInfo":{"name":"codex"}}}',
+      "Auto-merging package.json",
+      "Already up to date.",
+    ]) {
+      expect(isActionableErrorSignature(noise)).toBe(false);
+    }
     expect(isActionableErrorSignature("ENOENT: no such file or directory")).toBe(true);
   });
+
+  it("accepts only real verification commands", () => {
+    for (const noise of [
+      "",
+      "$erroractionpreference = 'Stop'",
+      "set-location $files = @( ) fmt @files",
+      "@' feat: verify PBIR .pbix from Power BI",
+      '{"_meta":{"io.modelcontextprotocol/clientInfo":{"name":"codex"}}}',
+      "feat: verify PBIR .pbix from Power BI",
+      "docs: mention the new flag",
+      "push-location apps/server",
+      "vp test run; vp lint",
+    ]) {
+      expect(isCleanVerificationCommand(noise)).toBe(false);
+    }
+    for (const cmd of [
+      "vp test run",
+      "pytest -q",
+      "cargo test --all",
+      "../../node_modules/.bin/vp.cmd lint apps/server",
+      "pnpm typecheck",
+    ]) {
+      expect(isCleanVerificationCommand(cmd)).toBe(true);
+    }
+  });
+
+  it.effect("never distills shell, prose, or MCP envelope noise", () =>
+    Effect.gen(function* () {
+      const rsi = yield* makeRsiService();
+      const noise = [
+        "$erroractionpreference = 'Stop'",
+        "set-location $files = @( ) fmt @files",
+        "@' feat: verify PBIR .pbix from Power BI",
+        '{"_meta":{"io.modelcontextprotocol/clientInfo":{"name":"codex"}}}',
+      ];
+      for (const [index, errorSignature] of noise.entries()) {
+        yield* rsi.recordRunTelemetry({
+          threadId: "t-noise",
+          runId: `r-noise-${index}`,
+          provider: "codex",
+          model: "gpt-5",
+          cwd: "/repo/noise",
+          usedTokens: 100,
+          cachedInputTokens: 0,
+          toolErrorCount: 1,
+          loopTripped: false,
+          safetyBlockedCount: 0,
+          wastedReads: 0,
+          outcome: "completed",
+          durationMs: 10,
+          editedFiles: ["src/a.ts"],
+          verifiedCommands: [errorSignature],
+          failureSignature: {
+            tool: "command_execution",
+            errorSignature,
+            title: "Recovered shell failure",
+            guidance: `Inspect error "${errorSignature}" before retrying.`,
+          },
+        });
+      }
+      yield* rsi.recordRunTelemetry({
+        threadId: "t-noise",
+        runId: "r-noise-failed",
+        provider: "codex",
+        model: "gpt-5",
+        cwd: "/repo/noise",
+        usedTokens: 100,
+        cachedInputTokens: 0,
+        toolErrorCount: 1,
+        loopTripped: false,
+        safetyBlockedCount: 0,
+        wastedReads: 0,
+        outcome: "completed",
+        durationMs: 10,
+        verifiedCommands: ["$erroractionpreference = 'Stop'"],
+        failureSignature: {
+          tool: "command_execution",
+          errorSignature: "failed",
+          title: "Command execution failed",
+          guidance: 'Inspect error "failed" before retrying.',
+        },
+      });
+      expect(yield* rsi.queryLessons()).toHaveLength(0);
+    }),
+  );
+
+  it.effect("distills real verification commands and clean recoveries after noise signatures", () =>
+    Effect.gen(function* () {
+      const rsi = yield* makeRsiService();
+      yield* rsi.recordRunTelemetry({
+        threadId: "t-noise",
+        runId: "r-clean-verify",
+        provider: "codex",
+        model: "gpt-5",
+        cwd: "/repo/clean",
+        usedTokens: 100,
+        cachedInputTokens: 0,
+        toolErrorCount: 0,
+        loopTripped: false,
+        safetyBlockedCount: 0,
+        wastedReads: 0,
+        outcome: "completed",
+        durationMs: 10,
+        editedFiles: ["src/a.ts"],
+        verifiedCommands: ["vp test run", "pytest -q", "cargo test"],
+      });
+      yield* rsi.recordRunTelemetry({
+        threadId: "t-noise",
+        runId: "r-clean-recovery",
+        provider: "codex",
+        model: "gpt-5",
+        cwd: "/repo/clean",
+        usedTokens: 100,
+        cachedInputTokens: 0,
+        toolErrorCount: 2,
+        loopTripped: false,
+        safetyBlockedCount: 0,
+        wastedReads: 0,
+        outcome: "completed",
+        durationMs: 10,
+        verifiedCommands: ["vp test run"],
+        failureSignature: {
+          tool: "command_execution",
+          errorSignature: "failed",
+          title: "Command execution failed",
+          guidance: 'Inspect error "failed" before retrying.',
+        },
+      });
+
+      const lessons = yield* rsi.queryLessons({ cwd: "/repo/clean" });
+      const verify = lessons.find((lesson) => lesson.title === "Verify edits with vp test run");
+      expect(verify?.guidance).toBe(
+        "Run `vp test run` and `pytest -q` to verify source edits before finishing.",
+      );
+      const recovery = lessons.find(
+        (lesson) => lesson.title === "Verify preconditions before command_execution (codex)",
+      );
+      expect(recovery?.guidance).toBe(
+        "Recovered after 2 tool error(s); verify changes with `vp test run`.",
+      );
+      expect(lessons.some((lesson) => lesson.guidance.includes("failed"))).toBe(false);
+      expect(lessons.some((lesson) => lesson.title.includes("Recovered:"))).toBe(false);
+    }),
+  );
 
   it.effect("keeps injected lessons on one line without tag markup", () =>
     Effect.gen(function* () {

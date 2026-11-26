@@ -126,18 +126,34 @@ const MODEL_IDS: Record<number, string> = {
   1417: "gemini-4-argon",
   1418: "gemini-4-argon",
   1419: "gemini-4-argon",
+  1526: "gemini-4-hydrogen",
+  1537: "gemini-pro-orchestrator-neon",
+  1668: "gemini-4-neon",
+};
+
+// Antigravity routing tiers that have no priced entry of their own.
+const RATE_ALIASES: Record<string, string> = {
+  "gemini-pro-orchestrator-neon": "gemini-4-neon",
+  "gemini-pro-orchestrator-argon": "gemini-4-argon",
+  "gemini-pro-orchestrator": "gemini-4-carbon",
+  "gemini-pro-orchestrator-carbon": "gemini-4-carbon",
+  // Closest Flash-tier priced base model.
+  "gemini-flash-worker-agy": "gemini-3.8-flash",
 };
 
 // Effort and routing variants share the base model's price.
 export const antigravityRateModel = (model: string) => {
-  const base = model.replace(/-(?:extra-low|low|medium|high|tiered|control|thinking|agent)$/, "");
+  const base = model.replace(
+    /-(?:extra-low|low|medium|high|tiered|control|thinking|agent|trial)$/,
+    "",
+  );
   return /^gemini-3-flash-(?:agent(?:-[ab])?|[ab])$/.test(model)
     ? "gemini-3.5-flash"
     : model === "gemini-3.7-flash-safety-le"
       ? "gemini-3.7-flash"
       : base === "gemini-3-flash"
         ? "gemini-3-flash-preview"
-        : base;
+        : (RATE_ALIASES[base] ?? base);
 };
 
 function withRateModel(record: UsageRecord): UsageRecord {
