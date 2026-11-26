@@ -35,10 +35,10 @@
   ],
   "blindJudges": [
     {
-      "name": "Hydrogen",
+      "name": "Neon",
       "target": {
         "providerInstanceId": "antigravity",
-        "model": "gemini-4-hydrogen",
+        "model": "gemini-4-neon",
         "options": {
           "thought_level": "high"
         }
@@ -61,6 +61,19 @@
         "model": "claude-sonnet-5-5",
         "options": {
           "effort": "high"
+        }
+      }
+    }
+  ],
+  "escalationJudges": [
+    {
+      "name": "Carbon",
+      "replaces": "Sonnet",
+      "target": {
+        "providerInstanceId": "antigravity",
+        "model": "gemini-4-carbon",
+        "options": {
+          "thought_level": "high"
         }
       }
     }
